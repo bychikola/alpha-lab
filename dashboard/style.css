@@ -1,0 +1,139 @@
+/* Alpha Lab — дашборд отчёта валидации.
+   Палитра и типографика повторяют корневой index.html проекта:
+   тёмный фон #0b0e14, акценты amber/sky/emerald, Inter + JetBrains Mono. */
+
+:root {
+  --bg: #0b0e14; --panel: #0d1117; --panel2: #11151f; --line: rgba(255,255,255,.07);
+  --text: #cbd5e1; --dim: #64748b;
+  --amber: #f59e0b; --green: #22c55e; --red: #ef4444; --sky: #38bdf8;
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: Inter, system-ui, sans-serif; font-size: 14px;
+  background-image: radial-gradient(900px 460px at 85% -10%, rgba(56,189,248,.08), transparent 60%),
+                    radial-gradient(700px 400px at -10% 40%, rgba(245,158,11,.06), transparent 55%),
+                    radial-gradient(700px 420px at 50% 110%, rgba(34,197,94,.04), transparent 60%);
+  background-attachment: fixed;
+}
+.mono { font-family: var(--mono); }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px 80px; }
+
+/* ── шапка ── */
+.top { border-bottom: 1px solid var(--line); background: rgba(11,14,20,.75);
+       backdrop-filter: blur(14px); position: sticky; top: 0; z-index: 10; }
+.top-inner { max-width: 1180px; margin: 0 auto; padding: 0 20px;
+             display: flex; align-items: center; justify-content: space-between;
+             gap: 14px; height: 56px; }
+.brand { display: flex; align-items: center; gap: 10px; }
+.logo { width: 30px; height: 30px; border-radius: 9px; flex: none;
+        background: linear-gradient(135deg, #f59e0b, #ea580c); color: #0b0e14;
+        font-weight: 800; font-size: 12px; display: flex; align-items: center;
+        justify-content: center; box-shadow: 0 6px 16px rgba(245,158,11,.18); }
+.brand-name { font-weight: 700; color: #e2e8f0; letter-spacing: -.2px; }
+.brand-name .dot { color: var(--amber); }
+.top-meta { color: var(--dim); font-size: 11.5px; }
+
+/* ── служебные плашки ── */
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px;
+        padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line);
+        color: var(--dim); white-space: nowrap; }
+.chip.green { color: #86efac; border-color: rgba(34,197,94,.3); background: rgba(34,197,94,.07); }
+.chip.amber { color: #fcd34d; border-color: rgba(245,158,11,.35); background: rgba(245,158,11,.08); }
+.chip.red   { color: #fca5a5; border-color: rgba(239,68,68,.35); background: rgba(239,68,68,.08); }
+
+/* ── панель вердикта ── */
+.verdict { border-radius: 16px; padding: 22px 26px; border: 1px solid var(--line); margin-bottom: 16px; }
+.verdict.alive { background: rgba(34,197,94,.08); border-color: rgba(34,197,94,.35); }
+.verdict.dead  { background: rgba(239,68,68,.08); border-color: rgba(239,68,68,.35); }
+.verdict-top { display: flex; justify-content: space-between; align-items: flex-start;
+               gap: 18px; flex-wrap: wrap; }
+.verdict h1 { margin: 0; font-size: 34px; letter-spacing: -.5px; line-height: 1.1; }
+.verdict.alive h1 { color: var(--green); }
+.verdict.dead h1 { color: var(--red); }
+.verdict .status-note { font-size: 12.5px; color: var(--dim); margin-top: 5px; }
+.verdict .sub { color: var(--dim); font-size: 12.5px; margin-top: 10px; }
+.verdict .sub .mono { color: var(--text); }
+.verdict-meta { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; max-width: 460px; }
+
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+        gap: 10px; margin-top: 18px; }
+.kpi { background: rgba(0,0,0,.28); border-radius: 10px; padding: 11px 13px;
+       border: 1px solid transparent; }
+.kpi .k { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); }
+.kpi .v { font-size: 19px; font-weight: 600; margin-top: 3px; }
+.kpi .t { font-size: 10.5px; color: var(--dim); margin-top: 2px; min-height: 13px; }
+.kpi .bar { height: 4px; border-radius: 3px; margin-top: 9px; overflow: hidden;
+            background: rgba(255,255,255,.07); }
+.kpi .bar i { display: block; height: 100%; border-radius: 3px; background: #475569; }
+.kpi.pass .v { color: var(--green); }
+.kpi.pass .bar i { background: var(--green); }
+.kpi.fail .v { color: var(--red); }
+.kpi.fail .bar i { background: var(--red); }
+.kpi.na .v { color: var(--dim); }
+
+.reasons { margin: 18px 0 0; padding: 0; list-style: none; }
+.reasons li { padding: 7px 0 7px 18px; position: relative; color: #fca5a5; font-size: 13px;
+              border-top: 1px solid rgba(239,68,68,.18); }
+.reasons li::before { content: '×'; position: absolute; left: 2px; color: var(--red); font-weight: 700; }
+.reasons.ok li { color: #86efac; border-top-color: rgba(34,197,94,.18); }
+.reasons.ok li::before { content: '✓'; color: var(--green); }
+
+.metrics-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+                 gap: 8px 12px; margin-top: 18px; padding-top: 14px;
+                 border-top: 1px solid var(--line); }
+.metric { display: flex; flex-direction: column; gap: 1px; }
+.metric .mk { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+.metric .mv { font-size: 13.5px; color: #e2e8f0; }
+
+/* ── предупреждения ── */
+.alert { border-radius: 14px; padding: 14px 18px; margin-bottom: 16px;
+         border: 1px solid var(--line); font-size: 13px; }
+.alert h3 { margin: 0 0 4px; font-size: 13.5px; }
+.alert p { margin: 0; color: var(--dim); line-height: 1.55; }
+.alert.warn { background: rgba(245,158,11,.09); border-color: rgba(245,158,11,.4); }
+.alert.warn h3 { color: #fcd34d; }
+.alert.info { background: rgba(56,189,248,.06); border-color: rgba(56,189,248,.28); }
+.alert.info h3 { color: #7dd3fc; }
+
+/* ── карточки графиков ── */
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+        padding: 16px 18px 12px; margin-bottom: 16px; }
+.card-head { display: flex; justify-content: space-between; align-items: baseline;
+             gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+.card h2 { margin: 0; font-size: 13px; font-weight: 600; color: #94a3b8;
+           text-transform: uppercase; letter-spacing: .05em; }
+.readout { font-size: 11.5px; color: var(--dim); }
+.readout b { color: var(--text); font-weight: 500; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11px; color: var(--dim);
+          margin: 8px 2px 0; }
+.legend i { display: inline-block; vertical-align: middle; margin-right: 5px; }
+.legend .ln { width: 12px; height: 2px; border-radius: 2px; }
+.legend .bx { width: 10px; height: 10px; border-radius: 2px; }
+.legend .ln.dash { height: 0; border-top: 2px dashed rgba(148,163,184,.5); }
+.chart-note { font-size: 11px; color: var(--dim); margin: 8px 2px 2px; }
+canvas { width: 100%; display: block; cursor: crosshair; }
+
+/* ── таблица издержек ── */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+th { color: var(--dim); font-size: 10.5px; text-transform: uppercase;
+     letter-spacing: .05em; font-weight: 600; }
+td.num { text-align: right; white-space: nowrap; }
+tr.total td { border-bottom: 0; border-top: 1px solid rgba(255,255,255,.14); }
+.neg { color: var(--red); }
+.income { color: #6ee7b7; }
+.share { width: 34%; }
+.sbar { height: 6px; border-radius: 3px; background: rgba(255,255,255,.06); overflow: hidden; }
+.sbar i { display: block; height: 100%; border-radius: 3px; background: rgba(245,158,11,.75); }
+.costs-note { font-size: 11.5px; color: var(--dim); margin: 12px 2px 4px; line-height: 1.5; }
+
+/* ── ошибка загрузки ── */
+.error { background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.4);
+         border-radius: 14px; padding: 28px; }
+.error h2 { color: var(--red); margin-top: 0; }
+.error p { line-height: 1.6; }
+.error code { background: rgba(0,0,0,.4); padding: 2px 6px; border-radius: 5px; color: var(--amber); }
+.error ul { color: var(--dim); line-height: 1.7; padding-left: 20px; }
+.footer { color: var(--dim); font-size: 11.5px; text-align: center; margin-top: 30px; }
