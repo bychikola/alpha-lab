@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from alpha_lab.engine.backtest import run_backtest
+from alpha_lab.engine.backtest import run_backtest, trade_returns
 from alpha_lab.engine.costs import RealisticCost, ZeroCost
 
 
@@ -243,3 +243,134 @@ def test_zero_cost_equity_is_bit_exact_cumprod():
     expected = np.cumprod(1.0 + res.gross_returns.to_numpy())
     np.testing.assert_array_equal(res.equity.to_numpy(), expected)
     assert res.costs.to_numpy().sum() == 0.0
+
+
+# --- trade_returns: атрибуция издержек и границы сделок ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "positions, quote_volume",
+    [
+        ([0.0, 1.0, 0.0, 0.0, 0.0], 1e9),          # круглая сделка с выходом в плоское
+        ([0.0, 1.0, -1.0, 1.0, -1.0, 0.0], 1e5),   # серия разворотов
+        ([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1e9),     # ни одной сделки
+        ([1.0, -1.0] * 10, 1e6),                   # высокая оборачиваемость
+    ],
+    ids=["flat_exit", "reversals", "no_trades", "alternating"],
+)
+def test_trade_returns_conserve_total_net_return(positions, quote_volume):
+    """Каждый бар учтён ровно одной сделкой: сумма сделок == сумме net-доходностей.
+
+    Это главный инвариант атрибуции: win-rate и profit factor (Task 12) должны
+    видеть полные издержки, а не только комиссию входа. Особенно важен выход в
+    плоское: на нём gross = 0, но заявка на выход оплачивается именно там.
+    """
+    bars = _bars([100.0] * len(positions))
+    bars["quote_volume"] = quote_volume
+
+    res = run_backtest(bars, pd.Series(positions, dtype="float64"),
+                       RealisticCost(), capital=10_000.0)
+    trades = trade_returns(res)
+
+    np.testing.assert_allclose(
+        float(trades.sum()), float(res.returns.sum()), rtol=1e-12, atol=1e-15
+    )
+
+
+def test_trade_returns_flat_exit_includes_exit_cost():
+    """Круговая сделка: издержка выхода принадлежит закрываемой сделке.
+
+    held = [0, 0, 1, 0, 0]: заявки входа (бар 2) и выхода (бар 3) по 10 000
+    при объёме бара 1e9, то есть по 5 bps комиссии + 0.51 bps проскальзывания.
+    Сделка обязана вернуть -1.102e-3, а не -5.51e-4 (только вход).
+    """
+    bars = _bars([100.0] * 5)
+    positions = pd.Series([0.0, 1.0, 0.0, 0.0, 0.0])
+
+    res = run_backtest(bars, positions, RealisticCost(), capital=10_000.0)
+    trades = trade_returns(res)
+
+    assert len(trades) == 1
+    assert trades.iloc[0] == pytest.approx(-1.102e-3, rel=1e-9)
+    assert trades.iloc[0] == pytest.approx(float(res.returns.sum()), rel=1e-12)
+
+
+def test_trade_returns_hand_built_segmentation():
+    """Разметка сделок и издержек, посчитанная вручную.
+
+    Цена:    [100, 110, 121, 121, 100, 100, 90, 99, 99, 99]
+    positions[1, 1, 1, 0, 0, -1, 1, 1, 0, 0] -> held = [0,1,1,1,0,0,-1,1,1,0]
+    Оборот:  [0, 1, 0, 0, 1, 0, 1, 2, 0, 1]; издержка = 10 bps * оборот.
+    Сделки:  №0 бары 1-3 (вход 1, выход 4); №1 бар 6 (вход 1, разворот 7);
+             №2 бары 7-8 (вход 1, выход 9).
+    Разворот на баре 7: заявка 2 закрывает -1 и открывает +1, издержка 2e-3
+    делится 1e-3 : 1e-3; gross бара 7 (+10%) достаётся новой сделке №2.
+    Итого:   №0 = +0.1 (бар 2) +0.1 (бар 3) - 1e-3 (вход) - 1e-3 (выход) = 0.198
+             №1 = +0.1 (бар 6) - 1e-3 (вход) - 1e-3 (доля разворота)   = 0.098
+             №2 = +0.1 (бар 7) - 1e-3 (доля разворота) - 1e-3 (выход)  = 0.098
+    """
+    close = [100.0, 110.0, 121.0, 121.0, 100.0, 100.0, 90.0, 99.0, 99.0, 99.0]
+    positions = pd.Series([1.0, 1.0, 1.0, 0.0, 0.0, -1.0, 1.0, 1.0, 0.0, 0.0])
+    cost = RealisticCost(taker_fee_bps=10.0, min_slippage_bps=0.0, impact_coef=0.0)
+
+    res = run_backtest(_bars(close), positions, cost, capital=10_000.0)
+    trades = trade_returns(res)
+
+    assert trades.tolist() == pytest.approx([0.198, 0.098, 0.098], rel=1e-9)
+    assert float(trades.sum()) == pytest.approx(float(res.returns.sum()), rel=1e-12)
+
+
+def test_trade_returns_never_trading_is_empty_float64():
+    """Пустой результат должен быть float64: object-пустышка ломает .mean() у Task 12."""
+    bars = _bars([100.0] * 5)
+
+    trades = trade_returns(run_backtest(bars, pd.Series([0.0] * 5), ZeroCost()))
+
+    assert trades.empty
+    assert trades.dtype == np.float64
+    assert len(trades) == 0
+
+
+# --- валидация max_participation и наблюдаемое участие ----------------------------------
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -0.01])
+def test_invalid_max_participation_raises(bad):
+    """NaN/0 отключают диагностику ёмкости молча — это должно падать, а не «доказывать»."""
+    bars = _bars([100.0] * 3)
+
+    with pytest.raises(ValueError, match="max_participation"):
+        run_backtest(bars, pd.Series([0.0] * 3), ZeroCost(), max_participation=bad)
+
+
+def test_max_participation_observed_zero_for_never_trading():
+    bars = _bars([100.0] * 5)
+
+    res = run_backtest(bars, pd.Series([0.0] * 5), RealisticCost(), capital=10_000.0)
+
+    assert res.max_participation_observed == 0.0
+
+
+def test_max_participation_observed_grows_with_order_size():
+    """Наблюдённое участие — запас до лимита: растёт с размером заявки.
+
+    held = [0, 1, 1, 1, 1]: одна заявка размером capital при объёме 1e6.
+    """
+    bars = _bars([100.0] * 5)
+    bars["quote_volume"] = 1e6
+    positions = pd.Series([1.0] * 5)
+
+    small = run_backtest(bars, positions, ZeroCost(), capital=1_000.0)
+    large = run_backtest(bars, positions, ZeroCost(), capital=10_000.0)
+
+    assert small.max_participation_observed == pytest.approx(1e-3)
+    assert large.max_participation_observed == pytest.approx(1e-2)
+    assert large.max_participation_observed > small.max_participation_observed
+
+    # Максимум по барам, а не последняя заявка: разворот торгует 2 * capital.
+    rev_bars = _bars([100.0] * 4)
+    rev_bars["quote_volume"] = 1e6
+    rev = run_backtest(rev_bars, pd.Series([0.0, 1.0, -1.0, 0.0]), ZeroCost(),
+                       capital=10_000.0)
+    assert rev.max_participation_observed == pytest.approx(2e-2)
+    assert rev.max_participation_observed > large.max_participation_observed

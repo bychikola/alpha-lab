@@ -36,6 +36,13 @@ class BacktestResult:
     # поэтому прогон с cap_hits > 0 оптимистичен, а его ёмкость не доказана.
     # Поле обязательное: дефолт 0 молча объявлял бы любой прогон доказанным.
     cap_hits: int
+    # Максимальное наблюдённое участие: max по барам trade_notional / quote_volume.
+    # Мера запаса до лимита заполнения — показывает, насколько близко стратегия
+    # подошла к порогу max_participation, даже когда cap_hits == 0 (флаг горит
+    # только на самом пороге и легко теряется). 0.0, если заявок не было.
+    # Бары с нулевым или нефинитным объёмом пропускаются (деление на ноль), но
+    # заявка на таком баре всё равно попадает в cap_hits.
+    max_participation_observed: float
 
     @property
     def cost_totals(self) -> dict[str, float]:
@@ -74,6 +81,14 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
         )
     if n < 2:
         raise ValueError("Нужно минимум 2 бара")
+    # NaN делает любое сравнение False (cap_hits == 0 при любой заявке), а <= 0
+    # инвертирует или перевозбуждает диагностику. Это не ограничение исполнения,
+    # а защита самой диагностики: невалидный порог молча «доказывал» бы ёмкость.
+    if not np.isfinite(max_participation) or max_participation <= 0.0:
+        raise ValueError(
+            "max_participation должен быть конечным положительным числом "
+            f"(получено {max_participation!r})"
+        )
 
     close = bars["close"].astype("float64").to_numpy()
     quote_volume = bars["quote_volume"].astype("float64").to_numpy()
@@ -121,6 +136,15 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
     # исполнение (движок не режет заявки), только на диагностику.
     cap_hits = int(np.count_nonzero(trade_notional > max_participation * quote_volume))
 
+    # Наблюдённое участие — насколько близко заявки подошли к лимиту заполнения.
+    # Участие определено только там, где есть заявка и положительный конечный
+    # объём бара; бары без объёма исключены из деления (заявка на них уже
+    # посчитана в cap_hits), поэтому максимум не может стать inf/NaN.
+    participation = np.zeros(n, dtype="float64")
+    live = (trade_notional > 0.0) & np.isfinite(quote_volume) & (quote_volume > 0.0)
+    participation[live] = trade_notional[live] / quote_volume[live]
+    max_participation_observed = float(participation.max())
+
     costs = pd.DataFrame(
         {"fee": fee, "slippage": slip, "funding": fund}, index=bars.index
     )
@@ -143,26 +167,64 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
         bars=n,
         price_returns=pd.Series(price_ret, index=bars.index, name="price_returns"),
         cap_hits=cap_hits,
+        max_participation_observed=max_participation_observed,
     )
 
 
 def trade_returns(result: BacktestResult) -> pd.Series:
-    """R-мультипликаторы сделок: суммарная доходность за непрерывный период удержания.
+    """Доходности сделок: от входа до полного закрытия, со всеми издержками.
 
-    Сделка — последовательность баров с одинаковым знаком удерживаемой позиции.
+    Сделка — непрерывный отрезок баров с одинаковым знаком удерживаемой позиции.
+    Доходность бара — это net (gross - fee - slippage - funding), но издержки
+    бара принадлежат не только бару удержания, поэтому атрибуция такая:
+      * вход (0 -> ±) и добор/сокращение внутри сделки — целиком этой сделке;
+      * выход (± -> 0) — закрываемой сделке: gross на баре выхода равен нулю,
+        но заявка на выход оплачивается именно на нём (раньше эта издержка
+        терялась и сделки выглядели лучше, чем были);
+      * разворот (± -> ∓) — одна заявка закрывает старую позицию и открывает
+        новую, поэтому издержка делится пропорционально |held[t-1]| : |held[t]|,
+        а gross и funding бара относятся к новой позиции;
+      * flat-бар между сделками (0 -> 0) — оборота и издержек нет.
+    Инвариант: trade_returns(result).sum() == result.returns.sum() с точностью
+    до ошибки сложения float64. Без него win-rate и profit factor (Task 12)
+    видели бы только издержку входа и систематически завышали бы качество.
     """
-    held = result.positions.to_numpy()
-    net = result.returns.to_numpy()
-    sign = np.sign(held)
+    held = np.nan_to_num(result.positions.to_numpy(dtype="float64"), nan=0.0)
+    gross = result.gross_returns.to_numpy(dtype="float64")
+    funding = result.costs["funding"].to_numpy(dtype="float64")
+    fee_slip = (result.costs["fee"].to_numpy(dtype="float64")
+                + result.costs["slippage"].to_numpy(dtype="float64"))
 
-    trades, current, current_sign = [], 0.0, 0.0
-    for i in range(len(sign)):
-        if sign[i] != current_sign:
-            if current_sign != 0.0:
-                trades.append(current)
-            current, current_sign = 0.0, sign[i]
-        if current_sign != 0.0:
-            current += net[i]
-    if current_sign != 0.0:
-        trades.append(current)
-    return pd.Series(trades, name="trade_return")
+    # Номера сделок по барам (-1 — вне сделки). Новая сделка начинается там,
+    # где знак ненулевой позиции отличается от знака предыдущего бара.
+    sign = np.sign(held)
+    prev_sign = np.concatenate(([0.0], sign[:-1]))
+    starts = (sign != 0.0) & (sign != prev_sign)
+    trade_id = np.cumsum(starts) - 1
+    trade_id[sign == 0.0] = -1
+    n_trades = int(trade_id.max()) + 1 if len(trade_id) else 0
+    totals = np.zeros(n_trades, dtype="float64")
+
+    for i in range(len(held)):
+        # gross и funding начисляются на удерживаемую позицию — её сделке.
+        if trade_id[i] >= 0:
+            totals[trade_id[i]] += gross[i] - funding[i]
+        cost = fee_slip[i]
+        if cost == 0.0:
+            continue
+        if sign[i] == prev_sign[i]:
+            totals[trade_id[i]] -= cost              # добор внутри сделки
+        elif prev_sign[i] == 0.0:
+            totals[trade_id[i]] -= cost              # вход с плоского
+        elif sign[i] == 0.0:
+            totals[trade_id[i - 1]] -= cost          # выход в плоское
+        else:
+            # Разворот: заявка = закрытие |held[t-1]| + открытие |held[t]|.
+            w_old = abs(held[i - 1]) / (abs(held[i - 1]) + abs(held[i]))
+            close_cost = w_old * cost
+            totals[trade_id[i - 1]] -= close_cost
+            totals[trade_id[i]] -= cost - close_cost
+
+    # dtype="float64" обязателен и для пустого результата: object-пустышка
+    # ломает типы у потребителей (win-rate/profit factor в Task 12).
+    return pd.Series(totals, dtype="float64", name="trade_return")
