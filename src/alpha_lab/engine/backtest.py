@@ -95,9 +95,16 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
     turnover = np.zeros(n, dtype="float64")
     turnover[1:] = np.abs(held[1:] - held[:-1])
 
-    notional = np.abs(held) * capital
+    # База проскальзывания — размер ИСПОЛНЯЕМОЙ заявки (turnover * capital),
+    # а не удерживаемой позиции: издержка исполнения возникает на сделке, а
+    # заявка — это изменение позиции. На выходе (1 -> 0) held = 0, и базис по
+    # позиции обнулил бы проскальзывание выхода (остался бы только floor); при
+    # развороте (+1 -> -1) заявка вдвое больше позиции, и базис по held занизил
+    # бы воздействие вдвое. Обе ошибки занижают издержки и завышают доходность,
+    # сильнее всего — на высокооборотных стратегиях.
+    trade_notional = turnover * capital
     slippage_bps = np.array([
-        cost_model.slippage_bps(notional[i], quote_volume[i]) for i in range(n)
+        cost_model.slippage_bps(trade_notional[i], quote_volume[i]) for i in range(n)
     ])
     fee = turnover * cost_model.fee_bps() * BPS
     slip = turnover * slippage_bps * BPS
@@ -108,10 +115,11 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
     else:
         fund = np.zeros(n, dtype="float64")
 
-    # Ёмкость: заявка на баре t — это изменение удерживаемой позиции. Порог
-    # не влияет на исполнение (движок не режет заявки), только на диагностику.
-    order_notional = turnover * capital
-    cap_hits = int(np.count_nonzero(order_notional > max_participation * quote_volume))
+    # Ёмкость: заявка на баре t — это изменение удерживаемой позиции (тот же
+    # trade_notional, что и база проскальзывания: диагностика и модель издержек
+    # должны одинаково понимать, что такое «заявка»). Порог не влияет на
+    # исполнение (движок не режет заявки), только на диагностику.
+    cap_hits = int(np.count_nonzero(trade_notional > max_participation * quote_volume))
 
     costs = pd.DataFrame(
         {"fee": fee, "slippage": slip, "funding": fund}, index=bars.index

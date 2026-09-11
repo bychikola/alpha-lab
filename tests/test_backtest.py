@@ -160,3 +160,86 @@ def test_large_volume_produces_no_capacity_hits():
 
     assert res.cap_hits == 0
     assert res.over_capacity is False
+
+
+def test_exit_slippage_is_charged_on_the_exit_trade():
+    """Проскальзывание выхода считается по размеру выхода, а не по остатку позиции.
+
+    held = [0, 0, 0, 1, 1, 0]: заявка на выходе (бар 5) — 10 000 при объёме
+    бара 100 000, то есть 10% участия. Базис по held дал бы |held[5]| = 0 и
+    floor 0.5 bps, то есть выход был бы фактически бесплатным.
+    """
+    bars = _bars([100.0] * 6)          # цена стоит: изолируем издержки
+    bars["quote_volume"] = 1e5
+    exit_pos = pd.Series([0.0, 0.0, 1.0, 1.0, 0.0, 0.0])
+    hold_pos = pd.Series([0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+
+    exit_run = run_backtest(bars, exit_pos, RealisticCost(), capital=10_000.0)
+    hold_run = run_backtest(bars, hold_pos, RealisticCost(), capital=10_000.0)
+
+    # Заявка выхода: 10 000 / 100 000 = 10% -> 0.5 + 1e4 * 0.1 * 0.1 = 100.5 bps
+    expected_exit_bps = 0.5 + 1e4 * 0.1 * (10_000.0 / 1e5)
+    assert exit_run.costs["slippage"].iloc[5] == pytest.approx(
+        expected_exit_bps * 1e-4, rel=1e-9
+    )
+    # Выход дороже нулевой заявки (floor-only = 0.5 bps * 1e-4)
+    assert exit_run.costs["slippage"].iloc[5] > 0.5e-4 * 1.5
+    # Прогон с выходом платит строго больше, чем удержание без выхода
+    assert exit_run.cost_totals["slippage"] > hold_run.cost_totals["slippage"]
+
+
+def test_reversal_slippage_scales_with_full_trade_size():
+    """Разворот +1 -> -1 — заявка 2 * capital, а не 1 * capital (как у held).
+
+    Считаем издержку разворота против издержки выхода +1 -> 0 при том же
+    капитале и объёме. Отношение чуть больше 2: bps растёт с размером заявки
+    (impact), поэтому удвоение заявки даёт чуть больше удвоения издержки.
+    Floor, наоборот, тянет отношение к 2 — без него в impact-режиме оно
+    стремилось бы к 4. Здесь участие мало (2e-5), поэтому отклонение ~2%,
+    и допуск rel=5% покрывает его с запасом.
+    """
+    bars = _bars([100.0] * 4)          # цена стоит, объём 1e9
+    exit_pos = pd.Series([0.0, 1.0, 0.0, 0.0])      # held = [0, 0, 1, 0]
+    rev_pos = pd.Series([0.0, 1.0, -1.0, 0.0])      # held = [0, 0, 1, -1]
+
+    exit_run = run_backtest(bars, exit_pos, RealisticCost(), capital=10_000.0)
+    rev_run = run_backtest(bars, rev_pos, RealisticCost(), capital=10_000.0)
+
+    exit_slip = float(exit_run.costs["slippage"].iloc[3])       # заявка 1 * capital
+    rev_slip = float(rev_run.costs["slippage"].iloc[3])         # заявка 2 * capital
+
+    # Выход: 0.5 + 1e4 * 0.1 * 1e-5 = 0.51 bps; разворот: 2 * 0.52 = 1.04 bps
+    assert exit_slip == pytest.approx(0.51e-4, rel=1e-3)
+    assert rev_slip == pytest.approx(1.04e-4, rel=1e-3)
+    assert rev_slip / exit_slip == pytest.approx(2.0, rel=0.05)
+
+
+def test_capacity_hits_use_traded_notional_not_held_position():
+    """Большая позиция при маленькой заявке не должна давать cap_hit.
+
+    held = [0, 0, 1, 2, 3, 4, 4.5]: ноционал позиции доходит до 45 000,
+    но все заявки <= 10 000 (порог 0.01 * 1e6), поэтому ёмкость доказана.
+    """
+    bars = _bars([100.0] * 7)
+    bars["quote_volume"] = 1e6
+    positions = pd.Series([0.0, 1.0, 2.0, 3.0, 4.0, 4.5, 4.5])
+
+    res = run_backtest(bars, positions, ZeroCost(), capital=10_000.0,
+                       max_participation=0.01)
+
+    assert np.abs(res.positions).max() * 10_000.0 > 0.01 * 1e6   # позиция > порога
+    assert res.turnover.max() * 10_000.0 <= 0.01 * 1e6           # заявки <= порога
+    assert res.cap_hits == 0
+    assert res.over_capacity is False
+
+
+def test_zero_cost_equity_is_bit_exact_cumprod():
+    """ZeroCost не должен вносить ни одного лишнего floating-point шага."""
+    bars = _bars([100, 110, 90, 95, 105, 99])
+    positions = pd.Series([1.0, -1.0, 1.0, 0.0, 1.0, -1.0])
+
+    res = run_backtest(bars, positions, ZeroCost())
+
+    expected = np.cumprod(1.0 + res.gross_returns.to_numpy())
+    np.testing.assert_array_equal(res.equity.to_numpy(), expected)
+    assert res.costs.to_numpy().sum() == 0.0
