@@ -89,7 +89,7 @@ D:\alpha-lab\
 class Strategy(Protocol):
     name: str
 
-    def generate(self, bars: pl.DataFrame) -> pl.Series:
+    def generate(self, bars: pd.DataFrame) -> pd.Series:
         """Целевая позиция: -1.0 (полный шорт) … 0.0 … +1.0 (полный лонг).
 
         bars: колонки ts, open, high, low, close, volume, sorted by ts.
@@ -297,9 +297,9 @@ OU-симуляция из `index.html` используется как фикс
 | Решение | Обоснование |
 |---|---|
 | **Python 3.14.6, управление через `uv` 0.12.3** | Уже установлены. Проверено `pip --dry-run`: колёса pandas, scipy, statsmodels, scikit-learn, pyarrow, duckdb, ccxt, arch, numba, lightgbm, polars резолвятся. Системный Python не трогаем; при проблемах `uv` откатит на 3.12 за секунды. |
-| **Polars + pandas interop** | Polars быстрее на векторизованных признаках; pandas — для совместимости с statsmodels. |
+| **pandas везде, Polars не тянем** | Тяжёлое чтение Parquet снимает DuckDB; в памяти остаются объёмы, где Polars не даёт выигрыша. `statsmodels`/`scipy`/`numpy` работают с pandas нативно. Два API датафреймов в одном проекте — лишняя сложность и лишние баги. |
 | **DuckDB поверх Parquet** | 16 ГБ RAM против десятков ГБ данных. Плюс воспроизводимость: SQL-запрос сохраняется в конфиг эксперимента. |
-| **numba для горячих циклов** | Событийный цикл бэктеста на 79 млн баров в чистом Python неподъёмен. |
+| **numba для симуляции выходов** | Нахождение входов векторизовано (numpy), но SL/TP — путь-зависимы и требуют цикла. На 25 парах × 6 лет чистом Python это неподъёмно. При недоступности numba на 3.14 — `uv python pin 3.12`. |
 | **Parquet + zstd на `D:\alpha-lab\data`** | На `C:` свободно 6 ГБ — ОС задохнётся. На `D:` — 50 ГБ. |
 | **Дашборд без сборки** | Соответствует философии существующего `index.html`: открыл файл — работает. |
 | **pytest** | Стандарт. |
