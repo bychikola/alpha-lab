@@ -58,7 +58,7 @@
        <p>funnel.js содержит schema_version «${esc(funnel.schema_version)}», ` +
       `дашборд умеет ${REQUIRED_MAJOR}.x. Числа не показаны: ` +
       `частично совместимая воронка выглядела бы правдоподобно, но была бы неверна.</p></div>`;
-    app.appendChild(card);
+    attach();
     return;
   }
 
@@ -163,5 +163,16 @@
     хранилищу ${esc((funnel.source && funnel.source.store) || '—')} ·
     схема ${esc(funnel.schema_version)}</p>`;
 
-  app.appendChild(card);
+  // app.js рисует отчёт на DOMContentLoaded (его слушатель зарегистрирован
+  // раньше), и вставка во время разбора была бы затёрта его innerHTML.
+  // Карточка собрана заранее и не привязана к документу, поэтому вставляем её
+  // после init: слушатели DOMContentLoaded срабатывают в порядке регистрации.
+  function attach() {
+    app.appendChild(card);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', attach);
+  } else {
+    attach();
+  }
 })();
