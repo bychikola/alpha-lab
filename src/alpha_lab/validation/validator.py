@@ -2,7 +2,7 @@
 
 Инвариант: этот модуль НЕ импортирует слой стратегий.
 Иначе появляется соблазн «подкрутить» проверку под конкретную стратегию.
-Проверяется тестом tests/test_traps.py::test_validator_does_not_import_strategies.
+Проверяется тестом из tests/test_traps.py.
 """
 from __future__ import annotations
 
@@ -89,16 +89,23 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
         reasons.append(
             f"недостаточно сделок: {n_trades} < {thresholds['min_trades']}"
         )
-    if dsr <= thresholds["min_dsr"]:
+    if not np.isfinite(dsr) or dsr <= thresholds["min_dsr"]:
         reasons.append(
             f"DSR {dsr:.3f} ≤ {thresholds['min_dsr']} (с поправкой на {n_trials} попыток)"
         )
-    if p_value >= thresholds["max_p_value"]:
+    if not np.isfinite(p_value) or p_value >= thresholds["max_p_value"]:
         reasons.append(
             f"p-value {p_value:.3f} ≥ {thresholds['max_p_value']} — неотличимо от случая"
         )
-    if np.isfinite(pbo) and pbo >= thresholds["max_pbo"]:
-        reasons.append(f"PBO {pbo:.2f} ≥ {thresholds['max_pbo']} — признак подгонки")
+    if np.isfinite(pbo):
+        if pbo >= thresholds["max_pbo"]:
+            reasons.append(f"PBO {pbo:.2f} ≥ {thresholds['max_pbo']} — признак подгонки")
+    elif returns_matrix is not None:
+        # Матрицу передали, но CSCV её не осилил: молча пропустить проверку нельзя.
+        reasons.append(
+            f"PBO не вычислен для матрицы {np.asarray(returns_matrix).shape}: "
+            f"нужно ≥ 2 конфигураций и ≥ 2·n_blocks наблюдений"
+        )
 
     stats = summarize(r, t, eq, PERIODS_PER_YEAR) if len(r) else {}
 

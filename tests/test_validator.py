@@ -120,6 +120,30 @@ def test_pbo_is_nan_without_matrix_and_threshold_skipped():
     assert not any("PBO" in reason for reason in v.reasons)
 
 
+def test_pbo_degenerate_matrix_single_config_is_dead():
+    """Матрица передана, но PBO невычислим: тихий пропуск недопустим."""
+    rng = np.random.default_rng(14)
+    matrix = rng.normal(0.0, 0.01, size=(200, 1))
+    v = _run(_case(seed=14, strength=0.8), _trades(300, 14),
+             returns_matrix=matrix)
+
+    assert np.isnan(v.pbo)
+    assert not v.alive
+    assert any("PBO не вычислен" in reason for reason in v.reasons)
+
+
+def test_pbo_too_short_matrix_is_dead():
+    """Матрицы короче 2·n_blocks наблюдений для CSCV недостаточно."""
+    rng = np.random.default_rng(15)
+    matrix = rng.normal(0.0, 0.01, size=(15, 5))
+    v = _run(_case(seed=15, strength=0.8), _trades(300, 15),
+             returns_matrix=matrix)
+
+    assert np.isnan(v.pbo)
+    assert not v.alive
+    assert any("PBO не вычислен" in reason for reason in v.reasons)
+
+
 def test_pbo_computed_when_matrix_given():
     rng = np.random.default_rng(12)
     matrix = rng.normal(0.0, 0.01, size=(200, 5))
@@ -128,6 +152,20 @@ def test_pbo_computed_when_matrix_given():
 
     assert np.isfinite(v.pbo)
     assert 0.0 <= v.pbo <= 1.0
+
+
+def test_non_finite_dsr_produces_reason(monkeypatch):
+    """NaN DSR не должен молча проходить порог: nan <= x и nan >= x — оба False."""
+    import alpha_lab.validation.validator as validator_module
+
+    monkeypatch.setattr(
+        validator_module, "deflated_sharpe_ratio", lambda *args, **kwargs: float("nan")
+    )
+    v = _run(_case(seed=16, strength=0.8), _trades(300, 16))
+
+    assert np.isnan(v.dsr)
+    assert not v.alive
+    assert any("DSR" in reason for reason in v.reasons)
 
 
 def test_validation_block_from_experiment_config_is_tolerated():
