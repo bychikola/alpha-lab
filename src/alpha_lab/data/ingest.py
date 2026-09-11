@@ -104,6 +104,11 @@ def parse_kline_csv(raw: bytes, *,
     df = df.drop(columns=[c for c in ("_taker_quote", "_ignore") if c in df.columns])
 
     parsed_rows = len(df)
+    # Бар с NaT-меткой write_bars молча выбросил бы при группировке по месяцу
+    # (pandas не создаёт группу для NaT), и он числился бы загруженным. Убираем
+    # такие строки здесь и считаем их отброшенными — отчёт обязан совпадать с
+    # тем, что реально ляжет на диск.
+    df = df.loc[df["ts"].notna()]
     out = normalize_bars(df)
     if stats is not None:
         stats["dropped_rows"] = parsed_rows - len(out)
@@ -172,6 +177,9 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
         if dropped:
             # Отброшенные бары не проглатываем: они видны в отчёте.
             detail += f"; отброшено строк: {dropped}"
+        if missing:
+            # 404 — норма для ранних месяцев, но оператор должен видеть масштаб.
+            detail += f"; пропущено месяцев: {missing}"
         results.append(IngestResult(symbol, "klines", bar_files, len(bars),
                                     detail, dropped_rows=dropped))
     else:
@@ -181,7 +189,13 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
     if with_funding:
         fund_frames = []
         for period in months:
-            raw = _download(archive_url(market, "fundingRate", symbol, None, period))
+            try:
+                raw = _download(archive_url(market, "fundingRate", symbol, None,
+                                            period))
+            except requests.RequestException as exc:
+                # Сбой funding не должен уносить с собой уже загруженные klines.
+                results.append(IngestResult(symbol, "funding", 0, 0, "", str(exc)))
+                return results
             if raw is not None:
                 fund_frames.append(parse_funding_csv(raw))
         if fund_frames:
@@ -199,6 +213,11 @@ def ingest_universe(universe, freq: str, root: Path = DEFAULT_ROOT
                     ) -> list[IngestResult]:
     out: list[IngestResult] = []
     for symbol in universe.symbols:
-        out.extend(ingest_symbol(symbol, freq, universe.start, universe.end,
-                                 root=root, market=universe.market))
+        try:
+            out.extend(ingest_symbol(symbol, freq, universe.start, universe.end,
+                                     root=root, market=universe.market))
+        except Exception as exc:
+            # Изоляция символов: один сбойный символ не должен уносить с собой
+            # отчёт по остальным — цикл обязан дойти до последнего.
+            out.append(IngestResult(symbol, "universe", 0, 0, "", str(exc)))
     return out

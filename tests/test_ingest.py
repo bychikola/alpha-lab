@@ -1,5 +1,6 @@
 import pandas as pd
 import pytest
+import requests
 
 from alpha_lab.data.ingest import (
     archive_url, month_range, parse_funding_csv, parse_kline_csv,
@@ -105,3 +106,84 @@ def test_ingest_reports_dropped_rows(tmp_path, monkeypatch):
     assert result.rows == 2
     assert result.dropped_rows == 1
     assert "отброшено" in result.quality
+
+
+# Строка с неразбираемой меткой времени получает NaT. write_bars группирует по
+# месяцу и молча выбрасывает NaT-ключи, поэтому до диска такой бар не доходит.
+# Парсер обязан сразу посчитать его отброшенным, а не отчитаться как о загруженном.
+KLINE_WITH_BAD_TIMESTAMP = KLINE_WITH_HEADER + (
+    b"not-a-timestamp,42354.00,42360.00,42350.00,42355.00,100.0,"
+    b"1704067379999,4235500.0,900,50.0,2117750.0,0\n"
+)
+
+
+def test_parse_kline_reports_dropped_nat_timestamp_rows():
+    stats = {}
+    df = parse_kline_csv(KLINE_WITH_BAD_TIMESTAMP, stats=stats)
+
+    assert stats["dropped_rows"] == 1
+    assert len(df) == 2
+    assert df["ts"].notna().all()
+
+
+# Сбой загрузки funding (таймаут, 5xx) не должен вылетать из ingest_symbol:
+# klines уже загружены, и отчёт по ним обязан уцелеть.
+def test_funding_download_error_is_isolated(tmp_path, monkeypatch):
+    import alpha_lab.data.ingest as ingest_module
+
+    def fake_download(url):
+        if "fundingRate" in url:
+            raise requests.RequestException("funding timeout")
+        return KLINE_WITH_HEADER
+
+    monkeypatch.setattr(ingest_module, "_download", fake_download)
+    results = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path, with_funding=True)
+
+    assert len(results) == 2
+    assert results[0].ok
+    funding = results[1]
+    assert funding.kind == "funding"
+    assert not funding.ok
+    assert "funding timeout" in funding.error
+
+
+# Один сбойный символ не должен уносить с собой весь прогон по вселенной:
+# цикл обязан дойти до последнего символа и вернуть отчёт по каждому.
+def test_ingest_universe_isolates_failing_symbol(tmp_path, monkeypatch):
+    import alpha_lab.data.ingest as ingest_module
+
+    class Universe:
+        symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+        start = "2024-01-01"
+        end = "2024-01-31"
+        market = "futures-um"
+
+    def fake_ingest(symbol, freq, start, end, root=None, market="futures-um"):
+        if symbol == "BBBUSDT":
+            raise RuntimeError("битый символ")
+        return [ingest_module.IngestResult(symbol, "klines", 1, 10, "OK")]
+
+    monkeypatch.setattr(ingest_module, "ingest_symbol", fake_ingest)
+    results = ingest_module.ingest_universe(Universe(), "1m", tmp_path)
+
+    assert [r.symbol for r in results] == ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+    assert results[0].ok and results[2].ok
+    assert not results[1].ok
+    assert "битый символ" in results[1].error
+
+
+# 404 на месячном файле — норма (ранние месяцы), но оператор должен видеть,
+# сколько месяцев реально отсутствовало, а не молчаливое «ок».
+def test_ingest_reports_missing_months(tmp_path, monkeypatch):
+    import alpha_lab.data.ingest as ingest_module
+
+    monkeypatch.setattr(
+        ingest_module, "_download",
+        lambda url: None if "2024-02" in url else KLINE_WITH_HEADER)
+    results = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-02-29", tmp_path, with_funding=False)
+
+    assert len(results) == 1
+    assert results[0].ok
+    assert "пропущено месяцев: 1" in results[0].quality
