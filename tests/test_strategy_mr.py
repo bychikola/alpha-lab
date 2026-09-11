@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from fixtures.causality import assert_strategy_is_causal
 from fixtures.synthetic import ou_bars, random_walk_bars
 
 from alpha_lab.data.quality import check_bars
@@ -21,22 +22,26 @@ def test_position_is_bounded():
 
 
 def test_no_lookahead_position_depends_only_on_past():
-    """Изменение будущих баров не должно менять прошлые позиции."""
+    """Изменение будущих баров не должно менять прошлые позиции.
+
+    Проверку ведёт общий harness (tests/fixtures/causality.py): он сравнивает
+    generate(bars.iloc[:k]) с generate(bars).iloc[:k] в нескольких точках
+    усечения и падает с русским сообщением о первом расхождении. Дублировать
+    сравнение здесь не нужно — harness и есть контракт.
+    """
     bars = ou_bars(n=2000, seed=12)
     s = MeanReversionStrategy({"window": 20, "k": 2.0})
 
-    full = s.generate(bars)
-    truncated = s.generate(bars.iloc[:1000])
-
-    pd.testing.assert_series_equal(full.iloc[:1000], truncated, check_names=False)
+    assert_strategy_is_causal(s, bars)
 
 
 def test_no_lookahead_with_half_life_filter():
     """Фильтр полужизни тоже обязан быть причинным: окно [i-w, i) — только прошлое.
 
-    Тот же приём, что и в тесте выше, но с включённым фильтром: если бы
-    _half_life_ok заглядывал в текущий или будущий бар, префикс позиций
-    изменился бы при усечении ряда.
+    Та же проверка harness'ом, но с включённым фильтром: если бы _half_life_ok
+    заглядывал в текущий или будущий бар, префикс позиций изменился бы при
+    усечении ряда. Это отдельный (опциональный) путь кода, поэтому он покрыт
+    своим тестом, а не только общим случаем выше.
     """
     bars = ou_bars(n=1200, seed=12)
     s = MeanReversionStrategy({
@@ -44,10 +49,7 @@ def test_no_lookahead_with_half_life_filter():
         "hl_window": 100, "hl_min": 0.5, "hl_max": 50.0,
     })
 
-    full = s.generate(bars)
-    truncated = s.generate(bars.iloc[:600])
-
-    pd.testing.assert_series_equal(full.iloc[:600], truncated, check_names=False)
+    assert_strategy_is_causal(s, bars)
 
 
 def test_generates_trades_on_mean_reverting_series():

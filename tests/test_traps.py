@@ -15,8 +15,12 @@
 
 Ловушки подглядывания (LookAhead, PerfectForesight) — не про статистику:
 в доходностях подглядывание неотличимо от настоящего edge, и validate() его
-не ловит. Их тесты доказывают сам дефект (точное тождество gross[t] == |ret[t]|)
-и то, что отбраковывает прогон не валидатор, а диагностика ёмкости движка.
+не ловит — это фундаментальное ограничение, а не баг (spec 8.1). Регрессия
+на слепоту валидатора зафиксирована ниже явно. Отбраковывает подглядывание
+не статистика, а причинностный harness (tests/fixtures/causality.py):
+generate(bars[:k]) обязана совпадать с generate(bars)[:k]. Тесты ниже
+доказывают, что harness действительно ловит обе ловушки и не падает на
+причинной AlwaysLong.
 """
 from __future__ import annotations
 
@@ -24,6 +28,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
+from fixtures.causality import assert_strategy_is_causal
 from fixtures.synthetic import ou_bars
 from fixtures.traps import (
     AlwaysLongStrategy, LookAheadStrategy, OverfitNoiseStrategy,
@@ -32,6 +38,7 @@ from fixtures.traps import (
 
 from alpha_lab.engine.backtest import run_backtest, trade_returns
 from alpha_lab.engine.costs import RealisticCost, ZeroCost
+from alpha_lab.validation.metrics import sharpe_ratio
 from alpha_lab.validation.validator import validate
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -66,7 +73,7 @@ def test_validator_does_not_import_strategies():
     assert scanned > 0, f"скан не прочитал ни одного файла в {validation_dir}"
 
 
-def test_lookahead_strategy_is_rejected_as_too_good():
+def test_lookahead_payoff_identity_and_capacity_rejection():
     """Подглядывание: сдвиг движка не блокирует его, а точно компенсирует.
 
     Движок держит held[t] = pos[t-1]. Ловушка кладёт
@@ -80,9 +87,9 @@ def test_lookahead_strategy_is_rejected_as_too_good():
     минутного бара (quote_volume ~ 1000), движок помечает прогон как
     over_capacity, а издержки обнуляют эквити (total_return == -1.0).
     «Слишком хорошо» означает: при нулевых издержках сигнал даёт ~1.6e10,
-    при реалистичных — неисполним и убыточен. Статистический валидатор
-    подглядывание не ловит вовсе — защита в конвенции времени и диагностике
-    ёмкости, поэтому здесь проверяем движок, а не validate().
+    при реалистичных — неисполнимо и убыточно. Статистический валидатор
+    подглядывание не ловит вовсе (spec 8.1): причинность ловит harness, а
+    здесь проверяются движок и его диагностика ёмкости.
     """
     bars = ou_bars(n=3000, seed=21)
     pos = LookAheadStrategy().generate(bars)
@@ -136,6 +143,100 @@ def test_perfect_foresight_is_impossible_in_practice():
     pd.testing.assert_series_equal(pos.iloc[:-2], down.iloc[:-2])
 
 
+class _MisalignedIndexStrategy:
+    """Нарушает индексную конвенцию harness'а: подписывает позиции `ts`, не индексом баров.
+
+    Значения причинны (константа), поэтому поймать нарушение может только
+    явная проверка индекса: без неё reset_index/выравнивание по меткам молча
+    «нормализовало» бы результат.
+    """
+
+    name = "trap_misaligned_index"
+
+    def generate(self, bars: pd.DataFrame) -> pd.Series:
+        return pd.Series(1.0, index=pd.Index(bars["ts"], name="ts"))
+
+
+def test_causality_harness_catches_lookahead_trap():
+    """Harness обязан поймать подглядывание: усечение вскрывает чтение будущего.
+
+    На усечённом ряде последний бар не имеет будущего, и ловушка ставит там 0;
+    в полном прогоне на той же позиции стоит знак следующего бара. Расхождение
+    ровно в одной позиции на каждую точку усечения — этого достаточно.
+    """
+    bars = ou_bars(n=1000, seed=22)
+
+    with pytest.raises(AssertionError, match=r"k=250 — позиций 1 из 250"):
+        assert_strategy_is_causal(LookAheadStrategy(), bars)
+
+
+def test_causality_harness_catches_perfect_foresight_trap():
+    """PerfectForesight читает весь ряд целиком — harness ловит и его."""
+    bars = ou_bars(n=1000, seed=22)
+
+    with pytest.raises(AssertionError, match=r"k=250 — позиций 1 из 250"):
+        assert_strategy_is_causal(PerfectForesightStrategy(), bars)
+
+
+def test_causality_harness_passes_always_long_and_custom_cut_points():
+    """AlwaysLong причинна: она игнорирует вход, поэтому усечение ничего не меняет.
+
+    Контроль в обратную сторону: harness, который валит всё подряд, бесполезен.
+    Заодно проверяется путь caller-supplied cut_points.
+    """
+    bars = ou_bars(n=1000, seed=22)
+
+    assert_strategy_is_causal(AlwaysLongStrategy(), bars, cut_points=[7, 333, 999])
+
+
+def test_causality_harness_enforces_bar_index_convention():
+    """Индексная конвенция проверяется, а не обходится reset_index'ом.
+
+    Harness требует, чтобы позиция была подписана баром (индекс результата равен
+    индексу входа). Стратегия, подписывающая позиции колонкой ts, — нарушение
+    контракта, о котором сообщается явно: молчаливая нормализация скрыла бы
+    misalignment, а значения здесь причинны, и без проверки индекса тест прошёл бы.
+    """
+    bars = ou_bars(n=200, seed=22)
+
+    with pytest.raises(AssertionError, match="индексную конвенцию"):
+        assert_strategy_is_causal(_MisalignedIndexStrategy(), bars)
+
+
+def test_validator_cannot_detect_lookahead_documented_limitation():
+    """ИЗВЕСТНОЕ ФУНДАМЕНТАЛЬНОЕ ограничение: validate() слеп к подглядыванию.
+
+    Валидатор — статистика по реализованным доходностям. Подглядывание и
+    настоящий edge дают одинаковое совместное распределение (r_t, h_t), поэтому
+    никакая проверка по returns/price_returns/positions их не различит (spec 8.1).
+    Замер: validate() на выходах движка с ZeroCost даёт alive=True, DSR 1.0,
+    p 0.001, годовой Sharpe 125.1. Защита — не статистика, а причинностный
+    harness (tests/fixtures/causality.py), которому обязана подвергаться каждая
+    стратегия; здесь зафиксирована именно слепота валидатора.
+
+    ЕСЛИ ЭТОТ ТЕСТ НАЧНЁТ ПАДАТЬ — значит в валидаторе появился механизм,
+    который различает подглядывание; его нужно понять и осознанно принять,
+    а не «починить» порогом или ослабить тест.
+    """
+    bars = ou_bars(n=3000, seed=21)
+    target = LookAheadStrategy().generate(bars)
+    res = run_backtest(bars, target, ZeroCost())
+
+    v = validate(res.returns, trade_returns(res), res.equity, config={}, n_trials=1,
+                 strategy_name="trap_lookahead", experiment_id="la_blind",
+                 price_returns=res.price_returns, positions=res.positions)
+
+    assert v.alive, f"валидатор внезапно поймал look-ahead: {v.reasons}"
+    assert v.reasons == ()
+    # Статистика «отличная» ровно потому, что ловушка выровнена с доходностью
+    # по построению, — это и есть ловушка, а не доказательство мастерства.
+    assert v.dsr > 0.95 and v.p_value < 0.05
+    assert v.sharpe > 100.0
+    # Причинностный harness на тех же данных обязан упасть — он и есть защита.
+    with pytest.raises(AssertionError, match="не причинна"):
+        assert_strategy_is_causal(LookAheadStrategy(), bars)
+
+
 def _case(n, seed, strength):
     """Согласованный набор: доходности цены, позиции, доходность стратегии."""
     rng = np.random.default_rng(seed)
@@ -180,6 +281,42 @@ def test_always_long_on_flat_series_fails():
     assert v.dsr < 0.95
 
 
+def test_positions_argument_must_be_engine_held_positions():
+    """Контракт validate(positions=...): только УДЕРЖИВАЕМЫЕ движком позиции.
+
+    permutation-тест спрашивает, выровнена ли удерживаемая экспозиция с
+    доходностями цены. При ZeroCost выполняется точное тождество
+    res.returns == res.positions * res.price_returns, поэтому именно
+    result.positions — тот ряд, к которому относится наблюдаемый Sharpe.
+    Сырые целевые позиции стратегии сдвинуты на бар (held[t] = target[t-1]),
+    их произведение с price_returns — уже не реализованные доходности, и
+    перемешивание разрушает связь, которой и так нет.
+
+    Замер на ловушке LookAhead (ZeroCost, 3000 баров): result.positions дают
+    p=0.001 (alive=True), strategy.generate(bars) — p=0.344 (kill по p-value),
+    то есть подмена аргумента ложно убивает прогон. Task 18 обязан передавать
+    result.positions.
+    """
+    bars = ou_bars(n=3000, seed=21)
+    target = LookAheadStrategy().generate(bars)
+    res = run_backtest(bars, target, ZeroCost())
+    trades = trade_returns(res)
+    common = dict(config={}, n_trials=1, strategy_name="trap_lookahead",
+                  experiment_id="positions_contract")
+
+    held = validate(res.returns, trades, res.equity,
+                    price_returns=res.price_returns, positions=res.positions,
+                    **common)
+    raw = validate(res.returns, trades, res.equity,
+                   price_returns=res.price_returns, positions=target, **common)
+
+    assert held.p_value != raw.p_value
+    assert held.p_value < 0.05           # корректный вход: экспозиция выровнена
+    assert raw.p_value >= 0.05           # сырые цели: выравнивание потеряно
+    assert held.alive
+    _assert_killed(raw, "p-value")
+
+
 def test_overfit_segment_is_killed_by_min_trades():
     """Подгонка под отрезок: 50 баров = 1 сделка — гейт min_trades рубит."""
     bars = ou_bars(n=4000, seed=29)
@@ -196,15 +333,20 @@ def test_overfit_segment_is_killed_by_min_trades():
 
 
 def test_strong_edge_survives_validation():
-    """Контрольный случай: настоящая альфа НЕ должна убиваться.
+    """Контрольный случай: РЕАЛИСТИЧНАЯ альфа у границы НЕ должна убиваться.
 
     Не менее важен, чем тест на убийство ловушек: валидатор, который режет всё
-    подряд, бесполезен ровно так же, как тот, что не режет ничего.
+    подряд, бесполезен ровно так же, как тот, что не режет ничего. Прежний
+    оракул (годовой Sharpe 78) проходил бы и всеядный валидатор, поэтому здесь
+    край у самой границы: годовой Sharpe ≈ 1.7 при пороге ≈ 1.1 (DSR > 0.95
+    при n_trials=1: per-bar Sharpe > 1.645/sqrt(n) ≈ 0.0116, годовой ≈ 1.09).
+    Замер: per-bar 0.0184, годовой 1.717, DSR 0.9953, p 0.0060, alive=True.
     """
-    returns, pr, pos = _case(n=20000, seed=25, strength=0.8)
-    # Оракул действительно сильный: позиция совпадает со знаком доходности
-    # бара в ~90% случаев (0.8 подмешивания + половина случайных совпадений).
-    assert (pos.to_numpy() == np.sign(pr.to_numpy())).mean() > 0.85
+    returns, pr, pos = _case(n=20000, seed=25, strength=0.02)
+    raw = sharpe_ratio(returns, annualize=False)
+    annual = sharpe_ratio(returns)
+    assert 0.015 < raw < 0.03, f"край не у границы: per-bar Sharpe {raw:.4f}"
+    assert 1.5 < annual < 2.5, f"годовой Sharpe {annual:.3f} вне реалистичного окна"
     trades = pd.Series(np.random.default_rng(25).normal(0.002, 0.01, 400))
 
     v = validate(returns, trades, (1 + returns).cumprod(), config={}, n_trials=1,
@@ -214,9 +356,40 @@ def test_strong_edge_survives_validation():
     assert v.alive, f"Валидатор убил настоящий edge: {v.reasons}"
     assert v.reasons == ()
     assert v.trades == 400
-    assert v.sharpe > 10.0
     assert v.dsr > 0.95
     assert v.p_value < 0.05
+
+
+def test_edge_below_boundary_is_killed():
+    """Негативный контроль: край слабее порога обязан погибнуть.
+
+    Слабый, но настоящий сигнал (per-bar Sharpe ≈ 0.005, годовой ≈ 0.48)
+    против порога ≈ 1.1. Замер: DSR 0.766 и p 0.251 — убит статистикой, а не
+    отсутствием входов. В паре с тестом выше это и есть проверка порогов:
+    всеядный валидатор валит первый тест, режущий всё — второй.
+    """
+    returns, pr, pos = _case(n=20000, seed=32, strength=0.02)
+    raw = sharpe_ratio(returns, annualize=False)
+    assert 0.0 < raw < 0.0116, f"контроль не ниже границы: per-bar Sharpe {raw:.4f}"
+    trades = pd.Series(np.random.default_rng(32).normal(0.002, 0.01, 400))
+
+    v = validate(returns, trades, (1 + returns).cumprod(), config={}, n_trials=1,
+                 strategy_name="below_boundary", experiment_id="t3_neg",
+                 price_returns=pr, positions=pos)
+
+    assert not v.alive, f"край ниже порога выжил: {v.reasons}"
+    assert MISSING_INPUT_REASON not in " ".join(v.reasons)
+    assert any("p-value" in r or "DSR" in r for r in v.reasons), v.reasons
+    assert v.sharpe < 1.1
+    assert v.dsr < 0.95 and v.p_value >= 0.05
+
+
+# Фикстура изоляции n_trials: слабый, но настоящий край у границы, который сам
+# по себе (n_trials=1) выживает. Замер per-bar Sharpe 0.0525 на 4000 барах:
+# n_trials=1 -> DSR 0.9995, p 0.002, alive=True; n_trials=10000 -> sr0 ≈ 0.061,
+# DSR 0.294 — убивает ТОЛЬКО поправка на число попыток.
+MANY_TRIALS_CASE = dict(n=4000, seed=28, strength=0.06)
+MANY_TRIALS_TRADES = 150
 
 
 def test_all_traps_are_killed_by_validator():
@@ -229,8 +402,8 @@ def test_all_traps_are_killed_by_validator():
                             defect="p-value"),
         "tiny_sample": dict(n=4000, seed=27, strength=0.8, trades=5, trials=1,
                             defect="недостаточно сделок"),
-        "many_trials": dict(n=4000, seed=28, strength=0.0, trades=150, trials=10000,
-                            defect="10000 попыток"),
+        "many_trials": {**MANY_TRIALS_CASE, "trades": MANY_TRIALS_TRADES,
+                        "trials": 10000, "defect": "10000 попыток"},
     }
 
     verdicts = {}
@@ -250,3 +423,42 @@ def test_all_traps_are_killed_by_validator():
     tiny = verdicts["tiny_sample"]
     assert tiny.reasons == ("недостаточно сделок: 5 < 100",)
     assert tiny.dsr > 0.95 and tiny.p_value < 0.05
+
+
+def test_many_trials_penalty_is_isolated_via_dsr():
+    """many_trials обязан убиваться ИМЕННО поправкой на число попыток.
+
+    Прежняя фикстура (чистый шум) умирала от DSR и p-value уже при n_trials=1,
+    поэтому реализация, полностью игнорирующая n_trials, проходила бы сводный
+    тест. Здесь у стратегии есть слабый настоящий край: при n_trials=1 вердикт
+    alive=True со всеми пройденными порогами, при n_trials=10000 те же returns,
+    trades и p-value остаются прежними, а гибнет он ровно на DSR.
+    """
+    returns, pr, pos = _case(**MANY_TRIALS_CASE)
+    trades = pd.Series(
+        np.random.default_rng(MANY_TRIALS_CASE["seed"]).normal(0.001, 0.01,
+                                                                MANY_TRIALS_TRADES)
+    )
+
+    def verdict(n_trials):
+        return validate(returns, trades, (1 + returns).cumprod(), config={},
+                        n_trials=n_trials, strategy_name="many_trials",
+                        experiment_id=f"trials_{n_trials}",
+                        price_returns=pr, positions=pos)
+
+    one = verdict(1)
+    many = verdict(10000)
+
+    assert one.alive, f"край убит уже при n_trials=1: {one.reasons}"
+    assert one.reasons == ()
+    assert one.dsr > 0.95 and one.p_value < 0.05
+
+    assert not many.alive
+    # Единственная причина — DSR: значит, убила именно дефляция на 10000 попыток.
+    assert len(many.reasons) == 1, f"убийство не изолировано: {many.reasons}"
+    reason = _assert_killed(many, "10000 попыток")
+    assert "DSR" in reason
+    assert many.n_configs_tried == 10000
+    assert many.dsr < 0.95
+    # p-value и min_trades не изменились — они не могли убить many_trials.
+    assert many.p_value < 0.05 and many.trades >= 100
