@@ -401,3 +401,128 @@ warning-free, на закоммиченном дереве.
 `uv run pytest -q -W error` → **326 passed**, warning-free (на закоммиченном
 дереве `f9f87d0`). BTC-вердикт `МЕРТВА`, метрики побитово прежние.
 
+## Fix wave 2
+
+Финальное ревью W2: после сегментации post-gap lookahead стал **избыточным и
+вредным**. Коммит `9e2d260` — «fix: W2 review — gap mask lookahead 0 after
+segmentation». `engine/`, сегментация, `history_bars`, annualization и funding
+не тронуты.
+
+### Почему lookahead=0, а lookback=1 остаётся несущим
+
+- Доходность сквозь дыру `close[i0]/close[i0-1] − 1` движок зарабатывает
+  только через `held[i0] = target[i0-1]` — последнее решение **предразрывного**
+  участка. Сегментация этот target не трогает, поэтому `lookback=1` обязателен:
+  без него позиция проходит сквозь неизвестное движение.
+- Любой target при `t >= i0` порождён свежим `generate` по `bars[i0:]`.
+  Самая ранняя доходность такой позиции — `close[i0+1]/close[i0] − 1`, то есть
+  полностью контигуозный бар. Решения после дыры достоверны по построению.
+- Прежняя формула окна `[i-1-lookback, i-1+lookahead]` при `lookback=1`
+  маскировала **два** бара перед дырой; семантика приведена к имени и к
+  trade-flow аргументу: `[i-lookback, i-1+lookahead]`. Теперь `lookback=1` —
+  ровно последний бар перед дырой (SOL: 2 бара на 2 разрыва, по одному).
+- Утверждение «решения после дыры опираются на скользящие окна, пересекающие
+  пропуск» удалено из кода, докстрингов, spec 8 и чекбокса W1 как ложное
+  после сегментации. `history_bars` оставлен: это подлинная память стратегии
+  (диагностика `extra.history_bars`, будущий несегментированный путь), но маску
+  он больше не задаёт.
+
+### Что изменено
+
+- `cli.py`: `_gap_mask(..., lookahead=0)`, окно `[i-lookback, i-1+lookahead]`;
+  вызов в `_cmd_validate` — `lookahead=0`; предупреждение вердикта объясняет
+  `lookback=1`/`lookahead=0`; импорт `DEFAULT_HISTORY_BARS` убран (константа
+  нигде не торчала дефолтом маски).
+- `strategies/base.py`: комментарии `history_bars` (поле) и `history_bars_of`,
+  а также обоснование `DEFAULT_HISTORY_BARS` — без ложного «маскируется окно
+  после разрыва».
+- spec 8 (строка «Грязные данные») и чекбокс W1 плана фазы 1.5 — механизм
+  «сегментация + lookback=1» вместо «lookback/lookahead = 1/1».
+- Тесты: `test_gap_mask_window_margins_are_configurable` (новая семантика окна,
+  дефолт), `test_gap_mask_has_no_forward_window_after_segmentation` (замена
+  теста про lookahead из history_bars), `test_gap_blocks_carry_and_trading_resumes`
+  (сквозной: предусловие — сегментация перенос НЕ снимает, маска снимает),
+  `test_post_gap_signal_is_not_suppressed_by_mask` (новый: crafted-фикстура,
+  сигнал с `i+24` выживает), `test_data_gaps_are_surfaced_and_warned`,
+  `test_gap_segmentation_aligns_to_original_index`,
+  `test_gap_segmentation_is_noop_without_gaps` (маска на ряде без дыр — no-op).
+
+### RED / GREEN
+
+RED (новые ожидания против старого кода, `tests/test_cli.py -k "gap or post_gap"`):
+
+```
+FAILED test_data_gaps_are_surfaced_and_warned      assert 96 == 1
+FAILED test_gap_mask_window_margins_are_configurable
+FAILED test_gap_mask_has_no_forward_window_after_segmentation
+FAILED test_gap_blocks_carry_and_trading_resumes
+FAILED test_post_gap_signal_is_not_suppressed_by_mask   assert 41 == 1
+FAILED test_gap_segmentation_aligns_to_original_index   assert mask[100] (лишний бар)
+6 failed, 2 passed, 35 deselected
+```
+
+GREEN: тот же набор — 8 passed. Полный набор: `uv run pytest -q -W error` →
+**327 passed** (326 − 1 заменённый + 2 новых), предупреждений нет.
+
+### SOLUSDT `mr_base` 1h 2022–2025: 192 → 2 маскированных бара
+
+Baseline — текущий HEAD до фикса (та же маска 192), after — рабочее дерево
+(`--ignore-journal`, у обоих `experiment_id 36a873efb47e551f`).
+
+| величина | до (`723ae81`, маска 192) | после (`9e2d260`, маска 2) |
+|---|---|---|
+| Вердикт | МЕРТВА | **МЕРТВА** |
+| Сделок | 699 | 704 |
+| Sharpe | −0.769902 | −0.756969 |
+| DSR | 0.061689 | 0.064912 |
+| p-value | 0.881119 | 0.871129 |
+| Max DD | −0.992476 | −0.992226 |
+| Доходность | −98.662 % | −98.617 % |
+| Разрывы / пропущено / маска | 2 / 120 / 192 | 2 / 120 / **2** |
+
+Предупреждение CLI после фикса:
+
+```
+В данных разрывов: 2, пропущено баров: 120 (таймфрейм 1h) — торговля
+приостановлена на 2 барах вокруг них (lookback=1: последнее решение перед
+дырой, иначе позиция прошла бы сквозь неё; lookahead=0: сегментация
+перезапускает историю стратегии с первого бара после дыры); состояние
+стратегии перезапускается на каждом непрерывном участке
+```
+
+Диагностика по реальным дырам (`series.position`):
+
+```
+i=1344: pos[i-2:i+3]=[0.0, -1.0, 0.0, 0.0, 0.0], доходность дыры +6.33 %
+i=2088: pos[i-2:i+3]=[0.0,  0.0, 0.0, 0.0, 0.0], доходность дыры +9.13 %
+```
+
+Позиция на баре перед дырой (i−1) сохранена — это честная сделка
+предразрывного участка; позиция на первом баре после дыры нулевая, то есть
+движение в пропуске не заработано. Освободившиеся сигналы дали +5 сделок.
+
+### BTCUSDT `mr_base` 1h: побитовая идентичность
+
+У BTC ноль разрывов — маска пуста, сегментация no-op, поэтому фикс обязан быть
+строгим no-op. До/после при одном HEAD: все метрики совпали, все 11 рядов
+отчёта (`ts`, `equity`, `drawdown`, `close`, `position`, `fee`, `slippage`,
+`funding`, `open`, `high`, `low`; по 35 064 бара) — **bit-identical**
+(`np.array_equal`).
+
+| величина | до | после |
+|---|---|---|
+| Вердикт | МЕРТВА | **МЕРТВА** |
+| Сделок | 736 | **736** |
+| Sharpe | −0.692446 | **−0.692446** |
+| DSR | 0.082842 | **0.082842** |
+| p-value | 0.711289 | **0.711289** |
+| Max DD | −0.897362 | **−0.897362** |
+| Доходность | −0.804921 | **−0.804921** |
+| Разрывы / маска | 0 / 0 | 0 / 0 |
+| `extra.history_bars` | 94 | 94 (диагностика) |
+
+### Полный набор
+
+`uv run pytest -q -W error` → **327 passed**, warning-free. SOL-вердикт
+`МЕРТВА`, BTC-вердикт `МЕРТВА` и метрики побитово прежние. Коммит `9e2d260`.
+
