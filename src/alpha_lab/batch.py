@@ -26,7 +26,9 @@
   выполненные конфигурации не пересчитываются (повтор — force=True). Успешная
   строка — выполненная; строка с ошибкой — нет: отказ бывает временным, и
   следующий запуск обязан её повторить. Строки пишутся батчами по FLUSH_EVERY,
-  поэтому обрыв стоит не больше нескольких конфигураций.
+  поэтому обрыв стоит не больше нескольких конфигураций. P5 добавляет второй
+  ключ возобновления — грейд вердикта: полный прогон не засчитывает черновую
+  строку, черновой засчитывает и полную (см. results.completed_ids).
 * **Изоляция отказов**: ошибка конфигурации (плохие параметры, отказ
   стратегии, проблема данных) записывается строкой с error и не прерывает
   свип; недоступные данные группы помечают все её ячейки и свип идёт дальше.
@@ -41,31 +43,28 @@
   доминируют). Поэтому свип идёт последовательно: сложность пула не
   окупается.
 
-Интерфейс хранилища (P3, src/alpha_lab/results.py), на который опирается модуль:
+Хранилище — P3, src/alpha_lab/results.py (Parquet + DuckDB):
 
-    read_runs(store_path) -> DataFrame   # колонки config_id, data_version,
-                                         # error (пусто/NaN у успешных)
-    write_runs(store_path, rows) -> None # идемпотентно по config_id
+    write_runs(store_path, rows) -> None      # идемпотентно по config_id
+    completed_ids(store_path, data_version, screening=...) -> set[str]
 
-Пока модуля нет, open_result_store отдаёт временное parquet-хранилище с тем же
-контрактом (один файл runs.parquet в каталоге --out); граница узкая, поэтому
-подключение P3 сводится к удалению этого фолбэка.
+Ошибка не считается выполнением: строка с error не останавливает повторный
+прогон конфигурации. Контракт строки-ошибки — в results.py.
 """
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-import pandas as pd
-
 from alpha_lab.config import Universe
 from alpha_lab.data.query import data_version
 from alpha_lab.grid import Grid, GridCell
+from alpha_lab.results import completed_ids as _completed_ids
+from alpha_lab.results import write_runs as _write_runs
 from alpha_lab.validation.validator import build_returns_matrix
 
 # Строк на батч записи в хранилище: обрыв свипа теряет не больше этого числа
@@ -84,8 +83,14 @@ class SweepError(ValueError):
 class ResultSink(Protocol):
     """Узкий контракт хранилища результатов (P3)."""
 
-    def completed_ids(self, data_version: str) -> set[str]:
-        """id успешно посчитанных конфигураций для данной версии данных."""
+    def completed_ids(self, data_version: str,
+                      *, screening: bool = False) -> set[str]:
+        """id посчитанных конфигураций для данной версии данных.
+
+        screening=False — только подтверждённые полным вердиктом (черновая
+        строка не останавливает полную проверку); screening=True — плюс
+        черновые (полный вердикт строго сильнее, пересчитывать не нужно).
+        """
 
     def write(self, rows: list[dict]) -> None:
         """Идемпотентно записывает строки, ключ — config_id."""
@@ -100,97 +105,23 @@ class SweepSummary:
     store_path: Path | None
 
 
-def _completed_from_frame(frame: pd.DataFrame | None,
-                          data_version: str) -> set[str]:
-    """id выполненных конфигураций из таблицы хранилища.
-
-    Выполненная — строка без ошибки (error пуст/NaN). Строки с другой версией
-    данных не считаются выполненными: данные изменились, вердикт устарел, и
-    переиспользовать его молча нельзя. Колонка error отсутствует — считаем
-    все строки успешными (совместимость с хранилищем без поля ошибок).
-    """
-    if frame is None or len(frame) == 0:
-        return set()
-    if "config_id" not in frame.columns:
-        raise ValueError(
-            "Хранилище результатов не содержит колонку 'config_id': "
-            "возобновляемость по id конфигурации невозможна"
-        )
-    done = frame
-    if "error" in done.columns:
-        err = done["error"]
-        done = done[err.isna() | (err.astype(str).str.strip() == "")]
-    if "data_version" in done.columns:
-        done = done[done["data_version"].astype(str) == str(data_version)]
-    return set(done["config_id"].astype(str))
-
-
-class _ResultsModuleSink:
-    """Адаптер к alpha_lab.results (P3): read_runs/write_runs."""
-
-    def __init__(self, module, path: Path):
-        self._module = module
-        self._path = path
-
-    def completed_ids(self, data_version: str) -> set[str]:
-        return _completed_from_frame(self._module.read_runs(self._path),
-                                     data_version)
-
-    def write(self, rows: list[dict]) -> None:
-        self._module.write_runs(self._path, rows)
-
-
-class _ParquetResultStore:
-    """Временное хранилище до P3: один parquet-файл в каталоге --out.
-
-    Контракт тот же, что у results.py (идемпотентность по config_id), поэтому
-    замена фолбэка на P3 не меняет поведение свипа. Файл перезаписывается
-    атомарно (tmp + os.replace): обрыв не оставляет половину таблицы.
-    """
-
-    FILE_NAME = "runs.parquet"
+class _ResultsStoreSink:
+    """Адаптер к alpha_lab.results (P3): completed_ids/write_runs."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self.file = self.path / self.FILE_NAME
 
-    def completed_ids(self, data_version: str) -> set[str]:
-        if not self.file.exists():
-            return set()
-        return _completed_from_frame(pd.read_parquet(self.file), data_version)
+    def completed_ids(self, data_version: str,
+                      *, screening: bool = False) -> set[str]:
+        return _completed_ids(self.path, data_version, screening=screening)
 
     def write(self, rows: list[dict]) -> None:
-        if not rows:
-            return
-        self.path.mkdir(parents=True, exist_ok=True)
-        fresh = pd.DataFrame(rows)
-        if self.file.exists():
-            old = pd.read_parquet(self.file)
-            fresh = pd.concat([old, fresh], ignore_index=True)
-        fresh = fresh.drop_duplicates(subset=["config_id"], keep="last")
-        tmp = self.file.with_name(self.FILE_NAME + ".tmp")
-        fresh.to_parquet(tmp, index=False)
-        os.replace(tmp, self.file)
+        _write_runs(self.path, rows)
 
 
 def open_result_store(store_path: str | Path) -> ResultSink:
-    """Хранилище результатов: P3, если он есть, иначе временный parquet.
-
-    Импорт results ленивый и единственный: пока модуля нет, свип работает на
-    временном хранилище с тем же контрактом. Как только P3 появится, этот
-    выбор подхватит его без правок свипа.
-    """
-    try:
-        from alpha_lab import results as results_mod
-    except ImportError:
-        return _ParquetResultStore(Path(store_path))
-    if not (hasattr(results_mod, "read_runs") and
-            hasattr(results_mod, "write_runs")):
-        raise RuntimeError(
-            "alpha_lab.results не предоставляет read_runs/write_runs: "
-            "интерфейс хранилища разошёлся с ожиданием batch.py"
-        )
-    return _ResultsModuleSink(results_mod, Path(store_path))
+    """Хранилище результатов P3 (Parquet + DuckDB) в каталоге --out."""
+    return _ResultsStoreSink(Path(store_path))
 
 
 def _format_hms(seconds: float) -> str:
@@ -261,8 +192,13 @@ def _params_json(params: dict) -> str:
 
 def _row(cell: GridCell, data_version: str, *, experiment_id: str,
          n_trials: int, verdict=None, error: str = "",
-         duration_s: float = 0.0) -> dict:
-    """Строка результата: успех несёт метрики вердикта, отказ — только error."""
+         duration_s: float = 0.0, costs: dict | None = None) -> dict:
+    """Строка результата: успех несёт метрики вердикта, отказ — только error.
+
+    costs — разбивка издержек движка (cost_totals): сумма и JSON попадают в
+    хранилище, чтобы воронка показывала, сколько съели комиссии/funding/
+    проскальзывание у выживших, а не только сухие Sharpe и DSR.
+    """
     row: dict[str, Any] = {
         "config_id": cell.config_id,
         "experiment_id": experiment_id,
@@ -276,6 +212,10 @@ def _row(cell: GridCell, data_version: str, *, experiment_id: str,
         "error": error,
         "data_version": data_version,
         "duration_s": float(duration_s),
+        "cost_total": (float(sum(float(v) for v in costs.values()))
+                       if costs else float("nan")),
+        "costs_json": (json.dumps(costs, sort_keys=True, ensure_ascii=False)
+                       if costs else ""),
     }
     if verdict is None:
         row.update({
@@ -284,6 +224,7 @@ def _row(cell: GridCell, data_version: str, *, experiment_id: str,
             "max_dd": float("nan"), "total_return": float("nan"),
             "trades": 0, "n_trials": int(n_trials), "alive": False,
             "reasons": "", "warnings": "",
+            "screening": False, "n_permutations": 0,
         })
     else:
         row.update({
@@ -293,6 +234,10 @@ def _row(cell: GridCell, data_version: str, *, experiment_id: str,
             "total_return": float(verdict.total_return),
             "trades": int(verdict.trades),
             "n_trials": int(verdict.n_configs_tried),
+            # Грейд вердикта — часть строки, а не догадка читателя: черновой
+            # вердикт не имеет права выглядеть как полный (P5).
+            "screening": bool(getattr(verdict, "screening", False)),
+            "n_permutations": int(getattr(verdict, "n_permutations", 0)),
             "alive": bool(verdict.alive),
             "reasons": " | ".join(verdict.reasons),
             "warnings": " | ".join(verdict.warnings),
@@ -495,7 +440,8 @@ def run_sweep(grid: Grid, *, data_root: Path, universe: Universe,
                 buffer.append(_row(
                     cell, dv, experiment_id=exp_id, n_trials=n_trials,
                     error=f"{type(exc).__name__}: {exc}",
-                    duration_s=time.monotonic() - started))
+                    duration_s=time.monotonic() - started,
+                    costs=outcome.result.cost_totals))
             else:
                 if not ignore_journal:
                     cli.log_trial(
@@ -509,7 +455,8 @@ def run_sweep(grid: Grid, *, data_root: Path, universe: Universe,
                         family=family)
                 buffer.append(_row(
                     cell, dv, experiment_id=exp_id, n_trials=n_trials,
-                    verdict=verdict, duration_s=time.monotonic() - started))
+                    verdict=verdict, duration_s=time.monotonic() - started,
+                    costs=outcome.result.cost_totals))
             if len(buffer) >= FLUSH_EVERY:
                 flush()
         flush()
