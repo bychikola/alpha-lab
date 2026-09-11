@@ -2,6 +2,16 @@
 
 Архив бесплатный, без API-ключа и содержит всю историю. Это основной источник;
 ccxt используется только как резерв, если архив недоступен из региона.
+
+Почему загрузка чанкованная. На машине прогона промежуточный узел сети
+обрывает соединение примерно на 17 КБ тела ответа: файл 1 898 532 Б
+стабильно останавливался на 16 980 Б, файл 38 890 Б — на 16 982 Б, а всё,
+что меньше порога, доходило целиком. Это не троттлинг Binance: тот же файл
+целиком скачивается последовательными Range-запросами по 16 КиБ, а пул из
+8 соединений отдаёт его за ~16 с. Поэтому крупные файлы режутся на диапазоны
+(см. DEFAULT_CHUNK_SIZE/DEFAULT_CONCURRENCY) и собираются строго по номеру
+чанка. Не «упрощать» обратно до requests.get(url).content: один запрос на
+файл здесь не докачивает ничего крупнее ~17 КБ.
 """
 from __future__ import annotations
 
@@ -10,6 +20,7 @@ import random
 import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -30,6 +41,13 @@ from alpha_lab.data.store import (
 BASE_URL = "https://data.binance.vision/data"
 MARKET_PREFIX = {"futures-um": "futures/um", "spot": "spot"}
 REQUEST_TIMEOUT = 60
+
+# 16 КиБ — замеренный порог обрыва минус запас: последовательные Range-запросы
+# такого размера доходят, а один запрос на весь файл умирает на ~17 КБ.
+DEFAULT_CHUNK_SIZE = 16 * 1024
+# 8 соединений: замер дал ~16 с на месячный 1m-файл (~115 КБ/с суммарно).
+# Больше не нужно — упираемся в канал, а не в число соединений.
+DEFAULT_CONCURRENCY = 8
 
 # Политика повторов. В прогоне по вселенной ~2000 файлов; единичный Read
 # timed out — не редкость, а закономерность, и без повтора он стоит символа
@@ -237,49 +255,238 @@ def _log_retry(url: str, attempt: int, total: int, exc: BaseException,
           file=sys.stderr)
 
 
+# Обрыв соединения на середине тела requests не всегда заворачивает в
+# ConnectionError: усечённый ответ приходит как ChunkedEncodingError. Оба
+# случая временные и обязаны повторяться.
+_TRANSIENT_ERRORS = (requests.Timeout, requests.ConnectionError,
+                     requests.exceptions.ChunkedEncodingError)
+
+
+def _retry_pause(url: str, attempt: int, total: int, exc: BaseException,
+                 base_delay: float, retry_after: float | None = None) -> None:
+    """Логирует повтор и спит: чужой Retry-After важнее собственного backoff."""
+    delay = (retry_after if retry_after is not None
+             else _backoff_delay(base_delay, attempt))
+    _log_retry(url, attempt, total, exc, delay)
+    time.sleep(delay)
+
+
+def _content_length(resp: requests.Response) -> int | None:
+    """Content-Length ответа, если он есть и разбирается."""
+    value = resp.headers.get("Content-Length")
+    if value is None:
+        return None
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return None
+    return size if size >= 0 else None
+
+
+def _validate_zip(raw: bytes, url: str) -> bytes:
+    """Возвращает raw, только если это читаемый zip без битых членов.
+
+    Байты, сошедшиеся по длине, могут быть обрезком архива: парсер принял бы
+    его за CSV и отдал бы короткий датафрейм. Целость проверяется до передачи
+    в парсер, а ошибка обязана быть громкой (BadZipFile), не тихой.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            if not zf.namelist():
+                raise zipfile.BadZipFile("архив пуст")
+            bad = zf.testzip()
+            if bad is not None:
+                raise zipfile.BadZipFile(f"повреждён член архива: {bad}")
+    except zipfile.BadZipFile as exc:
+        raise zipfile.BadZipFile(
+            f"{url}: скачанный архив не читается ({exc})") from exc
+    return raw
+
+
+class _RangeIgnored(Exception):
+    """Сервер ответил 200 на Range: тело — целый файл, а не запрошенный кусок."""
+
+    def __init__(self, body: bytes):
+        super().__init__("сервер вернул 200 вместо 206")
+        self.body = body
+
+
+def _fetch_range(url: str, start: int, end: int, *, retries: int,
+                 base_delay: float, timeout: float,
+                 whole_file_ok: bool = False) -> bytes:
+    """Скачивает bytes=start-end, повторяя сбой только этого диапазона.
+
+    `whole_file_ok` разрешён лишь для первого диапазона: тогда ответ 200
+    означает «Range не поддержан», и его тело — весь файл. Для остальных
+    диапазонов 200 — рассогласование: принять его значило бы подсунуть целый
+    файл в середину сборки.
+    """
+    expected = end - start + 1
+    total = retries + 1
+    headers = {"Range": f"bytes={start}-{end}"}
+    for attempt in range(1, total + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code == 404:
+                # Файл только что был (проба видела размер): пропажа на
+                # середине повтором не лечится.
+                raise requests.HTTPError(
+                    f"HTTP 404 при докачке байт {start}-{end}", response=resp)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt == total:
+                    resp.raise_for_status()
+                retry_after = (_retry_after_delay(resp)
+                               if resp.status_code == 429 else None)
+                _retry_pause(url, attempt, total,
+                             requests.HTTPError(f"HTTP {resp.status_code}",
+                                                response=resp),
+                             base_delay, retry_after)
+                continue
+            resp.raise_for_status()
+            if resp.status_code == 200:
+                if whole_file_ok:
+                    raise _RangeIgnored(resp.content)
+                raise requests.HTTPError(
+                    f"сервер вернул 200 вместо 206 на диапазон {start}-{end}",
+                    response=resp)
+            if resp.status_code != 206:
+                raise requests.HTTPError(
+                    f"неожиданный HTTP {resp.status_code} на диапазон "
+                    f"{start}-{end}", response=resp)
+            data = resp.content
+        except _TRANSIENT_ERRORS as exc:
+            if attempt == total:
+                raise
+            _retry_pause(url, attempt, total, exc, base_delay)
+            continue
+        if len(data) != expected:
+            # Короткий ответ сервер может и не пометить ошибкой; для сборки
+            # это дыра, поэтому проверяем длину сами.
+            exc = requests.ConnectionError(
+                f"диапазон {start}-{end}: получено {len(data)} из {expected} Б")
+            if attempt == total:
+                raise exc
+            _retry_pause(url, attempt, total, exc, base_delay)
+            continue
+        return data
+    raise RuntimeError("цикл повторов завершился без результата")  # pragma: no cover
+
+
+def _download_chunked(url: str, total: int, *, chunk_size: int,
+                      concurrency: int, retries: int, base_delay: float,
+                      timeout: float) -> bytes:
+    """Качает файл известного размера диапазонами и собирает по номерам.
+
+    Пул ограничен `concurrency`: на 2 МБ это ~120 диапазонов, и по соединению
+    на каждый сеть не выдержит. Части раскладываются по индексу, а не в
+    порядке завершения запросов, — иначе байты перемешаются.
+    """
+    n_chunks = (total + chunk_size - 1) // chunk_size
+    workers = max(1, min(concurrency, n_chunks - 1))
+    print(f"[download] {url}: {total} Б, чанков {n_chunks} по {chunk_size} Б, "
+          f"соединений {workers}", file=sys.stderr)
+    started = time.monotonic()
+
+    def fetch(index: int) -> bytes:
+        start = index * chunk_size
+        end = min(start + chunk_size, total) - 1
+        return _fetch_range(url, start, end, retries=retries,
+                            base_delay=base_delay, timeout=timeout,
+                            whole_file_ok=index == 0)
+
+    parts: list[bytes | None] = [None] * n_chunks
+    try:
+        first = fetch(0)
+    except _RangeIgnored as exc:
+        # Range не поддержан: тело — целый файл, на чанки его не режем.
+        if len(exc.body) != total:
+            raise requests.ConnectionError(
+                f"сервер отдал {len(exc.body)} Б вместо {total} Б") from exc
+        print(f"[download] {url}: {total} Б за "
+              f"{time.monotonic() - started:.1f} с (Range не поддержан)",
+              file=sys.stderr)
+        return exc.body
+    parts[0] = first
+    if n_chunks > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(fetch, i): i for i in range(1, n_chunks)}
+            errors: list[BaseException] = []
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    parts[index] = future.result()
+                except Exception as exc:  # ошибку поднимаем после уборки
+                    errors.append(exc)
+                    for other in futures:
+                        other.cancel()
+            if errors:
+                raise errors[0]
+    if any(part is None for part in parts):  # pragma: no cover — защита сборки
+        raise requests.ConnectionError("сборка неполна: не все чанки получены")
+    data = b"".join(parts)
+    if len(data) != total:
+        raise requests.ConnectionError(f"сборка {len(data)} Б вместо {total} Б")
+    print(f"[download] {url}: {total} Б за {time.monotonic() - started:.1f} с",
+          file=sys.stderr)
+    return data
+
+
 def _download(url: str, *, retries: int = DEFAULT_RETRIES,
               base_delay: float = DEFAULT_RETRY_BASE_DELAY,
-              timeout: float = REQUEST_TIMEOUT) -> bytes | None:
+              timeout: float = REQUEST_TIMEOUT,
+              chunk_size: int = DEFAULT_CHUNK_SIZE,
+              concurrency: int = DEFAULT_CONCURRENCY) -> bytes | None:
     """Скачивает файл, повторяя только временные сбои.
+
+    Пробный запрос узнаёт размер (Content-Length). Файл не крупнее chunk_size
+    он же и скачивает — Range для мелочи лишний. Крупный файл после пробы
+    качается диапазонами через _download_chunked; повтор при этом применяется
+    к отдельному чанку, а не ко всему файлу.
 
     None означает «файла нет» (404) — норма для ранних месяцев и текущего
     незавершённого: 404 не повторяется никогда, иначе полный прогон тратит
     минуты на заведомо отсутствующие файлы.
 
-    Повторяются: Timeout, ConnectionError, 429 и 5xx. Прочие 4xx — ошибка
-    запроса (URL, права), повтор её не исправит и только откладывает провал.
-    После исчерпания повторов последняя ошибка всплывает наружу, а не
-    превращается в тихий None.
+    Повторяются: Timeout, ConnectionError, ChunkedEncodingError, 429 и 5xx.
+    Прочие 4xx — ошибка запроса (URL, права), повтор её не исправит и только
+    откладывает провал. После исчерпания повторов последняя ошибка всплывает
+    наружу, а не превращается в тихий None. Целость zip проверяется до
+    возврата: обрезок обязан упасть здесь, а не дать короткий датафрейм.
     """
     total = retries + 1
     for attempt in range(1, total + 1):
         try:
-            resp = requests.get(url, timeout=timeout)
-        except (requests.Timeout, requests.ConnectionError) as exc:
+            resp = requests.get(url, timeout=timeout, stream=True)
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt == total:
+                    resp.raise_for_status()
+                retry_after = (_retry_after_delay(resp)
+                               if resp.status_code == 429 else None)
+                _retry_pause(url, attempt, total,
+                             requests.HTTPError(f"HTTP {resp.status_code}",
+                                                response=resp),
+                             base_delay, retry_after)
+                continue
+            resp.raise_for_status()
+            size = _content_length(resp)
+            if size is None or size <= chunk_size:
+                # Мелкий файл (или сервер не назвал размер): берём тело
+                # целиком — этот запрос и есть загрузка.
+                return _validate_zip(resp.content, url)
+            # Крупный файл: пробная связь нужна была только ради размера.
+            resp.close()
+        except _TRANSIENT_ERRORS as exc:
             if attempt == total:
                 raise
-            delay = _backoff_delay(base_delay, attempt)
-            _log_retry(url, attempt, total, exc, delay)
-            time.sleep(delay)
+            _retry_pause(url, attempt, total, exc, base_delay)
             continue
-
-        if resp.status_code == 404:
-            return None
-        if resp.status_code == 429 or resp.status_code >= 500:
-            if attempt == total:
-                resp.raise_for_status()
-            retry_after = (_retry_after_delay(resp)
-                           if resp.status_code == 429 else None)
-            delay = (retry_after if retry_after is not None
-                     else _backoff_delay(base_delay, attempt))
-            _log_retry(url, attempt, total,
-                       requests.HTTPError(f"HTTP {resp.status_code}", response=resp),
-                       delay)
-            time.sleep(delay)
-            continue
-
-        resp.raise_for_status()
-        return resp.content
+        return _validate_zip(
+            _download_chunked(url, size, chunk_size=chunk_size,
+                              concurrency=concurrency, retries=retries,
+                              base_delay=base_delay, timeout=timeout),
+            url)
     raise RuntimeError("цикл повторов завершился без результата")  # pragma: no cover
 
 
@@ -297,7 +504,9 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
                   include_delisted: bool = True,
                   force: bool = False,
                   retries: int = DEFAULT_RETRIES,
-                  retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY
+                  retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+                  chunk_size: int = DEFAULT_CHUNK_SIZE,
+                  concurrency: int = DEFAULT_CONCURRENCY
                   ) -> list[IngestResult]:
     """Скачивает и раскладывает все месяцы для одного символа.
 
@@ -305,7 +514,9 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
     пропускается, если его parquet читается и непуст (см. store.parquet_row_count).
     force=True отменяет пропуск — явная перекачка поверх существующего.
 
-    retries/retry_base_delay настраивают политику повторов HTTP.
+    retries/retry_base_delay настраивают политику повторов HTTP;
+    chunk_size/concurrency — нарезку крупных файлов на Range-запросы
+    (см. docstring модуля про обрыв на ~17 КБ).
 
     include_delisted=False исключает пару с оборванной историей из области
     исследования — явно и с пометкой excluded, а не молча (иначе отказ от
@@ -330,8 +541,9 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
                 continue
         try:
             raw = _download(archive_url(market, "klines", symbol, freq, period),
-                            retries=retries, base_delay=retry_base_delay)
-        except requests.RequestException as exc:
+                            retries=retries, base_delay=retry_base_delay,
+                            chunk_size=chunk_size, concurrency=concurrency)
+        except (requests.RequestException, zipfile.BadZipFile) as exc:
             results.append(IngestResult(
                 symbol, "klines", 0, skipped_rows, "", str(exc),
                 skipped=skipped, missing=missing))
@@ -414,8 +626,9 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
             try:
                 raw = _download(archive_url(market, "fundingRate", symbol, None,
                                             period),
-                                retries=retries, base_delay=retry_base_delay)
-            except requests.RequestException as exc:
+                                retries=retries, base_delay=retry_base_delay,
+                                chunk_size=chunk_size, concurrency=concurrency)
+            except (requests.RequestException, zipfile.BadZipFile) as exc:
                 # Сбой funding не должен уносить с собой уже загруженные klines.
                 results.append(IngestResult(symbol, "funding", 0, 0, "", str(exc)))
                 return results
@@ -435,7 +648,9 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
 def ingest_universe(universe, freq: str, root: Path = DEFAULT_ROOT,
                     force: bool = False,
                     retries: int = DEFAULT_RETRIES,
-                    retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY
+                    retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+                    chunk_size: int = DEFAULT_CHUNK_SIZE,
+                    concurrency: int = DEFAULT_CONCURRENCY
                     ) -> list[IngestResult]:
     out: list[IngestResult] = []
     # getattr: юниверс может быть duck-typed (тесты), дефолт spec 5 — true.
@@ -446,7 +661,9 @@ def ingest_universe(universe, freq: str, root: Path = DEFAULT_ROOT,
                                      root=root, market=universe.market,
                                      include_delisted=include_delisted,
                                      force=force, retries=retries,
-                                     retry_base_delay=retry_base_delay))
+                                     retry_base_delay=retry_base_delay,
+                                     chunk_size=chunk_size,
+                                     concurrency=concurrency))
         except Exception as exc:
             # Изоляция символов: один сбойный символ не должен уносить с собой
             # отчёт по остальным — цикл обязан дойти до последнего.

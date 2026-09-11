@@ -1,3 +1,6 @@
+import io
+import zipfile
+
 import pandas as pd
 import pytest
 import requests
@@ -5,6 +8,15 @@ import requests
 from alpha_lab.data.ingest import (
     archive_url, month_range, parse_funding_csv, parse_kline_csv,
 )
+
+
+def _zip_payload(content: bytes, name: str = "data.csv") -> bytes:
+    """Zip в памяти: архив Binance отдаёт zip, и _download проверяет его целость."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(name, content)
+    return buf.getvalue()
+
 
 KLINE_WITH_HEADER = (
     b"open_time,open,high,low,close,volume,close_time,quote_volume,count,"
@@ -17,6 +29,10 @@ KLINE_WITH_HEADER = (
 
 # Старые файлы архива не содержат строки заголовка
 KLINE_WITHOUT_HEADER = b"\n".join(KLINE_WITH_HEADER.split(b"\n")[1:])
+
+# То, что реально отдаёт архив: zip с CSV внутри. _download обязан проверить
+# целость zip, поэтому тела HTTP-ответов в тестах ниже — zip, а не голый CSV.
+ZIP_CSV = _zip_payload(KLINE_WITH_HEADER)
 
 
 def test_parse_kline_with_header():
@@ -337,6 +353,9 @@ class _FakeResponse:
             raise requests.HTTPError(
                 f"{self.status_code} Client Error", response=self)
 
+    def close(self):
+        pass
+
 
 def test_download_retries_transient_timeout(monkeypatch):
     """Read timed out — временный сбой: повтор, а не потеря символа."""
@@ -344,11 +363,11 @@ def test_download_retries_transient_timeout(monkeypatch):
 
     calls = []
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, headers=None, timeout=None, stream=False):
         calls.append(url)
         if len(calls) < 3:
             raise requests.Timeout("read timed out")
-        return _FakeResponse(200, KLINE_WITH_HEADER)
+        return _FakeResponse(200, ZIP_CSV)
 
     sleeps = []
     monkeypatch.setattr(ingest_module.requests, "get", fake_get)
@@ -357,7 +376,7 @@ def test_download_retries_transient_timeout(monkeypatch):
     raw = ingest_module._download("http://example.test/x.zip",
                                   retries=3, base_delay=0.1)
 
-    assert raw == KLINE_WITH_HEADER
+    assert raw == ZIP_CSV
     assert len(calls) == 3
     # Пауза только между попытками: после успеха спать нечего.
     assert len(sleeps) == 2
@@ -370,7 +389,7 @@ def test_download_persistent_timeout_fails_after_bounded_attempts(
 
     calls = []
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, headers=None, timeout=None, stream=False):
         calls.append(url)
         raise requests.Timeout("read timed out")
 
@@ -394,11 +413,11 @@ def test_download_retries_5xx(monkeypatch):
 
     calls = []
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, headers=None, timeout=None, stream=False):
         calls.append(url)
         if len(calls) == 1:
             return _FakeResponse(503)
-        return _FakeResponse(200, KLINE_WITH_HEADER)
+        return _FakeResponse(200, ZIP_CSV)
 
     monkeypatch.setattr(ingest_module.requests, "get", fake_get)
     monkeypatch.setattr("time.sleep", lambda seconds: None)
@@ -406,7 +425,7 @@ def test_download_retries_5xx(monkeypatch):
     raw = ingest_module._download("http://example.test/x.zip",
                                   retries=2, base_delay=0)
 
-    assert raw == KLINE_WITH_HEADER
+    assert raw == ZIP_CSV
     assert len(calls) == 2
 
 
@@ -416,7 +435,7 @@ def test_download_404_is_not_retried(monkeypatch):
 
     calls = []
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, headers=None, timeout=None, stream=False):
         calls.append(url)
         return _FakeResponse(404)
 
@@ -434,11 +453,11 @@ def test_download_429_honours_retry_after(monkeypatch):
 
     calls = []
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, headers=None, timeout=None, stream=False):
         calls.append(url)
         if len(calls) == 1:
             return _FakeResponse(429, headers={"Retry-After": "2"})
-        return _FakeResponse(200, KLINE_WITH_HEADER)
+        return _FakeResponse(200, ZIP_CSV)
 
     sleeps = []
     monkeypatch.setattr(ingest_module.requests, "get", fake_get)
@@ -447,7 +466,7 @@ def test_download_429_honours_retry_after(monkeypatch):
     raw = ingest_module._download("http://example.test/x.zip",
                                   retries=2, base_delay=0.1)
 
-    assert raw == KLINE_WITH_HEADER
+    assert raw == ZIP_CSV
     assert len(calls) == 2
     assert sleeps[0] == pytest.approx(2.0, abs=0.05)
 
@@ -458,11 +477,11 @@ def test_download_retry_after_is_bounded(monkeypatch):
 
     calls = []
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, headers=None, timeout=None, stream=False):
         calls.append(url)
         if len(calls) == 1:
             return _FakeResponse(429, headers={"Retry-After": "100000"})
-        return _FakeResponse(200, KLINE_WITH_HEADER)
+        return _FakeResponse(200, ZIP_CSV)
 
     sleeps = []
     monkeypatch.setattr(ingest_module.requests, "get", fake_get)
@@ -471,7 +490,7 @@ def test_download_retry_after_is_bounded(monkeypatch):
     raw = ingest_module._download("http://example.test/x.zip",
                                   retries=1, base_delay=0.1)
 
-    assert raw == KLINE_WITH_HEADER
+    assert raw == ZIP_CSV
     assert 0 < sleeps[0] <= ingest_module.MAX_RETRY_AFTER
 
 
@@ -481,11 +500,11 @@ def test_download_retry_is_logged_to_stderr(monkeypatch, capsys):
 
     calls = []
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, headers=None, timeout=None, stream=False):
         calls.append(url)
         if len(calls) == 1:
             raise requests.Timeout("read timed out")
-        return _FakeResponse(200, KLINE_WITH_HEADER)
+        return _FakeResponse(200, ZIP_CSV)
 
     monkeypatch.setattr(ingest_module.requests, "get", fake_get)
     monkeypatch.setattr("time.sleep", lambda seconds: None)
@@ -628,3 +647,223 @@ def test_ingest_result_distinguishes_downloaded_skipped_missing(tmp_path,
     assert "скачано месяцев: 1" in result.quality
     assert "уже в хранилище: 1" in result.quality
     assert "пропущено месяцев: 1" in result.quality
+
+
+# --- Чанкованные Range-загрузки -------------------------------------------
+#
+# Промежуточный узел сети обрывает соединение примерно на 17 КБ тела, поэтому
+# один запрос на файл не докачивает ничего крупнее порога. Крупные файлы
+# режутся на диапазоны по chunk_size и качаются пулом; сборка — по номеру
+# диапазона, а не по порядку завершения запросов.
+
+
+def _parse_range(value: str) -> tuple[int, int]:
+    import re
+
+    match = re.fullmatch(r"bytes=(\d+)-(\d+)", value)
+    assert match is not None, value
+    return int(match.group(1)), int(match.group(2))
+
+
+class _RangeServer:
+    """Псевдо-сервер архива: отдаёт диапазоны, не выходя в сеть.
+
+    `requests` (заголовки Range) записывается по каждому обращению — тесты
+    проверяют и число запросов, и то, что мелкий файл не режется на чанки.
+    """
+
+    def __init__(self, payload: bytes, *, ignore_range: bool = False,
+                 fail_ranges: dict[str, int] | None = None,
+                 truncate_last: int = 0,
+                 delays: dict[int, float] | None = None):
+        self.payload = payload
+        self.ignore_range = ignore_range
+        # "start-end" -> сколько первых обращений упасть таймаутом
+        self.fail_ranges = dict(fail_ranges or {})
+        self.truncate_last = truncate_last
+        self.delays = delays or {}
+        self.requests: list[str | None] = []
+
+    def __call__(self, url, headers=None, timeout=None, stream=False):
+        import time as _time
+
+        rng = (headers or {}).get("Range")
+        self.requests.append(rng)
+        length = {"Content-Length": str(len(self.payload))}
+        if self.ignore_range or rng is None:
+            # Проба без Range; сервер, игнорирующий Range, отвечает так же.
+            return _FakeResponse(200, self.payload, length)
+        start, end = _parse_range(rng)
+        key = f"{start}-{end}"
+        if self.fail_ranges.get(key, 0) > 0:
+            self.fail_ranges[key] -= 1
+            raise requests.Timeout("read timed out")
+        body = self.payload[start:end + 1]
+        if self.truncate_last and end + 1 >= len(self.payload):
+            body = body[: max(0, len(body) - self.truncate_last)]
+        delay = self.delays.get(start, 0.0)
+        if delay:
+            _time.sleep(delay)
+        return _FakeResponse(206, body, {
+            "Content-Range": f"bytes {start}-{end}/{len(self.payload)}",
+            "Content-Length": str(len(body)),
+        })
+
+
+def _chunked_zip(size: int = 9000) -> bytes:
+    """Zip с неповторяющимся телом: перестановка чанков не останется незамеченной."""
+    import random
+
+    return _zip_payload(random.Random(42).randbytes(size))
+
+
+def _n_chunks(size: int, chunk_size: int) -> int:
+    return -(-size // chunk_size)
+
+
+def test_download_chunked_reassembles_in_order(monkeypatch):
+    """Диапазоны собираются по номерам, даже если завершаются вразнобой."""
+    import alpha_lab.data.ingest as ingest_module
+
+    payload = _chunked_zip()
+    # Чем раньше чанк, тем он медленнее: завершение заведомо не по порядку.
+    server = _RangeServer(payload, delays={1024: 0.2, 2048: 0.1})
+    monkeypatch.setattr(ingest_module.requests, "get", server)
+
+    raw = ingest_module._download("http://example.test/x.zip", retries=1,
+                                  base_delay=0, chunk_size=1024, concurrency=4)
+
+    assert raw == payload
+    assert server.requests[0] is None  # проба без Range: сначала узнаём размер
+    ranges = [r for r in server.requests if r is not None]
+    assert len(ranges) == _n_chunks(len(payload), 1024)
+
+
+def test_download_range_ignored_returns_whole_body(monkeypatch):
+    """200 вместо 206: Range не поддержан — берём тело целиком, не режем его."""
+    import alpha_lab.data.ingest as ingest_module
+
+    payload = _chunked_zip()
+    server = _RangeServer(payload, ignore_range=True)
+    monkeypatch.setattr(ingest_module.requests, "get", server)
+
+    raw = ingest_module._download("http://example.test/x.zip", retries=1,
+                                  base_delay=0, chunk_size=1024, concurrency=4)
+
+    assert raw == payload
+    # Проба + первый диапазон: получив 200, пул чанков не запускаем.
+    assert len(server.requests) == 2
+
+
+def test_download_small_file_is_single_request(monkeypatch, capsys):
+    """Файл не крупнее чанка качается одним запросом — Range для него лишний."""
+    import alpha_lab.data.ingest as ingest_module
+
+    server = _RangeServer(ZIP_CSV)  # ~350 Б много меньше chunk_size
+    monkeypatch.setattr(ingest_module.requests, "get", server)
+
+    raw = ingest_module._download("http://example.test/small.zip")
+
+    assert raw == ZIP_CSV
+    assert server.requests == [None]  # один запрос и ни одного Range
+    assert "[download]" not in capsys.readouterr().err  # мелочь не логируем
+
+
+def test_download_retries_failing_chunk_without_restarting_file(monkeypatch):
+    """Сбойный чанк повторяется на месте; остальные чанки не перекачиваются."""
+    import alpha_lab.data.ingest as ingest_module
+
+    payload = _chunked_zip()
+    server = _RangeServer(payload, fail_ranges={"1024-2047": 1})
+    monkeypatch.setattr(ingest_module.requests, "get", server)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    raw = ingest_module._download("http://example.test/x.zip", retries=2,
+                                  base_delay=0, chunk_size=1024, concurrency=4)
+
+    assert raw == payload
+    assert server.requests.count("bytes=1024-2047") == 2  # сбой + один повтор
+    assert server.requests.count("bytes=0-1023") == 1     # соседей не тронули
+    assert server.requests.count("bytes=2048-3071") == 1
+
+
+def test_download_logs_large_file_progress(monkeypatch, capsys):
+    """Крупный файл отмечается в stderr пофайлово, а не почленно."""
+    import alpha_lab.data.ingest as ingest_module
+
+    payload = _chunked_zip()
+    server = _RangeServer(payload)
+    monkeypatch.setattr(ingest_module.requests, "get", server)
+
+    raw = ingest_module._download("http://example.test/big.zip", retries=1,
+                                  base_delay=0, chunk_size=1024, concurrency=4)
+
+    assert raw == payload
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "[download]" in line]
+    assert len(lines) == 2  # старт и финиш, не больше
+    assert "чанков" in lines[0]
+    assert "http://example.test/big.zip" in lines[0]
+
+
+def test_download_rejects_short_chunk(monkeypatch):
+    """Недоданный чанк не «почти получилось»: сборка обязана упасть."""
+    import alpha_lab.data.ingest as ingest_module
+
+    payload = _chunked_zip()
+    server = _RangeServer(payload, truncate_last=5)
+    monkeypatch.setattr(ingest_module.requests, "get", server)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    with pytest.raises(requests.ConnectionError):
+        ingest_module._download("http://example.test/x.zip", retries=1,
+                                base_delay=0, chunk_size=1024, concurrency=4)
+
+
+def test_download_rejects_truncated_zip(monkeypatch):
+    """Байты сошлись, но это обрезок zip: BadZipFile, а не короткий датафрейм."""
+    import alpha_lab.data.ingest as ingest_module
+
+    full = _zip_payload(KLINE_WITH_HEADER * 200)
+    server = _RangeServer(full[: len(full) // 2])
+    monkeypatch.setattr(ingest_module.requests, "get", server)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    with pytest.raises(zipfile.BadZipFile):
+        ingest_module._download("http://example.test/x.zip", retries=1,
+                                base_delay=0, chunk_size=1024, concurrency=4)
+
+
+def test_ingest_reports_corrupt_zip_as_error(tmp_path, monkeypatch):
+    """Битый архив — ошибка пары в отчёте, а не исключение из ingest_symbol."""
+    import alpha_lab.data.ingest as ingest_module
+
+    def broken(url, **kwargs):
+        raise zipfile.BadZipFile("скачанный архив не читается")
+
+    monkeypatch.setattr(ingest_module, "_download", broken)
+    results = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path, with_funding=False)
+
+    assert len(results) == 1
+    assert not results[0].ok
+    assert "архив" in results[0].error
+
+
+def test_ingest_forwards_chunk_settings_to_download(tmp_path, monkeypatch):
+    """chunk_size/concurrency доходят до загрузчика, а не висят мёртвыми."""
+    import alpha_lab.data.ingest as ingest_module
+
+    seen: dict = {}
+
+    def fake_download(url, **kwargs):
+        seen.update(kwargs)
+        return _kline_month("2024-01")
+
+    monkeypatch.setattr(ingest_module, "_download", fake_download)
+    ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path,
+        with_funding=False, chunk_size=4096, concurrency=3)
+
+    assert seen["chunk_size"] == 4096
+    assert seen["concurrency"] == 3
