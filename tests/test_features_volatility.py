@@ -4,7 +4,7 @@ import pytest
 from fixtures.synthetic import ou_bars
 
 from alpha_lab.features.volatility import (
-    atr, atr_zscore, funding_features, volatility_regime,
+    atr, atr_zscore, funding_features, true_range, volatility_regime,
 )
 
 
@@ -19,13 +19,17 @@ def test_atr_matches_manual_true_range():
     })
 
     a = atr(bars, length=3)
+    tr = true_range(bars)
 
-    # TR: [2.0, 3.0, 3.0, 3.0]. RMA с alpha = 1/3 — рекурсия от первого TR:
-    #   2 -> 2/3*2 + 1/3*3 = 7/3 -> 2/3*7/3 + 1 = 23/9 -> 2/3*23/9 + 1 = 73/27.
-    # Первое значение — на баре length (индекс 2): min_periods=length.
+    # TR: [2.0, 3.0, 3.0, 3.0]. Уайлдер (ta.rma в Pine) заводит рекурсию не с
+    # первого TR, как pandas ewm(adjust=False), а со SMA первых length значений:
+    # первое значение — на баре length-1 (индекс 2) и равно mean(TR[:3]) = 8/3,
+    # далее rma[i] = 2/3*rma[i-1] + 1/3*tr[i]: 8/3 -> 25/9.
     assert a.iloc[:2].isna().all()
-    assert a.iloc[2] == pytest.approx(23 / 9)
-    assert a.iloc[3] == pytest.approx(73 / 27)
+    # Ключевое свойство ta.rma: первый валидный ATR — это среднее первых length TR.
+    assert a.iloc[2] == pytest.approx(tr.iloc[:3].mean())
+    assert a.iloc[2] == pytest.approx(8 / 3)
+    assert a.iloc[3] == pytest.approx(25 / 9)
     # Контроль: это не SMA последних TR (она дала бы ровно 3.0 по построению
     # данных). Уайлдер сглаживает хвост, поэтому ATR(3) на баре 3 ниже.
     assert a.iloc[3] < 3.0 - 0.2
@@ -37,11 +41,41 @@ def test_atr_is_positive():
     assert (a > 0).all()
 
 
+def test_atr_shorter_than_length_is_all_nan():
+    bars = ou_bars(n=10)
+
+    a = atr(bars, length=14)
+
+    # Вырожденный случай: баров меньше окна — не исключение, а весь ряд NaN
+    # (SMA-затравку длины length построить нельзя).
+    assert len(a) == len(bars)
+    assert a.index.equals(bars.index)
+    assert a.isna().all()
+
+
 def test_atr_zscore_centered():
     z = atr_zscore(ou_bars(n=2000), atr_len=14, window=200).dropna()
 
     assert abs(z.mean()) < 0.3
     assert abs(z.std() - 1.0) < 0.4
+
+
+def test_atr_zscore_constant_bars_is_nan():
+    # sigma=0 -> все OHLC равны, TR и ATR тождественно нулевые, std(ATR) = 0.
+    # Гвардия std > 1e-12 обязана отдать NaN, а не 0/0 или inf.
+    atr_len, window = 3, 20
+    bars = ou_bars(n=60, sigma=0.0)
+
+    a = atr(bars, length=atr_len)
+    # ATR за прогревом определён и ровно нулевой — значит, rolling std тоже
+    # определён и равен нулю, то есть NaN даёт именно гвардия, а не прогрев.
+    assert (a.iloc[atr_len - 1:] == 0.0).all()
+
+    z = atr_zscore(bars, atr_len=atr_len, window=window)
+
+    warmup_end = (atr_len - 1) + (window - 1)  # первый бар, где std посчитан
+    assert z.iloc[warmup_end:].isna().all()
+    assert z.notna().sum() == 0
 
 
 def test_volatility_regime_values():
@@ -60,7 +94,9 @@ def test_funding_features_zscore_of_constant_is_zero():
 
     out = funding_features(rate, window=20)
 
-    assert (out["funding_z"].fillna(0.0) == 0.0).all()
+    # eq, а не fillna(0.0) == 0.0: последнее прошло бы и на ряде из одних NaN.
+    assert out["funding_z"].eq(0.0).all()
+    assert out["funding_z"].notna().all()
     assert out["funding_ma"].iloc[-1] == pytest.approx(0.0001)
 
 
