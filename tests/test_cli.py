@@ -1001,11 +1001,15 @@ def test_daily_funding_is_fully_accounted(tmp_path):
 
 
 def test_data_gaps_are_surfaced_and_warned(tmp_path, capsys):
-    """Разрыв в данных обязан быть виден, а торговля вокруг него — остановлена.
+    """Разрыв в данных обязан быть виден, а торговля через него — остановлена.
 
     spec раздел 8: пропуск → не торговать. Разрыв не инвалидирует весь прогон
-    (120 часов дыры на 4 годах сделали бы пару непригодной), но позиция вокруг
-    него обнуляется, и счётчики обязаны это показать.
+    (120 часов дыры на 4 годах сделали бы пару непригодной), но позиция,
+    удерживаемая через дыру, обнуляется, и счётчики обязаны это показать.
+    Маскируется ровно последний бар перед дырой: движок удерживает
+    held[i] = target[i-1], и без обнуления этой цели позиция прошла бы сквозь
+    неизвестное движение в пропуске. Вперёд маски нет — сегментация
+    перезапускает историю стратегии с первого бара после дыры.
     """
     root = tmp_path / "data"
     _write_fixture_data(root)
@@ -1019,16 +1023,16 @@ def test_data_gaps_are_surfaced_and_warned(tmp_path, capsys):
     payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
     assert payload["extra"]["gaps"] == 1
     assert payload["extra"]["missing_bars"] == 1
-    # Окно маскирования: lookback=1 (бар перед дырой) + первый бар после дыры
-    # + lookahead=history_bars стратегии — требование истории MR (у ATR
-    # рекурсивная память, поэтому оно больше atr_len; см. atr_decay_bars).
+    # Один разрыв — ровно один маскированный бар: решение, которое иначе
+    # исполнилось бы через дыру. history_bars остаётся в отчёте диагностикой
+    # памяти стратегии, но маску вперёд больше не задаёт.
     history = build_strategy("mean_reversion", PARAMS).history_bars
     assert payload["extra"]["history_bars"] == history
-    assert payload["extra"]["gap_masked_bars"] == 1 + 1 + history
+    assert payload["extra"]["gap_masked_bars"] == 1
 
     warnings = payload["verdict"]["warnings"]
     assert any("разрыв" in w and "приостановлена" in w for w in warnings), warnings
-    assert any(f"lookahead={history}" in w and "history_bars" in w
+    assert any("lookahead=0" in w and "сегментац" in w
                for w in warnings), warnings
 
     captured = capsys.readouterr()
@@ -1042,64 +1046,72 @@ def test_gap_mask_window_margins_are_configurable():
     """Окно маскирования — параметр: запас назад и вперёд задаётся явно.
 
     i — индекс первого бара после разрыва (здесь 04:00 после пропущенного
-    03:00). При lookback=1, lookahead=1 маскируются [i-2..i]; при
-    lookback=2, lookahead=3 — [i-3..i+2].
+    03:00). Маскируется [i-lookback, i-1+lookahead]: при lookback=1,
+    lookahead=1 — [i-1..i]; при lookback=2, lookahead=3 — [i-2..i+2].
+    Дефолт lookahead=0: вперёд маскировать нечего, сегментация сама
+    перезапускает историю стратегии.
     """
     ts = pd.date_range("2024-01-01", periods=8, freq="1h", tz="UTC").delete(3)
     bars = pd.DataFrame({"ts": ts})
 
     narrow = cli._gap_mask(bars, "1h", lookback=1, lookahead=1)
     wide = cli._gap_mask(bars, "1h", lookback=2, lookahead=3)
+    default = cli._gap_mask(bars, "1h")
 
-    assert narrow.tolist() == [False, True, True, True, False, False, False]
-    assert wide.tolist() == [True, True, True, True, True, True, False]
+    assert narrow.tolist() == [False, False, True, True, False, False, False]
+    assert wide.tolist() == [False, True, True, True, True, True, False]
+    assert default.tolist() == [False, False, True, False, False, False, False]
 
 
-def test_gap_mask_lookahead_comes_from_strategy_history_bars():
-    """Lookahead маски — требование истории стратегии, а не константа 1.
+def test_gap_mask_has_no_forward_window_after_segmentation():
+    """Вперёд маска не нужна: сегментация перезапускает историю стратегии.
 
-    Решение на баре t использует окно z-скора и рекурсивный ATR, поэтому после
-    дыры ровно history_bars решений ещё опираются на данные, которых стратегия
-    не должна видеть. Старый lookahead=1 маскировал один бар и оставлял
-    остальные решения на неконтигуозных данных — невидимо, потому что маска не
-    влияет на причины вердикта.
+    После разрыва generate вызывается на свежем участке (см.
+    _generate_segmented), поэтому ни одно решение не опирается на окно,
+    пересекающее пропуск. Маскируется только последний бар перед дырой —
+    без этого движок удержал бы позицию через неизвестное движение
+    (held[i] = target[i-1]). Прежняя маска в history_bars вперёд глушила
+    достоверные сигналы нового участка.
     """
     ts = pd.date_range("2024-01-01", periods=200, freq="1h", tz="UTC").delete(9)
     bars = pd.DataFrame({"ts": ts})
     history = build_strategy("mean_reversion", PARAMS).history_bars
     # Требование выводится из рекурсии ATR: окно z-скора (20) меньше её
-    # decay-горизонта, поэтому прежнее max(window, atr_len) = 20 занижало.
+    # decay-горизонта, поэтому history_bars больше 20 — но маску он больше
+    # не задаёт.
     assert history == max(PARAMS["window"], atr_decay_bars(14)) > 20
 
-    mask = cli._gap_mask(bars, "1h", lookahead=history)
+    mask = cli._gap_mask(bars, "1h")
     i = 9                       # первый бар после дыры
-    assert mask[i - 1]          # бар перед дырой: позиция через дыру закрыта
-    assert mask[i:i + history].all()     # все history решений после дыры
-    assert not mask[i + history]         # на следующем баре окно уже не пересекает дыру
+    assert mask.sum() == 1
+    assert mask[i - 1]          # позиция не пройдёт сквозь дыру
+    assert not mask[i - 2]      # бар до него контигуозен с i-1
+    assert not mask[i:].any()   # вперёд маски нет: решения достоверны
 
-    old = cli._gap_mask(bars, "1h", lookahead=1)
-    assert not old[i + 1:].any(), "lookahead=1 маскирует только один бар после дыры"
+    # Lookback=1 — несущий: без него бар i-1 не маскируется, и позиция
+    # проходит сквозь дыру.
+    assert not cli._gap_mask(bars, "1h", lookback=0).any()
 
 
-def test_gap_window_is_flat_and_trading_resumes(tmp_path, capsys):
+def test_gap_blocks_carry_and_trading_resumes(tmp_path, capsys):
     """Сквозная проверка маски разрыва на часовом прогоне.
 
-    Сравниваем весь ряд удержанных позиций с эталоном: цели внутри окна
-    обнулены, вне окна — ровно то, что дала стратегия. Иначе «торговля
-    возобновилась» ничего не доказывала бы.
+    Сравниваем весь ряд удержанных позиций с эталоном: обнулена ровно цель
+    последнего бара перед дырой (иначе held[k] = target[k-1] прошла бы сквозь
+    пропуск), все остальные цели — сегментированные. Заодно проверяется, что
+    сигналы свежего участка после дыры маской не глушатся: торговля
+    возобновляется сама, по мере прогрева стратегии.
     """
     root = tmp_path / "data"
     _write_fixture_data(root)
     u, e = _write_configs(tmp_path, root)
 
-    history = build_strategy("mean_reversion", PARAMS).history_bars
-    assert history > 20
     bars = _hourly_bars(root)
     raw = _segmented_targets(bars)          # дыр ещё нет — сегментация no-op
-    # Час k: цель за три бара до него и через history+1 после — ненулевые,
-    # иначе проверка возобновления торговли была бы пустой.
-    k = next(j for j in range(6, len(raw) - history - 2)
-             if raw[j - 3] != 0.0 and raw[j + history + 1] != 0.0)
+    # Час k: цель на k-1 и k-2 ненулевая — без маски позиция прошла бы сквозь
+    # дыру, а бар k-1 ещё и торгуется (позиция из target[k-2]).
+    k = next(j for j in range(6, len(raw) - 60)
+             if raw[j - 1] != 0.0 and raw[j - 2] != 0.0)
     _remove_hours(root, [bars["ts"].iloc[k]])
 
     out = tmp_path / "out"
@@ -1108,27 +1120,59 @@ def test_gap_window_is_flat_and_trading_resumes(tmp_path, capsys):
     payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
     assert payload["extra"]["gaps"] == 1
     assert payload["extra"]["missing_bars"] == 1
-    assert payload["extra"]["gap_masked_bars"] == 1 + 1 + history
+    assert payload["extra"]["gap_masked_bars"] == 1
     assert payload["extra"]["dirty_bars"] == 0
 
     # После вырезания часа k первый бар за дырой снова имеет индекс k.
-    # Цели обнулены на [k-2, k-1+history]; позиция движка —
-    # held[t] = target[t-1], поэтому торговля возобновляется на баре
-    # k+history+1. Ожидание строится из сегментированных целей (generate
-    # вызывается на непрерывных участках), а не из прогона по всему ряду.
+    # Ожидание строится из сегментированных целей (generate вызывается на
+    # непрерывных участках), а не из прогона по всему ряду.
     bars_after = _hourly_bars(root)
     raw_after = _segmented_targets(bars_after)
+
+    # Предусловие: сегментация сама перенос НЕ снимает — позиция на баре k
+    # по-прежнему равна цели k-1, решённой до дыры.
+    assert _held_from_targets(raw_after)[k] != 0.0
+
+    # Маска обнуляет ровно цель k-1; всё остальное — честные решения участков.
     targets = raw_after.copy()
-    targets[k - 2:k + history] = 0.0
+    targets[k - 1] = 0.0
     expected = _held_from_targets(targets)
 
-    # Вне окна позиции не обнулены: торговля именно возобновляется.
-    assert expected[k - 2] != 0.0
-    assert expected[k + history] == 0.0      # последний бар окна ещё закрыт
-    assert expected[k + history + 1] != 0.0  # а на следующем торговля идёт
+    assert expected[k] == 0.0                # позиция сквозь дыру не проходит
+    assert expected[k - 1] != 0.0            # до дыры торговля идёт
+    assert (expected[k + 1:] != 0.0).any()   # после дыры торговля возобновляется
 
     got = np.asarray(payload["series"]["position"], dtype="float64")
     np.testing.assert_allclose(got, expected, atol=1e-6)
+
+
+def test_post_gap_signal_is_not_suppressed_by_mask():
+    """Честный сигнал нового участка не глушится маской разрыва.
+
+    На crafted-фикстуре сегментированная стратегия даёт ненулевые цели
+    начиная с i+24 (i — первый бар после дыры). Прежняя маска
+    lookahead=history_bars=94 накрывала весь остаток ряда и выбрасывала эти
+    достоверные решения; новая маскирует только бар i-1.
+    """
+    bars = _crafted_gap_bars()
+    i = int(cli._gap_starts(bars, "1h")[0])
+    seg = _segmented_targets(bars)
+    nz = np.flatnonzero(seg[i:] != 0.0)
+    assert len(nz) > 0
+    first = i + int(nz[0])
+    assert first == i + 24, "сигнал свежего участка внутри прежнего окна маски"
+
+    mask = cli._gap_mask(bars, "1h")
+    assert mask.sum() == 1
+    assert mask[i - 1]                       # перенос через дыру закрыт
+    assert not mask[first]                   # а достоверный сигнал — нет
+    assert not mask[first:].any()
+
+    # Конвейер CLI: цель выживает после объединения с clean_mask и маской.
+    tradable = ~mask
+    targets = seg.copy()
+    targets[~tradable] = 0.0
+    assert targets[first] == seg[first] != 0.0
 
 
 def test_gap_segmentation_resets_carried_strategy_state():
@@ -1180,9 +1224,12 @@ def test_gap_segmentation_aligns_to_original_index(tmp_path):
     # второй разрыв открывается баром 299 (300 − 2 + 1).
     starts = cli._gap_starts(bars, "1h")
     assert starts.tolist() == [100, 299]
-    history = strategy.history_bars
-    mask = cli._gap_mask(bars, "1h", lookahead=history)
-    assert mask[99] and mask[100] and mask[298] and mask[299]
+    # Маска обнуляет ровно бар перед каждой дырой: 99 и 298; первые бары
+    # после дыр (100, 299) маской не трогаются — их сдерживает только прогрев
+    # свежего участка.
+    mask = cli._gap_mask(bars, "1h")
+    assert mask[99] and not mask[100] and mask[298] and not mask[299]
+    assert mask.sum() == 2
 
     assert len(seg) == len(bars)
     assert seg.index.equals(bars.index)
@@ -1201,10 +1248,11 @@ def test_gap_segmentation_aligns_to_original_index(tmp_path):
 
 
 def test_gap_segmentation_is_noop_without_gaps():
-    """Нет дыр — нет сегментации: ряд без разрывов считается ровно как раньше."""
+    """Нет дыр — нет ни сегментации, ни маски: ряд считается ровно как раньше."""
     bars = random_walk_bars(n=500, freq="1h", seed=3)
     strategy = build_strategy("mean_reversion", PARAMS)
     assert len(cli._gap_starts(bars, "1h")) == 0
+    assert not cli._gap_mask(bars, "1h").any()
 
     seg = cli._generate_segmented(strategy, bars, "1h")
     raw = strategy.generate(bars)
