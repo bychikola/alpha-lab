@@ -9,8 +9,10 @@ import hashlib
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import pandas as pd
 
+from alpha_lab.data.quality import FREQ_DELTA
 from alpha_lab.data.store import DEFAULT_ROOT, end_bound
 
 # Правила агрегации минутных баров в старший таймфрейм
@@ -85,18 +87,100 @@ def load_funding(root: Path = DEFAULT_ROOT, symbol: str = "BTCUSDT") -> pd.DataF
     return df.reset_index(drop=True)
 
 
-def align_funding_to_bars(bars: pd.DataFrame, funding: pd.DataFrame) -> pd.Series:
+def _bar_step_ns(bar_ns: np.ndarray, timeframe: str | None) -> int | None:
+    """Шаг бара в наносекундах: явный таймфрейм или медиана интервалов ряда.
+
+    None — шаг неизвестен (меньше двух баров или все метки совпадают); тогда
+    событие привязывается только при точном совпадении с меткой бара.
+    """
+    if timeframe is not None:
+        if timeframe not in FREQ_DELTA:
+            raise ValueError(
+                f"Неизвестный таймфрейм: {timeframe!r}. "
+                f"Допустимые: {', '.join(FREQ_DELTA)}"
+            )
+        return int(FREQ_DELTA[timeframe].value)
+    if len(bar_ns) < 2:
+        return None
+    positive = np.diff(bar_ns)
+    positive = positive[positive > 0]
+    if positive.size == 0:
+        return None
+    # Медиана, а не минимум: дыры в ряде (большие интервалы) не должны
+    # уменьшать шаг и растаскивать события по несуществующим барам.
+    return int(np.median(positive))
+
+
+def _funding_positions(bars: pd.DataFrame, funding: pd.DataFrame,
+                       timeframe: str | None) -> tuple[np.ndarray, np.ndarray]:
+    """Индексы баров-контейнеров для событий funding и признак попадания.
+
+    Контейнер события — последний бар, открывающийся не позже события; бар
+    занимает полуоткрытый интервал [t, t+шаг). Событие до первого бара или
+    позже конца последнего бара (t+шаг) не принадлежит ни одному бару:
+    valid=False, а не «приклеилось» к крайнему бару.
+    """
+    # as_unit("ns") обязателен: pandas 3 хранит datetime64 с разным разрешением
+    # (у дневного ряда — микросекунды), и asi8 без приведения дал бы числа не в
+    # наносекундах, а сравнение с шагом из FREQ_DELTA — молча неверную границу.
+    bar_ns = pd.DatetimeIndex(
+        pd.to_datetime(bars["ts"], utc=True)).as_unit("ns").asi8
+    fund_ns = pd.DatetimeIndex(
+        pd.to_datetime(funding["ts"], utc=True)).as_unit("ns").asi8
+    if len(bar_ns) == 0:
+        return np.zeros(0, dtype="int64"), np.zeros(len(fund_ns), dtype=bool)
+
+    pos = np.searchsorted(bar_ns, fund_ns, side="right") - 1
+    clipped = np.clip(pos, 0, len(bar_ns) - 1)
+    valid = pos >= 0
+    step = _bar_step_ns(bar_ns, timeframe)
+    left = bar_ns[clipped]
+    if step is None:
+        valid &= fund_ns == left
+    else:
+        valid &= fund_ns < left + step
+    return clipped, valid
+
+
+def align_funding_to_bars(bars: pd.DataFrame, funding: pd.DataFrame,
+                          timeframe: str | None = None) -> pd.Series:
     """Ставка funding, привязанная к барам.
 
-    Ненулевое значение только в бары, совпадающие с моментом выплаты.
+    Каждое событие попадает в бар, который его СОДЕРЖИТ (полуоткрытый
+    интервал [t, t+шаг)); несколько событий одного бара суммируются. Ставка
+    ровно на границе принадлежит бару, который этой границей открывается:
+    так же вёл себя точный матч на 1h, и так же считает движок — funding
+    бара t начисляется на held[t], позицию, удерживаемую в этом баре.
+    Поэтому часовое выравнивание не меняется, а на 1d перестают теряться
+    выплаты 08:00 и 16:00 (две трети, занижавшие издержки).
+
+    timeframe — шаг бара; None означает вывести шаг из медианы интервалов
+    ряда (для регулярного ряда это тот же шаг). События вне диапазона баров
+    не привязываются ни к какому бару.
     """
     if funding.empty:
         return pd.Series(0.0, index=bars.index, name="funding_rate")
 
-    lookup = dict(zip(pd.to_datetime(funding["ts"], utc=True),
-                      funding["rate"].astype(float)))
-    ts = pd.to_datetime(bars["ts"], utc=True)
-    return ts.map(lookup).fillna(0.0).astype("float64").rename("funding_rate")
+    pos, valid = _funding_positions(bars, funding, timeframe)
+    rates = funding["rate"].astype(float).to_numpy()
+    sums = np.zeros(len(bars), dtype="float64")
+    if valid.any():
+        np.add.at(sums, pos[valid], rates[valid])
+    return pd.Series(sums, index=bars.index, name="funding_rate")
+
+
+def matched_funding_events(bars: pd.DataFrame, funding: pd.DataFrame,
+                           timeframe: str | None = None) -> int:
+    """Сколько событий funding попало в существующие бары (включая нулевые).
+
+    Нулевая ставка — такое же учтённое событие, как ненулевая: суммой их не
+    различить, а предупреждение «funding не привязан» должно срабатывать
+    только когда события действительно не легли ни на один бар.
+    """
+    if funding.empty:
+        return 0
+    _, valid = _funding_positions(bars, funding, timeframe)
+    return int(valid.sum())
 
 
 def data_version(root: Path = DEFAULT_ROOT) -> str:

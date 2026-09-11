@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from alpha_lab.validation.metrics import max_drawdown, sharpe_ratio, summarize
+from alpha_lab.validation.metrics import (
+    DEFAULT_PERIODS, max_drawdown, sharpe_ratio, summarize,
+)
 from alpha_lab.validation.significance import (
     deflated_sharpe_ratio, permutation_pvalue,
 )
@@ -23,9 +25,6 @@ DEFAULT_THRESHOLDS = {
     "min_dsr": 0.95,
     "n_permutations": 1000,
 }
-
-# Итоговый годовой Sharpe считается для часовых баров крипты (24/7)
-PERIODS_PER_YEAR = 365 * 24
 
 
 @dataclass(frozen=True)
@@ -54,7 +53,8 @@ class Verdict:
 def validate(returns, trade_returns, equity, config: dict, n_trials: int,
              strategy_name: str, experiment_id: str,
              returns_matrix=None, price_returns=None, positions=None,
-             warnings: tuple[str, ...] = ()) -> Verdict:
+             warnings: tuple[str, ...] = (),
+             periods_per_year: int = DEFAULT_PERIODS) -> Verdict:
     """Выносит вердикт. Все пороги — из config, значения по умолчанию в DEFAULT_THRESHOLDS.
 
     price_returns и positions обязательны для permutation-теста: он перемешивает
@@ -64,7 +64,18 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
     warnings — внешние (собранные CLI) предупреждения о непроверенных гейтах;
     к ним добавляется предупреждение о неоценённом PBO. Предупреждения — plain
     strings, не зависят от NaN и не участвуют в alive.
+
+    periods_per_year — годовой множитель Sharpe/Sortino/Calmar. CLI обязан
+    передать множитель таймфрейма эксперимента (data.quality.periods_per_year):
+    дефолт — часовой (8760) и сохраняет поведение прямых вызовов без
+    таймфрейма, а неверный множитель невидимо портит все метрики вердикта.
     """
+    if not np.isfinite(periods_per_year) or periods_per_year <= 0:
+        raise ValueError(
+            f"periods_per_year должен быть конечным положительным числом "
+            f"(получено {periods_per_year!r}): неверный годовой множитель "
+            f"невидимо портит Sharpe/Sortino/Calmar"
+        )
     thresholds = {**DEFAULT_THRESHOLDS, **(config or {})}
 
     r = np.asarray(pd.Series(returns), dtype="float64")
@@ -129,12 +140,12 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
             f"нужно ≥ 2 конфигураций и ≥ 2·n_blocks наблюдений"
         )
 
-    stats = summarize(r, t, eq, PERIODS_PER_YEAR) if len(r) else {}
+    stats = summarize(r, t, eq, periods_per_year) if len(r) else {}
 
     return Verdict(
         strategy_name=strategy_name,
         experiment_id=experiment_id,
-        sharpe=sharpe_ratio(r, PERIODS_PER_YEAR),
+        sharpe=sharpe_ratio(r, periods_per_year),
         dsr=dsr,
         p_value=p_value,
         max_dd=max_drawdown(eq) if len(eq) else 0.0,

@@ -19,6 +19,23 @@ FREQ_DELTA = {
 }
 
 
+def periods_per_year(timeframe: str) -> int:
+    """Число баров таймфрейма в году (крипта торгуется 24/7, 365 дней).
+
+    Единственный источник правды о годовом множителе: он выводится из
+    FREQ_DELTA, поэтому новый таймфрейм нельзя добавить в одну карту и забыть
+    в другой. Неизвестный таймфрейм — ValueError, а не молчаливый дефолт:
+    неверный множитель невидим в отчёте (Sharpe отличается на sqrt(24),
+    Calmar — ровно в 24 раза) и тихо портит все метрики вердикта.
+    """
+    if timeframe not in FREQ_DELTA:
+        raise ValueError(
+            f"Неизвестный таймфрейм для аннуализации: {timeframe!r}. "
+            f"Допустимые: {', '.join(FREQ_DELTA)}"
+        )
+    return int(round(pd.Timedelta(days=365) / FREQ_DELTA[timeframe]))
+
+
 @dataclass(frozen=True)
 class QualityReport:
     total_rows: int

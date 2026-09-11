@@ -17,15 +17,18 @@ import numpy as np
 import pandas as pd
 
 from alpha_lab.config import load_experiment, load_universe
-from alpha_lab.data.quality import FREQ_DELTA, clean_mask
+from alpha_lab.data.quality import FREQ_DELTA, clean_mask, periods_per_year
 from alpha_lab.data.query import (
     align_funding_to_bars, data_version, load_bars, load_funding,
+    matched_funding_events,
 )
 from alpha_lab.data.store import DEFAULT_ROOT
 from alpha_lab.engine.backtest import run_backtest, trade_returns
 from alpha_lab.engine.costs import RealisticCost
 from alpha_lab.report.writer import build_report, write_report
-from alpha_lab.strategies.base import build_strategy
+from alpha_lab.strategies.base import (
+    DEFAULT_HISTORY_BARS, build_strategy, history_bars_of,
+)
 from alpha_lab.validation.validator import validate
 
 EXIT_OK = 0
@@ -39,14 +42,16 @@ DEFAULT_JOURNAL = Path("reports") / "trials.jsonl"
 # при смене дефолта run_backtest.
 MAX_PARTICIPATION = 0.01
 
-# Окно маскирования разрыва по умолчанию (в барах таймфрейма стратегии).
-# Нужны обе стороны. Назад: позиция, удерживаемая через дыру, была решена за бар
-# до неё, а решение на последнем баре перед дырой принималось, когда о разрыве
-# ещё не было известно, — такие позиции обязаны быть закрыты. Вперёд: первые
-# решения после дыры опираются на скользящие окна, пересекающие пропуск, и их
-# сигнал недостоверен, пока окно не обновится.
+# Запас маскирования разрыва назад, в барах. Назад нужно ровно на один бар:
+# позиция, удерживаемая через дыру, была решена за бар до неё, а решение на
+# последнем баре перед дырой принималось, когда о разрыве ещё не было
+# известно, — такие позиции обязаны быть закрыты. Память стратегии назад здесь
+# ни при чём: все бары до дыры контигуозны и решение на них достоверно.
+#
+# Вперёд запас — это history_bars стратегии (см. strategies.base): первые
+# history_bars − 1 решений после дыры опираются на окно, пересекающее пропуск.
+# Дефолт для необъявившей стратегии — DEFAULT_HISTORY_BARS, консервативный.
 GAP_MASK_LOOKBACK_BARS = 1
-GAP_MASK_LOOKAHEAD_BARS = 1
 
 
 def git_hash() -> str:
@@ -222,7 +227,7 @@ def _gap_stats(bars: pd.DataFrame, timeframe: str) -> tuple[int, int]:
 
 def _gap_mask(bars: pd.DataFrame, timeframe: str,
               lookback: int = GAP_MASK_LOOKBACK_BARS,
-              lookahead: int = GAP_MASK_LOOKAHEAD_BARS) -> np.ndarray:
+              lookahead: int = DEFAULT_HISTORY_BARS) -> np.ndarray:
     """Маска баров, которые нельзя торговать из-за разрыва (True = исключён).
 
     Разрыв — интервал между соседними барами больше шага таймфрейма. Для
@@ -232,7 +237,11 @@ def _gap_mask(bars: pd.DataFrame, timeframe: str,
       последнем баре перед дырой принималось, когда о разрыве ещё не было
       известно; такие позиции обязаны быть закрыты, а не пройти сквозь дыру;
     * вперёд — первые решения после дыры опираются на скользящие окна,
-      пересекающие пропуск, поэтому их сигнал недостоверен.
+      пересекающие пропуск, поэтому их сигнал недостоверен, пока не наберётся
+      history_bars контигуозных баров. Вызывающий обязан передать требование
+      истории своей стратегии (strategies.base.history_bars_of); дефолт
+      консервативен (DEFAULT_HISTORY_BARS), а не 1: единица маскировала бы
+      один бар и оставляла остальные решения на неконтигуозных данных.
 
     Разрыв не инвалидирует весь прогон: 120 пропущенных часов на четырёх годах
     сделали бы пару непригодной, тогда как честный ответ — не торговать короткое
@@ -275,6 +284,12 @@ def _cmd_validate(args) -> int:
     }
     exp_id = experiment_id(cfg_payload, dv, git_hash())
 
+    # Годовой множитель метрик — из таймфрейма эксперимента, а не часовой
+    # константы: на 1d часы завышают Sharpe в sqrt(24) раз, Calmar — в 24.
+    # load_experiment уже отверг неизвестный таймфрейм; здесь он дал бы
+    # ValueError, что тоже громко, а не молчаливо.
+    ppy = periods_per_year(exp.timeframe)
+
     symbol = args.symbol
     try:
         bars = load_bars(root, symbol, "1m", exp.start, exp.end,
@@ -311,12 +326,12 @@ def _cmd_validate(args) -> int:
             )
         else:
             funding_available = True
-            funding_rate = align_funding_to_bars(bars, funding)
-            funding_matched = int(
-                pd.to_datetime(funding["ts"], utc=True).isin(
-                    pd.to_datetime(bars["ts"], utc=True)
-                ).sum()
-            )
+            # Событие привязывается к содержащему его бару и суммируется с
+            # соседями по бару (на 1d 00:00+08:00+16:00 — один бар). Явный
+            # timeframe задаёт шаг бара: события из пропущенных баров не
+            # приклеиваются к соседним.
+            funding_rate = align_funding_to_bars(bars, funding, exp.timeframe)
+            funding_matched = matched_funding_events(bars, funding, exp.timeframe)
             if funding_matched == 0:
                 funding_warning = (
                     f"Funding не привязан ни к одному бару "
@@ -337,8 +352,12 @@ def _cmd_validate(args) -> int:
     # Разрывы: через дыру цена шла неизвестно как, поэтому торговля вокруг неё
     # приостанавливается (spec 8: грязные данные → стратегия не торгует).
     # Маска компонуется с маской грязных баров; движок не меняется.
+    # Стратегия строится здесь, до маски: lookahead маски — это объявленное
+    # стратегией требование истории, и только она знает его точно.
+    strategy = build_strategy(exp.strategy, exp.params)
+    history = history_bars_of(strategy)
     gaps, missing_bars = _gap_stats(bars, exp.timeframe)
-    gap_excluded = _gap_mask(bars, exp.timeframe)
+    gap_excluded = _gap_mask(bars, exp.timeframe, lookahead=history)
     gap_masked = int(gap_excluded.sum())
     gap_warning = None
     if gaps:
@@ -346,7 +365,8 @@ def _cmd_validate(args) -> int:
             f"В данных разрывов: {gaps}, пропущено баров: {missing_bars} "
             f"(таймфрейм {exp.timeframe}) — торговля приостановлена на "
             f"{gap_masked} барах вокруг них (lookback="
-            f"{GAP_MASK_LOOKBACK_BARS}, lookahead={GAP_MASK_LOOKAHEAD_BARS})"
+            f"{GAP_MASK_LOOKBACK_BARS}, lookahead={history} = "
+            f"history_bars стратегии '{exp.strategy}')"
         )
         print(f"Предупреждение: {gap_warning}", file=sys.stderr)
 
@@ -381,7 +401,6 @@ def _cmd_validate(args) -> int:
             return EXIT_ERROR
         n_trials = count_prior_trials(journal, trial_key) + 1
 
-    strategy = build_strategy(exp.strategy, exp.params)
     # copy=True: to_numpy() в pandas 3 отдаёт read-only массив, а маска ниже
     # пишет в него на месте. Обнуляются цели и грязных баров, и окна разрывов.
     targets = strategy.generate(bars).to_numpy(dtype="float64", copy=True)
@@ -403,7 +422,7 @@ def _cmd_validate(args) -> int:
         config=exp.validation, n_trials=n_trials, strategy_name=exp.name,
         experiment_id=exp_id,
         price_returns=result.price_returns, positions=result.positions,
-        warnings=data_warnings,
+        warnings=data_warnings, periods_per_year=ppy,
     )
 
     # ВАЖНО: load_bars заканчивается reset_index(drop=True), поэтому бары и
@@ -422,6 +441,7 @@ def _cmd_validate(args) -> int:
                "data_version": dv, "dirty_bars": dirty,
                "gaps": gaps, "missing_bars": missing_bars,
                "gap_masked_bars": gap_masked,
+               "history_bars": history, "periods_per_year": ppy,
                "funding_available": funding_available,
                "funding_events": funding_events,
                "funding_matched": funding_matched,
@@ -450,6 +470,9 @@ def _cmd_validate(args) -> int:
     print(f"  ВЕРДИКТ: {status}")
     print(f"{'=' * 62}")
     print(f"  Стратегия      {exp.name}  ({exp.strategy}, {exp.timeframe})")
+    # Годовой множитель печатается явно: именно его неверное значение
+    # (например, часовое на 1d-эксперименте) незаметно портит метрики.
+    print(f"  Баров в году   {ppy}  (таймфрейм {exp.timeframe})")
     print(f"  Символ         {symbol}")
     print(f"  Experiment ID  {exp_id}")
     print(f"  Попыток (DSR)  {n_trials}")

@@ -2,10 +2,57 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from alpha_lab.data.quality import periods_per_year
 from alpha_lab.validation.metrics import (
     DEFAULT_PERIODS, calmar_ratio, max_drawdown, profit_factor, sharpe_ratio,
     sortino_ratio, summarize,
 )
+
+
+def test_periods_per_year_derived_from_timeframe():
+    """Годовой множитель выводится из таймфрейма, а не захардкожен под часы.
+
+    Крипта торгуется 24/7, поэтому год — 365 дней: 1d → 365, 1h → 8760,
+    1m → 525600. Множитель общий для Sharpe, Sortino и Calmar.
+    """
+    assert periods_per_year("1d") == 365
+    assert periods_per_year("1h") == 365 * 24
+    assert periods_per_year("4h") == 365 * 6
+    assert periods_per_year("15m") == 365 * 24 * 4
+    assert periods_per_year("5m") == 365 * 24 * 12
+    assert periods_per_year("1m") == 365 * 24 * 60
+
+
+def test_periods_per_year_unknown_timeframe_raises():
+    """Неизвестный таймфрейм — громкий ValueError, а не молчаливый дефолт.
+
+    Неверный множитель невидим в отчёте: Sharpe отличается на sqrt(24),
+    Calmar — на 24, и все метрики вердикта испорчены без единого признака
+    в выводе.
+    """
+    with pytest.raises(ValueError, match="Неизвестный таймфрейм"):
+        periods_per_year("2h")
+
+
+def test_sharpe_and_calmar_scale_with_timeframe_periods():
+    """Синтетика с известными моментами: годовой Sharpe на 1h и 1d сходится
+    с формулой mean/std*sqrt(periods_per_year), а не с одним и тем же числом."""
+    rng = np.random.default_rng(42)
+    r = pd.Series(rng.normal(0.0005, 0.01, 2000))
+    raw = float(r.mean() / r.std(ddof=1))
+
+    s_1h = sharpe_ratio(r, periods_per_year=periods_per_year("1h"))
+    s_1d = sharpe_ratio(r, periods_per_year=periods_per_year("1d"))
+
+    assert s_1h == pytest.approx(raw * np.sqrt(8760), rel=1e-12)
+    assert s_1d == pytest.approx(raw * np.sqrt(365), rel=1e-12)
+    assert s_1h / s_1d == pytest.approx(np.sqrt(24), rel=1e-12)
+
+    equity = (1.0 + r).cumprod()
+    c_1h = calmar_ratio(r, equity, periods_per_year=periods_per_year("1h"))
+    c_1d = calmar_ratio(r, equity, periods_per_year=periods_per_year("1d"))
+    # Годовая доходность арифметическая: множитель входит ровно в 24 раза.
+    assert c_1h / c_1d == pytest.approx(24.0, rel=1e-12)
 
 
 def test_sharpe_of_constant_returns_is_zero_std():

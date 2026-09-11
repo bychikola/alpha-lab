@@ -1,14 +1,28 @@
 """Протокол стратегии. Одна функция — намеренно узкий интерфейс."""
 from __future__ import annotations
 
+from numbers import Integral
 from typing import Protocol, runtime_checkable
 
 import pandas as pd
+
+# Консервативный дефолт истории для стратегии, не объявившей history_bars.
+# Единица означала бы «решение зависит только от текущего бара» — для любой
+# стратегии со скользящим окном это ложь, из-за которой после разрыва данных
+# маскируется один бар вместо всего окна. 500 — наибольшая память среди
+# штатных стратегий полигона (max_bars у MR); стратегия с более длинной
+# памятью обязана объявить своё значение явно.
+DEFAULT_HISTORY_BARS = 500
 
 
 @runtime_checkable
 class Strategy(Protocol):
     name: str
+
+    # Сколько хвостовых баров (включая текущий) использует решение на баре t.
+    # Нужно маскированию разрывов: решение, чьё окно ещё пересекает пропуск,
+    # недостоверно, и после дыры таких решений ровно history_bars - 1.
+    history_bars: int
 
     def generate(self, bars: pd.DataFrame) -> pd.Series:
         """Целевая позиция: −1.0 (полный шорт) … 0.0 … +1.0 (полный лонг).
@@ -30,6 +44,29 @@ class Strategy(Protocol):
         generate(bars).iloc[:k]. Новая стратегия обязана проходить его.
         """
         ...
+
+
+def history_bars_of(strategy) -> int:
+    """Требование истории стратегии: объявленное history_bars или дефолт.
+
+    Дефолт консервативен (DEFAULT_HISTORY_BARS), а не 1: заниженное окно
+    маскирования оставляет решения после разрыва на неконтигуозных данных.
+    Некорректное объявление (bool, нецелое, < 1) — ошибка, а не тихий
+    фолбэк: неверное требование испортило бы маску незаметно.
+    """
+    value = getattr(strategy, "history_bars", DEFAULT_HISTORY_BARS)
+    label = getattr(strategy, "name", type(strategy).__name__)
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(
+            f"history_bars стратегии '{label}' должен быть целым, "
+            f"получено {value!r}"
+        )
+    if value < 1:
+        raise ValueError(
+            f"history_bars стратегии '{label}' должен быть ≥ 1, "
+            f"получено {value!r}"
+        )
+    return int(value)
 
 
 def build_strategy(name: str, params: dict) -> Strategy:

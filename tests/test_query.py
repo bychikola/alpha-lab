@@ -1,7 +1,10 @@
+import numpy as np
 import pandas as pd
+import pytest
 
 from alpha_lab.data.query import (
     align_funding_to_bars, data_version, load_bars, load_funding,
+    matched_funding_events,
 )
 from alpha_lab.data.store import write_bars, write_funding
 from alpha_lab.data.schema import normalize_bars
@@ -113,3 +116,133 @@ def test_align_funding_places_rate_at_funding_timestamps(tmp_path):
     assert series.iloc[0] == 0.0001
     assert series.iloc[480] == 0.0002
     assert series.sum() == 0.0001 + 0.0002
+
+
+def test_align_funding_sums_events_into_containing_daily_bar():
+    """Решающий тест 1d: учтены ВСЕ ставки, а не только полуночные.
+
+    Ставки Binance (00:00, 08:00, 16:00 UTC) на дневном баре попадают в один
+    бар; точный матч выживлял только 00:00 и терял 2/3 выплат — в сторону,
+    которая льстит стратегии.
+    """
+    bars = pd.DataFrame({
+        "ts": pd.date_range("2024-01-01", periods=3, freq="1D", tz="UTC")})
+    funding = pd.DataFrame({
+        "ts": pd.to_datetime([
+            "2024-01-01 00:00", "2024-01-01 08:00", "2024-01-01 16:00",
+            "2024-01-02 00:00", "2024-01-02 08:00", "2024-01-02 16:00",
+        ], utc=True),
+        "rate": [1e-4, 2e-4, 3e-4, 4e-4, 5e-4, 6e-4],
+    })
+
+    series = align_funding_to_bars(bars, funding)
+
+    assert series.sum() == pytest.approx(float(funding["rate"].sum()))
+    assert series.iloc[0] == pytest.approx(6e-4)
+    assert series.iloc[1] == pytest.approx(15e-4)
+    assert series.iloc[2] == 0.0
+
+
+def test_align_funding_boundary_event_belongs_to_opening_bar():
+    """Ставка ровно на границе — бару, который ею открывается.
+
+    Соглашение то же, что у точного матча на 1h, и совпадает с движком:
+    funding бара t начисляется на held[t] — позицию, удерживаемую в баре
+    [t, t+step), поэтому выплата в момент t оплачивается этим баром.
+    """
+    bars = pd.DataFrame({
+        "ts": pd.date_range("2024-01-01", periods=3, freq="1D", tz="UTC")})
+    funding = pd.DataFrame({
+        "ts": pd.to_datetime(["2024-01-02 00:00"], utc=True),
+        "rate": [0.001],
+    })
+
+    series = align_funding_to_bars(bars, funding, timeframe="1d")
+
+    assert series.tolist() == [0.0, 0.001, 0.0]
+
+
+def test_align_funding_hourly_places_each_event_in_its_own_bar():
+    """1h: каждое событие — в свой бар, суммы не меняются.
+
+    Регрессия на W2: обобщение на «охватывающий бар» не должно сдвигать
+    часовое выравнивание — иначе BTC-прогон изменится там, где funding и так
+    учитывался полностью.
+    """
+    ts = pd.date_range("2024-01-01", periods=48, freq="1h", tz="UTC")
+    bars = pd.DataFrame({"ts": ts})
+    funding = pd.DataFrame({
+        "ts": ts[::8],                      # 00:00, 08:00, 16:00 каждые сутки
+        "rate": np.arange(1, 7) * 1e-4,
+    })
+
+    series = align_funding_to_bars(bars, funding, timeframe="1h")
+
+    assert series.sum() == pytest.approx(float(funding["rate"].sum()))
+    for i, rate in zip(range(0, 48, 8), funding["rate"]):
+        assert series.iloc[i] == pytest.approx(rate)
+    assert (series.drop(series.index[::8]) == 0.0).all()
+
+
+def test_align_funding_explicit_timeframe_drops_events_in_missing_bars():
+    """Явный timeframe задаёт интервал бара: событие из пропущенного бара
+    не приклеивается к соседнему.
+
+    1d-ряд с дырой (Jan 1 и Jan 4): ставка Jan 2 08:00 лежит в несуществующем
+    баре Jan 2 и не принадлежит ни одному бару. Без явного timeframe шаг
+    вывелся бы из медианы (3 дня) и молча приписал бы её бару Jan 1.
+    """
+    bars = pd.DataFrame({
+        "ts": pd.to_datetime(["2024-01-01", "2024-01-04"], utc=True)})
+    funding = pd.DataFrame({
+        "ts": pd.to_datetime(["2024-01-01 08:00", "2024-01-02 08:00",
+                              "2024-01-04 00:00"], utc=True),
+        "rate": [1e-4, 2e-4, 3e-4],
+    })
+
+    series = align_funding_to_bars(bars, funding, timeframe="1d")
+
+    assert series.tolist() == pytest.approx([1e-4, 3e-4])
+
+
+def test_align_funding_unknown_timeframe_raises():
+    bars = pd.DataFrame({
+        "ts": pd.date_range("2024-01-01", periods=2, freq="1D", tz="UTC")})
+    funding = pd.DataFrame({
+        "ts": pd.to_datetime(["2024-01-01 08:00"], utc=True),
+        "rate": [1e-4],
+    })
+
+    with pytest.raises(ValueError, match="Неизвестный таймфрейм"):
+        align_funding_to_bars(bars, funding, timeframe="2h")
+
+
+def test_align_funding_ignores_events_after_last_bar():
+    """Событие за последним баром не приклеивается к последнему бару."""
+    bars = pd.DataFrame({
+        "ts": pd.date_range("2024-01-01", periods=2, freq="1D", tz="UTC")})
+    funding = pd.DataFrame({
+        "ts": pd.to_datetime(["2024-01-01 08:00", "2024-01-05 08:00"], utc=True),
+        "rate": [1e-4, 9e-4],
+    })
+
+    series = align_funding_to_bars(bars, funding, timeframe="1d")
+
+    assert series.tolist() == pytest.approx([1e-4, 0.0])
+
+
+def test_matched_funding_events_counts_contained_including_zero_rates():
+    """Счётчик привязки: сколько событий попало в существующие бары.
+
+    Нулевая ставка — тоже учтённое событие (её нельзя отличить от «данных
+    нет» суммой), поэтому счётчик считается по попаданию, а не по значению.
+    """
+    bars = pd.DataFrame({
+        "ts": pd.date_range("2024-01-01", periods=3, freq="1D", tz="UTC")})
+    funding = pd.DataFrame({
+        "ts": pd.to_datetime(["2024-01-01 00:00", "2024-01-01 08:00",
+                              "2024-01-02 16:00", "2024-01-09 00:00"], utc=True),
+        "rate": [0.0, 1e-4, 2e-4, 3e-4],
+    })
+
+    assert matched_funding_events(bars, funding, timeframe="1d") == 3

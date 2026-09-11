@@ -38,6 +38,7 @@ from fixtures.traps import (
 
 from alpha_lab.engine.backtest import run_backtest, trade_returns
 from alpha_lab.engine.costs import RealisticCost, ZeroCost
+from alpha_lab.strategies.base import Strategy
 from alpha_lab.validation.metrics import sharpe_ratio
 from alpha_lab.validation.validator import validate
 
@@ -57,6 +58,19 @@ def _assert_killed(v, expected_reason: str) -> str:
     matches = [r for r in v.reasons if expected_reason in r]
     assert matches, f"среди причин нет {expected_reason!r}: {v.reasons}"
     return matches[0]
+
+
+def test_trap_strategies_satisfy_strategy_protocol():
+    """Ловушки обязаны удовлетворять протоколу Strategy, включая history_bars.
+
+    Протокол — контракт для рабочего пути CLI (`build_strategy`), и если
+    фикстуры его не выполняют, тесты проверяют не тот интерфейс, что прод.
+    """
+    for trap in (LookAheadStrategy, OverfitNoiseStrategy, AlwaysLongStrategy,
+                 PerfectForesightStrategy):
+        instance = trap()
+        assert isinstance(instance, Strategy), trap.__name__
+        assert instance.history_bars >= 1
 
 
 def test_validator_does_not_import_strategies():
@@ -152,6 +166,7 @@ class _MisalignedIndexStrategy:
     """
 
     name = "trap_misaligned_index"
+    history_bars = 1
 
     def generate(self, bars: pd.DataFrame) -> pd.Series:
         return pd.Series(1.0, index=pd.Index(bars["ts"], name="ts"))
@@ -168,6 +183,7 @@ class _SegmentLeak:
     """
 
     name = "trap_segment_leak"
+    history_bars = 1
 
     def __init__(self, start: int = 100, end: int = 249):
         self.start = start
@@ -194,6 +210,7 @@ class _WarmupLeak:
     """
 
     name = "trap_warmup_leak"
+    history_bars = 1
 
     def __init__(self, n_warmup: int = 100):
         self.n_warmup = n_warmup
@@ -216,6 +233,7 @@ class _ParityLeak:
     """
 
     name = "trap_parity_leak"
+    history_bars = 1
 
     def generate(self, bars: pd.DataFrame) -> pd.Series:
         close = bars["close"].astype("float64")

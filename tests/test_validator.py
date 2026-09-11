@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from alpha_lab.validation.metrics import sharpe_ratio
 from alpha_lab.validation.validator import Verdict, validate
 
 
@@ -218,6 +219,37 @@ def test_usable_matrix_has_no_pbo_warning():
 
     assert np.isfinite(v.pbo)
     assert not any("PBO" in w for w in v.warnings), v.warnings
+
+
+def test_validate_annualizes_with_passed_periods_per_year():
+    """validate обязан считать Sharpe/Sortino/Calmar переданным множителем.
+
+    Дефолт сохраняет часовое поведение; 1d-множитель даёт sqrt(24) раз меньше
+    Sharpe и ровно в 24 раза меньше Calmar — иначе дневной прогон выглядел бы
+    лучше правды, причём незаметно для читателя отчёта.
+    """
+    case = _case(seed=30, strength=0.8)
+    r, _, _ = case
+    trades = _trades(300, 30)
+    raw = sharpe_ratio(r.to_numpy(), annualize=False)
+
+    hourly = _run(case, trades)
+    daily = _run(case, trades, periods_per_year=365)
+
+    assert hourly.sharpe == pytest.approx(raw * np.sqrt(365 * 24), rel=1e-12)
+    assert daily.sharpe == pytest.approx(raw * np.sqrt(365), rel=1e-12)
+    assert daily.metrics["calmar"] == pytest.approx(
+        hourly.metrics["calmar"] / 24.0, rel=1e-9)
+
+
+def test_validate_rejects_nonpositive_periods_per_year():
+    """Множитель ≤ 0 — ошибка вызывающего, а не «метрики в нуле».
+
+    Ноль/отрицательное значение так же невидимо портит вердикт, как и
+    неверный таймфрейм, поэтому падаем громко и здесь.
+    """
+    with pytest.raises(ValueError, match="periods_per_year"):
+        _run(_case(seed=31, strength=0.8), _trades(300, 31), periods_per_year=0)
 
 
 def test_external_warnings_are_preserved_and_do_not_kill():

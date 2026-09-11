@@ -7,7 +7,9 @@ from fixtures.synthetic import ou_bars, random_walk_bars
 from alpha_lab.data.quality import check_bars
 from alpha_lab.features.price import zscore
 from alpha_lab.strategies import mean_reversion as mr_module
-from alpha_lab.strategies.base import Strategy, build_strategy
+from alpha_lab.strategies.base import (
+    DEFAULT_HISTORY_BARS, Strategy, build_strategy, history_bars_of,
+)
 from alpha_lab.strategies.mean_reversion import MeanReversionStrategy
 
 
@@ -273,3 +275,48 @@ def test_satisfies_strategy_protocol():
 
     assert isinstance(s, Strategy)
     assert s.name == "mean_reversion"
+
+
+def test_history_bars_reflects_used_windows():
+    """history_bars — требование истории, а не константа.
+
+    Это максимум окон, реально используемых решением на баре t: z-скор
+    (window), ATR (atr_len) и — только при включённом фильтре — окно
+    полужизни (hl_window; цикл _half_life_ok берёт w баров до i). Выключенный
+    hl_window решению не нужен и в требование не входит.
+    """
+    assert MeanReversionStrategy({"window": 20, "atr_len": 14}).history_bars == 20
+    assert MeanReversionStrategy({"window": 20, "atr_len": 50}).history_bars == 50
+    assert MeanReversionStrategy({"window": 40, "atr_len": 14}).history_bars == 40
+
+    filtered = MeanReversionStrategy({
+        "window": 20, "atr_len": 14, "use_hl_filter": True, "hl_window": 200})
+    assert filtered.history_bars == 200
+
+    ignored = MeanReversionStrategy({
+        "window": 20, "atr_len": 14, "use_hl_filter": False, "hl_window": 200})
+    assert ignored.history_bars == 20
+
+
+def test_history_bars_default_for_undeclared_strategy_is_conservative():
+    """Стратегия без history_bars получает консервативный дефолт, а не 1.
+
+    Единица означала бы «окно не пересекает разрыв» для любой стратегии —
+    ровно та ошибка, из-за которой маскировался один бар вместо двадцати.
+    """
+    class Bare:
+        name = "bare"
+
+        def generate(self, bars):
+            return pd.Series(0.0, index=bars.index)
+
+    assert history_bars_of(Bare()) == DEFAULT_HISTORY_BARS
+    assert DEFAULT_HISTORY_BARS > 1
+
+
+def test_history_bars_of_rejects_invalid_declaration():
+    class Bad:
+        history_bars = 0
+
+    with pytest.raises(ValueError, match="history_bars"):
+        history_bars_of(Bad())

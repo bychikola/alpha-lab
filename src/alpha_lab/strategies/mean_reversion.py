@@ -48,6 +48,21 @@ class MeanReversionStrategy:
         self.hl_window = int(cfg["hl_window"])
         self.params = cfg
 
+    @property
+    def history_bars(self) -> int:
+        """Сколько хвостовых баров (включая текущий) нужно решению.
+
+        Максимум из окон, которые решение реально использует: z-скор
+        (window баров, включая текущий), ATR (atr_len) и — только при
+        включённом фильтре — окно полужизни (hl_window: цикл _half_life_ok
+        берёт values[i-w:i], то есть w баров строго до бара i). Выключенный
+        фильтр в требование не входит.
+        """
+        required = max(self.window, self.atr_len)
+        if self.use_hl_filter:
+            required = max(required, self.hl_window)
+        return required
+
     def generate(self, bars: pd.DataFrame) -> pd.Series:
         close = bars["close"].astype("float64")
         z = zscore(close, self.window)

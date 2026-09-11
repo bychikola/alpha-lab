@@ -16,7 +16,9 @@ import pytest
 
 import alpha_lab.cli as cli
 from alpha_lab.cli import count_prior_trials, experiment_id, log_trial, main
-from alpha_lab.data.query import load_bars
+from alpha_lab.data.query import (
+    align_funding_to_bars, load_bars, load_funding,
+)
 from alpha_lab.data.schema import normalize_bars
 from alpha_lab.data.store import write_bars, write_funding
 from alpha_lab.strategies.base import build_strategy
@@ -55,7 +57,8 @@ def _write_fixture_data(root: Path, n: int = N_MINUTES, seed: int = 1,
     write_bars(df, root, symbol, "1m")
 
 
-def _write_configs(tmp_path, root=None, symbols=("BTCUSDT",)):
+def _write_configs(tmp_path, root=None, symbols=("BTCUSDT",), timeframe="1h",
+                   params="{window: 20, k: 2.0}"):
     """root не используется: конфигам он не нужен, но так короче вызовы."""
     u = tmp_path / "universe.yaml"
     u.write_text(
@@ -63,9 +66,9 @@ def _write_configs(tmp_path, root=None, symbols=("BTCUSDT",)):
         f"symbols: {list(symbols)}\n", encoding="utf-8")
     e = tmp_path / "exp.yaml"
     e.write_text(
-        "name: test\nstrategy: mean_reversion\ntimeframe: 1h\n"
+        f"name: test\nstrategy: mean_reversion\ntimeframe: {timeframe}\n"
         "start: '2024-01-01'\nend: '2024-06-30'\n"
-        "params: {window: 20, k: 2.0}\n"
+        f"params: {params}\n"
         "costs: {taker_fee_bps: 5.0}\n"
         "validation: {min_trades: 1}\n", encoding="utf-8")
     return u, e
@@ -892,6 +895,74 @@ def test_funding_events_are_counted_and_matched(tmp_path, capsys):
            f"привязано к барам {len(ts)})" in captured.out
 
 
+def test_daily_experiment_annualizes_with_daily_periods(tmp_path, monkeypatch):
+    """CLI обязан брать годовой множитель из таймфрейма эксперимента.
+
+    На 1d это 365, а не 8760: перепутанный множитель завышает Sharpe в
+    sqrt(24) раз, Calmar — в 24 раза, и в отчёте это никак не видно.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root, timeframe="1d",
+                          params="{window: 5, k: 2.0, atr_len: 3}")
+
+    captured: dict = {}
+    real_validate = cli.validate
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_validate(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "validate", spy)
+    out = tmp_path / "out"
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    assert captured["periods_per_year"] == 365
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert payload["extra"]["timeframe"] == "1d"
+
+
+def test_daily_funding_is_fully_accounted(tmp_path):
+    """На 1d сумма применённого funding равна всем выплатам периода.
+
+    Решающая проверка W2: ставки 08:00 и 16:00 обязаны попасть в тот же
+    дневной бар, что и 00:00. Старое точное совпадение оставляло 1/3 выплат,
+    занижая издержки и льстя вердикту.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)          # 30000 минут ≈ 21 сутки
+    u, e = _write_configs(tmp_path, root, timeframe="1d",
+                          params="{window: 5, k: 2.0, atr_len: 3}")
+    funding_ts = pd.date_range("2024-01-01", "2024-01-21 16:00", freq="8h",
+                               tz="UTC")
+    rates = np.linspace(1e-5, 2e-4, len(funding_ts))
+    write_funding(pd.DataFrame({"ts": funding_ts, "rate": rates,
+                                "interval_hours": 8.0}), root, "BTCUSDT")
+    out = tmp_path / "out"
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    extra = payload["extra"]
+    assert extra["funding_available"] is True
+    assert extra["funding_events"] == len(funding_ts)
+    assert extra["funding_matched"] == len(funding_ts)
+
+    bars = load_bars(root, "BTCUSDT", "1m", "2024-01-01", "2024-06-30",
+                     resample="1d")
+    funding = load_funding(root, "BTCUSDT")
+    aligned = align_funding_to_bars(bars, funding, timeframe="1d")
+    assert aligned.sum() == pytest.approx(float(funding["rate"].sum()))
+
+    # Сумма издержек отчёта — это ровно Σ held[t]·rate[t]: проверяется не
+    # только привязка события, но и то, что движок применил её к позиции бара.
+    held = np.asarray(payload["series"]["position"], dtype="float64")
+    assert len(held) == len(aligned)
+    expected_cost = float(np.sum(held * aligned.to_numpy()))
+    assert extra["costs_total"]["funding"] == pytest.approx(expected_cost,
+                                                            abs=1e-12)
+
+
 def test_data_gaps_are_surfaced_and_warned(tmp_path, capsys):
     """Разрыв в данных обязан быть виден, а торговля вокруг него — остановлена.
 
@@ -911,11 +982,15 @@ def test_data_gaps_are_surfaced_and_warned(tmp_path, capsys):
     payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
     assert payload["extra"]["gaps"] == 1
     assert payload["extra"]["missing_bars"] == 1
-    # Окно по умолчанию: lookback=1 + грязный бар + lookahead=1.
-    assert payload["extra"]["gap_masked_bars"] == 3
+    # Окно маскирования: lookback=1 (бар перед дырой) + первый бар после дыры
+    # + lookahead=history_bars стратегии. У MR с window=20, atr_len=14 это 20:
+    # именно столько баров после дыры ещё считают скользящие окна,
+    # пересекающие пропуск.
+    assert payload["extra"]["gap_masked_bars"] == 1 + 1 + 20
 
     warnings = payload["verdict"]["warnings"]
     assert any("разрыв" in w and "приостановлена" in w for w in warnings), warnings
+    assert any("lookahead=20" in w and "history_bars" in w for w in warnings), warnings
 
     captured = capsys.readouterr()
     assert "разрыв" in captured.err
@@ -928,17 +1003,41 @@ def test_gap_mask_window_margins_are_configurable():
     """Окно маскирования — параметр: запас назад и вперёд задаётся явно.
 
     i — индекс первого бара после разрыва (здесь 04:00 после пропущенного
-    03:00). По умолчанию маскируются [i-2..i]; при lookback=2, lookahead=3 —
-    [i-3..i+2].
+    03:00). При lookback=1, lookahead=1 маскируются [i-2..i]; при
+    lookback=2, lookahead=3 — [i-3..i+2].
     """
     ts = pd.date_range("2024-01-01", periods=8, freq="1h", tz="UTC").delete(3)
     bars = pd.DataFrame({"ts": ts})
 
-    default = cli._gap_mask(bars, "1h")
+    narrow = cli._gap_mask(bars, "1h", lookback=1, lookahead=1)
     wide = cli._gap_mask(bars, "1h", lookback=2, lookahead=3)
 
-    assert default.tolist() == [False, True, True, True, False, False, False]
+    assert narrow.tolist() == [False, True, True, True, False, False, False]
     assert wide.tolist() == [True, True, True, True, True, True, False]
+
+
+def test_gap_mask_lookahead_comes_from_strategy_history_bars():
+    """Lookahead маски — требование истории стратегии, а не константа 1.
+
+    MR с window=20: решение на баре t использует 20 хвостовых баров, поэтому
+    после дыры ровно 20 решений (i..i+19) ещё опираются на окно, пересекающее
+    пропуск. Старый lookahead=1 маскировал один бар и оставлял 19 решений на
+    неконтигуозных данных — невидимо, потому что маска не влияет на причины
+    вердикта.
+    """
+    ts = pd.date_range("2024-01-01", periods=41, freq="1h", tz="UTC").delete(9)
+    bars = pd.DataFrame({"ts": ts})
+    history = build_strategy("mean_reversion", PARAMS).history_bars
+    assert history == 20
+
+    mask = cli._gap_mask(bars, "1h", lookahead=history)
+    i = 9                       # первый бар после дыры
+    assert mask[i - 1]          # бар перед дырой: позиция через дыру закрыта
+    assert mask[i:i + history].all()     # все 20 решений после дыры
+    assert not mask[i + history]         # на 21-м баре окно уже не пересекает дыру
+
+    old = cli._gap_mask(bars, "1h", lookahead=1)
+    assert not old[i + 1:].any(), "lookahead=1 маскирует только один бар после дыры"
 
 
 def test_gap_window_is_flat_and_trading_resumes(tmp_path, capsys):
@@ -952,12 +1051,14 @@ def test_gap_window_is_flat_and_trading_resumes(tmp_path, capsys):
     _write_fixture_data(root)
     u, e = _write_configs(tmp_path, root)
 
+    history = build_strategy("mean_reversion", PARAMS).history_bars
+    assert history == 20
     bars = _hourly_bars(root)
     raw = _raw_targets(bars)
-    # Час k: цель за три бара до него и через два после — ненулевые, иначе
-    # проверка возобновления торговли была бы пустой.
-    k = next(j for j in range(6, len(raw) - 3)
-             if raw[j - 3] != 0.0 and raw[j + 2] != 0.0)
+    # Час k: цель за три бара до него и через history+1 после — ненулевые,
+    # иначе проверка возобновления торговли была бы пустой.
+    k = next(j for j in range(6, len(raw) - history - 2)
+             if raw[j - 3] != 0.0 and raw[j + history + 1] != 0.0)
     _remove_hours(root, [bars["ts"].iloc[k]])
 
     out = tmp_path / "out"
@@ -966,19 +1067,22 @@ def test_gap_window_is_flat_and_trading_resumes(tmp_path, capsys):
     payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
     assert payload["extra"]["gaps"] == 1
     assert payload["extra"]["missing_bars"] == 1
-    assert payload["extra"]["gap_masked_bars"] == 3
+    assert payload["extra"]["gap_masked_bars"] == 1 + 1 + history
     assert payload["extra"]["dirty_bars"] == 0
 
     # После вырезания часа k первый бар за дырой снова имеет индекс k.
+    # Цели обнулены на [k-2, k-1+history] = k-2..k+19; позиция движка —
+    # held[t] = target[t-1], поэтому торговля возобновляется на баре k+21.
     bars_after = _hourly_bars(root)
     raw_after = _raw_targets(bars_after)
     targets = raw_after.copy()
-    targets[k - 2:k + 1] = 0.0
+    targets[k - 2:k + history] = 0.0
     expected = _held_from_targets(targets)
 
     # Вне окна позиции не обнулены: торговля именно возобновляется.
     assert expected[k - 2] != 0.0
-    assert expected[k + 2] != 0.0
+    assert expected[k + history] == 0.0      # последний бар окна ещё закрыт
+    assert expected[k + history + 1] != 0.0  # а на следующем торговля идёт
 
     got = np.asarray(payload["series"]["position"], dtype="float64")
     np.testing.assert_allclose(got, expected, atol=1e-6)

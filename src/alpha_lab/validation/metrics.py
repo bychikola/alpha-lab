@@ -9,7 +9,10 @@ import numpy as np
 import pandas as pd
 
 MINUTES_PER_YEAR = 365 * 24 * 60
-DEFAULT_PERIODS = 365 * 24          # часовые бары крипты (24/7)
+# Часовой дефолт крипты (24/7). Он сохранён для вызовов без таймфрейма, но
+# рабочий путь обязан передавать множитель своего таймфрейма: единственный
+# источник правды «таймфрейм → баров в году» — data.quality.periods_per_year.
+DEFAULT_PERIODS = 365 * 24
 
 
 def _clean(returns) -> np.ndarray:

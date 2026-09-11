@@ -13,6 +13,9 @@ class LookAheadStrategy:
     """Торгует по цене СЛЕДУЮЩЕГО бара — классическое подглядывание в будущее."""
 
     name = "trap_lookahead"
+    # Ловушки не объявляют осмысленную историю: для протокола Strategy
+    # достаточно любого положительного значения.
+    history_bars = 1
 
     def generate(self, bars: pd.DataFrame) -> pd.Series:
         close = bars["close"].astype("float64")
@@ -26,6 +29,9 @@ class OverfitNoiseStrategy:
     """Подогнана под конкретный исторический отрезок: торгует только там."""
 
     name = "trap_overfit"
+    # Ловушки не объявляют осмысленную историю: для протокола Strategy
+    # достаточно любого положительного значения.
+    history_bars = 1
 
     def __init__(self, start: int = 0, end: int = 50):
         self.start = start
@@ -41,6 +47,9 @@ class AlwaysLongStrategy:
     """Всегда в лонге. На растущем ряде выглядит прибыльной без всякой альфы."""
 
     name = "trap_always_long"
+    # Ловушки не объявляют осмысленную историю: для протокола Strategy
+    # достаточно любого положительного значения.
+    history_bars = 1
 
     def generate(self, bars: pd.DataFrame) -> pd.Series:
         return pd.Series(1.0, index=bars.index)
@@ -50,6 +59,9 @@ class PerfectForesightStrategy:
     """Знает весь будущий ряд целиком — эталон максимального подглядывания."""
 
     name = "trap_foresight"
+    # Ловушки не объявляют осмысленную историю: для протокола Strategy
+    # достаточно любого положительного значения.
+    history_bars = 1
 
     def generate(self, bars: pd.DataFrame) -> pd.Series:
         close = bars["close"].astype("float64").to_numpy()
