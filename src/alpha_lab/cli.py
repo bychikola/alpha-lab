@@ -12,6 +12,7 @@ import json
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -460,6 +461,245 @@ def _params_summary(params: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in sorted(params.items()))
 
 
+# Единственный источник текста отказа от причинностной проверки: он уходит и в
+# stderr одиночного прогона, и в warnings вердикта, и в строки пакетного свипа.
+CAUSALITY_DISABLED_WARNING = (
+    "Причинностная проверка ОТКЛЮЧЕНА (--skip-causality): вердикт не "
+    "защищён от look-ahead. Подглядывание статистикой по результатам "
+    "не ловится (spec 8.1), поэтому подглядывающая стратегия может "
+    "получить «ЖИВА» с отличными метриками. Флаг — только для отладки."
+)
+
+
+@dataclass(frozen=True)
+class LoadedData:
+    """Бары одного (символ, таймфрейм) и всё, что считается из них один раз.
+
+    Пакетный свип грузит данные на каждую пару (символ, таймфрейм) один раз и
+    переиспользует их всеми конфигурациями группы: 22.2 с загрузки на
+    конфигурацию сделали бы перебор тысяч гипотез нерабочим.
+    """
+
+    symbol: str
+    timeframe: str
+    bars: pd.DataFrame
+    ts_index: pd.Index
+    tradable: np.ndarray
+    dirty: int
+    gaps: int
+    missing_bars: int
+    gap_masked: int
+    data_warnings: tuple[str, ...]
+    funding_rate: pd.Series | None
+    funding_available: bool
+    funding_events: int
+    funding_matched: int
+    ppy: int
+
+
+class CausalityError(RuntimeError):
+    """Стратегия не прошла причинностный harness: бэктест не запускался."""
+
+    def __init__(self, strategy_name: str, cause: BaseException):
+        super().__init__(
+            f"Стратегия '{strategy_name}' не прошла проверку причинности: "
+            f"{cause}"
+        )
+        self.strategy_name = strategy_name
+        self.cause = cause
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    """Результат одной конфигурации до вердикта."""
+
+    experiment: Experiment
+    result: object
+    trades: pd.Series
+    history: int
+    causality_cuts: int
+
+
+def prepare_data(root: Path, symbol: str, timeframe: str, start: str,
+                 end: str | None) -> LoadedData:
+    """Грузит бары и фундамент издержек/масок для одного (символ, таймфрейм).
+
+    Единая точка для одиночного прогона и пакетного свипа: маски, funding и
+    предупреждения о данных обязаны быть одинаковыми в обоих путях, иначе
+    вердикты разъедутся. FileNotFoundError пробрасывается: вызывающий решает,
+    печатать «Данных нет» и завершаться (CLI) или записать отказ группы и
+    продолжить (свип).
+    """
+    ppy = periods_per_year(timeframe)
+    bars = load_bars(root, symbol, "1m", start, end, resample=timeframe)
+
+    # Funding: недоступность — это не «ставка 0». Различаем отсутствие файла и
+    # пустой файл и считаем, сколько событий реально легло на бары: панель
+    # издержек обязана отличать «данных нет» от «funding был нулевым», иначе
+    # вердикт «жива» может стоять на заниженных издержках.
+    funding_available = False
+    funding_events = 0
+    funding_matched = 0
+    funding_rate = None
+    funding_warning = None
+    try:
+        funding = load_funding(root, symbol)
+    except FileNotFoundError:
+        funding = None
+        funding_warning = (
+            "Funding недоступен (файл не найден): ставки не применены, "
+            "издержки занижены, вердикт оптимистичен"
+        )
+    if funding is not None:
+        funding_events = int(len(funding))
+        if funding_events == 0:
+            # load_funding отдаёт все нули на пустой parquet без предупреждения,
+            # а align_funding_to_bars заливает нули и в несовпавшие бары.
+            funding_warning = (
+                "Funding недоступен (файл пуст): ставки не применены, "
+                "издержки занижены, вердикт оптимистичен"
+            )
+        else:
+            funding_available = True
+            # Событие привязывается к содержащему его бару и суммируется с
+            # соседями по бару (на 1d 00:00+08:00+16:00 — один бар). Явный
+            # timeframe задаёт шаг бара: события из пропущенных баров не
+            # приклеиваются к соседним.
+            funding_rate = align_funding_to_bars(bars, funding, timeframe)
+            funding_matched = matched_funding_events(bars, funding, timeframe)
+            if funding_matched == 0:
+                funding_warning = (
+                    f"Funding не привязан ни к одному бару "
+                    f"({funding_events} событий): издержки занижены, "
+                    f"вердикт оптимистичен"
+                )
+    if funding_warning:
+        print(f"Предупреждение: {funding_warning}", file=sys.stderr)
+
+    # Грязные бары: стратегия на них не торгует. Не чиним и не интерполируем —
+    # иначе тихо неверный бэктест выглядел бы как честный.
+    clean = clean_mask(bars).to_numpy()
+    dirty = int((~clean).sum())
+    if dirty:
+        print(f"Предупреждение: {dirty} грязных баров исключено из торговли",
+              file=sys.stderr)
+
+    # Разрывы: через дыру цена шла неизвестно как, поэтому торговля через неё
+    # не ведётся (spec 8: грязные данные → стратегия не торгует). Маска
+    # компонуется с маской грязных баров; движок не меняется. Forward-маски
+    # нет: ряд сегментируется (_generate_segmented), и на первом же баре после
+    # дыры история стратегии перезапущена — окна сквозь пропуск не тянутся.
+    # history_bars остаётся в отчёте диагностикой подлинной памяти стратегии.
+    gaps, missing_bars = _gap_stats(bars, timeframe)
+    gap_excluded = _gap_mask(bars, timeframe, lookahead=0)
+    gap_masked = int(gap_excluded.sum())
+    gap_warning = None
+    if gaps:
+        gap_warning = (
+            f"В данных разрывов: {gaps}, пропущено баров: "
+            f"{missing_bars} (таймфрейм {timeframe}) — торговля "
+            f"приостановлена на {gap_masked} барах вокруг них "
+            f"(lookback={GAP_MASK_LOOKBACK_BARS}: последнее решение перед "
+            f"дырой, иначе позиция прошла бы сквозь неё; lookahead=0: "
+            f"сегментация перезапускает историю стратегии с первого бара "
+            f"после дыры); состояние стратегии перезапускается на каждом "
+            f"непрерывном участке"
+        )
+        print(f"Предупреждение: {gap_warning}", file=sys.stderr)
+
+    tradable = clean & ~gap_excluded
+    data_warnings = tuple(
+        w for w in (funding_warning, gap_warning) if w)
+    # ВАЖНО: load_bars заканчивается reset_index(drop=True), поэтому бары и
+    # выходы движка проиндексированы RangeIndex (0..n-1). build_report делает
+    # из индекса series.ts через pd.Timestamp(t), а это наносекунды от эпохи
+    # 1970 года — ось времени всех графиков дашборда становится бессмысленной.
+    # Переиндексируем позиционные ряды реальными временами баров; set_axis не
+    # меняет длину, поэтому проверка выравнивания в writer проходит.
+    ts_index = pd.Index(bars["ts"].to_numpy(), name="ts")
+    return LoadedData(
+        symbol=symbol, timeframe=timeframe, bars=bars, ts_index=ts_index,
+        tradable=tradable, dirty=dirty, gaps=gaps, missing_bars=missing_bars,
+        gap_masked=gap_masked, data_warnings=data_warnings,
+        funding_rate=funding_rate, funding_available=funding_available,
+        funding_events=funding_events, funding_matched=funding_matched, ppy=ppy,
+    )
+
+
+def run_config(data: LoadedData, exp: Experiment, *,
+               skip_causality: bool = False) -> RunOutcome:
+    """Прогоняет одну конфигурацию: harness → сегментированный generate → бэктест.
+
+    Общий кусок одиночного CLI и пакетного свипа. Причинностная проверка идёт
+    до бэктеста каждой конфигурации: look-ahead статистикой по результатам не
+    ловится (spec 8.1), поэтому единственная работающая защита — запрос к
+    функции решения. Провал harness — CausalityError: CLI печатает «прогон
+    остановлен», свип записывает отказ конфигурации и идёт дальше.
+    """
+    strategy = build_strategy(exp.strategy, exp.params)
+    causality_cuts = 0
+    if not skip_causality:
+        try:
+            causality_cuts = assert_strategy_is_causal(strategy, data.bars)
+        except (AssertionError, ValueError) as exc:
+            raise CausalityError(
+                getattr(strategy, "name", exp.strategy), exc) from exc
+    # Разрыв — не только «не торговать в окне»: ряд неконтигуозен, и
+    # стратегия не имеет права видеть сквозь дыру. generate вызывается на
+    # каждом непрерывном участке отдельно, поэтому внутреннее состояние
+    # стратегии (у MR — direction/entry_bar/cur_sl/cur_tp внутри
+    # simulate_bracket_exits) перезапускается на дыре по построению.
+    # Обнуление целей этого не лечит: сделка, открытая до дыры, всплыла бы
+    # на первом немаскированном баре с предразрывной ценой входа, стопом/
+    # тейком и часами max_bars, которые не считали пропущенные бары. Маска
+    # гасит ровно бар перед дырой — позицию, которая иначе прошла бы сквозь
+    # пропуск; вперёд маски нет, потому что сегментация уже перезапустила
+    # историю стратегии.
+    #
+    # copy=True: to_numpy() в pandas 3 отдаёт read-only массив, а маска
+    # ниже пишет в него на месте. Обнуляются цели и грязных баров, и бара
+    # перед каждым разрывом.
+    targets = _generate_segmented(strategy, data.bars,
+                                  exp.timeframe).to_numpy(
+        dtype="float64", copy=True)
+    targets[~data.tradable] = 0.0
+    targets = pd.Series(targets, index=data.bars.index)
+
+    cost_model = RealisticCost.from_config(exp.costs)
+    result = run_backtest(data.bars, targets, cost_model,
+                          funding_rate=data.funding_rate,
+                          max_participation=MAX_PARTICIPATION)
+    return RunOutcome(
+        experiment=exp, result=result, trades=trade_returns(result),
+        history=history_bars_of(strategy), causality_cuts=causality_cuts,
+    )
+
+
+def validate_config(outcome: RunOutcome, data: LoadedData, *,
+                    experiment_id: str, n_trials: int,
+                    returns_matrix=None, pbo_value=None,
+                    warnings: tuple[str, ...] | None = None):
+    """Выносит вердикт по результату прогона — тот же validate, что и в CLI.
+
+    Валидатору уходят позиции ДВИЖКА (result.positions — удержанные,
+    held[t] = target[t-1]), а не сырые цели strategy.generate(): сырые цели
+    смещены на бар, поэтому permutation-тест сравнил бы сигнал не с той
+    доходностью (измерено 0.343656 у сырых против 0.000999 у позиций).
+    """
+    exp = outcome.experiment
+    return validate(
+        returns=outcome.result.returns, trade_returns=outcome.trades,
+        equity=outcome.result.equity, config=exp.validation,
+        n_trials=n_trials, strategy_name=exp.name,
+        experiment_id=experiment_id,
+        price_returns=outcome.result.price_returns,
+        positions=outcome.result.positions,
+        warnings=data.data_warnings if warnings is None else warnings,
+        periods_per_year=data.ppy,
+        returns_matrix=returns_matrix, pbo_value=pbo_value,
+    )
+
+
 def _cmd_validate(args) -> int:
     # Источник конфигураций ровно один: --config (одиночный прогон, PBO для
     # него невычислим) или --configs (манифест свипа, PBO вычислим). Молчаливое
@@ -551,93 +791,14 @@ def _cmd_validate(args) -> int:
 
     # Годовой множитель метрик — из таймфрейма эксперимента, а не часовой
     # константы: на 1d часы завышают Sharpe в sqrt(24) раз, Calmar — в 24.
-    # load_experiment уже отверг неизвестный таймфрейм; здесь он дал бы
-    # ValueError, что тоже громко, а не молчаливо.
-    ppy = periods_per_year(exp.timeframe)
-
+    # prepare_data берёт его из того же таймфрейма (periods_per_year).
     symbol = args.symbol
     try:
-        bars = load_bars(root, symbol, "1m", exp.start, exp.end,
-                         resample=exp.timeframe)
+        data = prepare_data(root, symbol, exp.timeframe, exp.start, exp.end)
     except FileNotFoundError as exc:
         print(f"Данных нет: {exc}", file=sys.stderr)
         return EXIT_ERROR
-
-    # Funding: недоступность — это не «ставка 0». Различаем отсутствие файла и
-    # пустой файл и считаем, сколько событий реально легло на бары: панель
-    # издержек обязана отличать «данных нет» от «funding был нулевым», иначе
-    # вердикт «жива» может стоять на заниженных издержках.
-    funding_available = False
-    funding_events = 0
-    funding_matched = 0
-    funding_rate = None
-    funding_warning = None
-    try:
-        funding = load_funding(root, symbol)
-    except FileNotFoundError:
-        funding = None
-        funding_warning = (
-            "Funding недоступен (файл не найден): ставки не применены, "
-            "издержки занижены, вердикт оптимистичен"
-        )
-    if funding is not None:
-        funding_events = int(len(funding))
-        if funding_events == 0:
-            # load_funding отдаёт все нули на пустой parquet без предупреждения,
-            # а align_funding_to_bars заливает нули и в несовпавшие бары.
-            funding_warning = (
-                "Funding недоступен (файл пуст): ставки не применены, "
-                "издержки занижены, вердикт оптимистичен"
-            )
-        else:
-            funding_available = True
-            # Событие привязывается к содержащему его бару и суммируется с
-            # соседями по бару (на 1d 00:00+08:00+16:00 — один бар). Явный
-            # timeframe задаёт шаг бара: события из пропущенных баров не
-            # приклеиваются к соседним.
-            funding_rate = align_funding_to_bars(bars, funding, exp.timeframe)
-            funding_matched = matched_funding_events(bars, funding, exp.timeframe)
-            if funding_matched == 0:
-                funding_warning = (
-                    f"Funding не привязан ни к одному бару "
-                    f"({funding_events} событий): издержки занижены, "
-                    f"вердикт оптимистичен"
-                )
-    if funding_warning:
-        print(f"Предупреждение: {funding_warning}", file=sys.stderr)
-
-    # Грязные бары: стратегия на них не торгует. Не чиним и не интерполируем —
-    # иначе тихо неверный бэктест выглядел бы как честный.
-    clean = clean_mask(bars).to_numpy()
-    dirty = int((~clean).sum())
-    if dirty:
-        print(f"Предупреждение: {dirty} грязных баров исключено из торговли",
-              file=sys.stderr)
-
-    # Разрывы: через дыру цена шла неизвестно как, поэтому торговля через неё
-    # не ведётся (spec 8: грязные данные → стратегия не торгует). Маска
-    # компонуется с маской грязных баров; движок не меняется. Forward-маски
-    # нет: ряд сегментируется (_generate_segmented), и на первом же баре после
-    # дыры история стратегии перезапущена — окна сквозь пропуск не тянутся.
-    # history_bars остаётся в отчёте диагностикой подлинной памяти стратегии.
-    gaps, missing_bars = _gap_stats(bars, exp.timeframe)
-    gap_excluded = _gap_mask(bars, exp.timeframe, lookahead=0)
-    gap_masked = int(gap_excluded.sum())
-    gap_warning = None
-    if gaps:
-        gap_warning = (
-            f"В данных разрывов: {gaps}, пропущено баров: "
-            f"{missing_bars} (таймфрейм {exp.timeframe}) — торговля "
-            f"приостановлена на {gap_masked} барах вокруг них "
-            f"(lookback={GAP_MASK_LOOKBACK_BARS}: последнее решение перед "
-            f"дырой, иначе позиция прошла бы сквозь неё; lookahead=0: "
-            f"сегментация перезапускает историю стратегии с первого бара "
-            f"после дыры); состояние стратегии перезапускается на каждом "
-            f"непрерывном участке"
-        )
-        print(f"Предупреждение: {gap_warning}", file=sys.stderr)
-
-    tradable = clean & ~gap_excluded
+    bars = data.bars
 
     # Причинностная проверка идёт до бэктеста каждой конфигурации: look-ahead
     # статистикой по результатам не ловится (spec 8.1), поэтому единственная
@@ -663,12 +824,7 @@ def _cmd_validate(args) -> int:
     causality_checked = not args.skip_causality
     causality_warning = None
     if args.skip_causality:
-        causality_warning = (
-            "Причинностная проверка ОТКЛЮЧЕНА (--skip-causality): вердикт не "
-            "защищён от look-ahead. Подглядывание статистикой по результатам "
-            "не ловится (spec 8.1), поэтому подглядывающая стратегия может "
-            "получить «ЖИВА» с отличными метриками. Флаг — только для отладки."
-        )
+        causality_warning = CAUSALITY_DISABLED_WARNING
         print(f"Предупреждение: {causality_warning}", file=sys.stderr)
 
     # Предупреждения о данных и отключённой проверке уходят тем же каналом,
@@ -677,7 +833,7 @@ def _cmd_validate(args) -> int:
     # попасть в отчёт и в блок вердикта — иначе после закрытия терминала
     # отключённая защита исчезает из артефакта.
     data_warnings = tuple(
-        w for w in (funding_warning, gap_warning, causality_warning) if w)
+        w for w in (*data.data_warnings, causality_warning) if w)
 
     # Судьба вердикта решается до бэктеста: журнал нужен для n_trials, а
     # непригодный журнал занижает n_trials и тем завышает DSR. Недодефлиро-
@@ -715,65 +871,25 @@ def _cmd_validate(args) -> int:
         # когда текущий свип сам покрывает всю семью.
         n_trials = count_prior_trials_for_keys(journal, trial_keys) + len(configs)
 
-    # ВАЖНО: load_bars заканчивается reset_index(drop=True), поэтому бары и
-    # выходы движка проиндексированы RangeIndex (0..n-1). build_report делает
-    # из индекса series.ts через pd.Timestamp(t), а это наносекунды от эпохи
-    # 1970 года — ось времени всех графиков дашборда становится бессмысленной.
-    # Переиндексируем позиционные ряды реальными временами баров; set_axis не
-    # меняет длину, поэтому проверка выравнивания в writer проходит.
-    ts_index = pd.Index(bars["ts"].to_numpy(), name="ts")
-
     runs: list[dict] = []
     for i, (path, cfg) in enumerate(configs):
-        strategy = build_strategy(cfg.strategy, cfg.params)
-        causality_cuts = 0
-        if not args.skip_causality:
-            try:
-                causality_cuts = assert_strategy_is_causal(strategy, bars)
-            except (AssertionError, ValueError) as exc:
-                where = (f" в конфигурации [{i}] {cfg.name} ({path})"
-                         if sweep_mode else "")
-                print(
-                    f"Ошибка: стратегия "
-                    f"'{getattr(strategy, 'name', cfg.strategy)}' не прошла "
-                    f"проверку причинности{where}: {exc} "
-                    f"Прогон остановлен до бэктеста: look-ahead статистикой по "
-                    f"результатам не ловится (spec 8.1), поэтому без harness "
-                    f"вердикт был бы оптимистичной ложью. Отчёт не записан. "
-                    f"Осознанный отказ от проверки — --skip-causality",
-                    file=sys.stderr,
-                )
-                return EXIT_ERROR
-        # Разрыв — не только «не торговать в окне»: ряд неконтигуозен, и
-        # стратегия не имеет права видеть сквозь дыру. generate вызывается на
-        # каждом непрерывном участке отдельно, поэтому внутреннее состояние
-        # стратегии (у MR — direction/entry_bar/cur_sl/cur_tp внутри
-        # simulate_bracket_exits) перезапускается на дыре по построению.
-        # Обнуление целей этого не лечит: сделка, открытая до дыры, всплыла бы
-        # на первом немаскированном баре с предразрывной ценой входа, стопом/
-        # тейком и часами max_bars, которые не считали пропущенные бары. Маска
-        # гасит ровно бар перед дырой — позицию, которая иначе прошла бы сквозь
-        # пропуск; вперёд маски нет, потому что сегментация уже перезапустила
-        # историю стратегии.
-        #
-        # copy=True: to_numpy() в pandas 3 отдаёт read-only массив, а маска
-        # ниже пишет в него на месте. Обнуляются цели и грязных баров, и бара
-        # перед каждым разрывом.
-        targets = _generate_segmented(strategy, bars, exp.timeframe).to_numpy(
-            dtype="float64", copy=True)
-        targets[~tradable] = 0.0
-        targets = pd.Series(targets, index=bars.index)
-
-        cost_model = RealisticCost.from_config(cfg.costs)
-        result = run_backtest(bars, targets, cost_model,
-                              funding_rate=funding_rate,
-                              max_participation=MAX_PARTICIPATION)
-        runs.append({
-            "path": path, "config": cfg, "result": result,
-            "trades": trade_returns(result),
-            "history": history_bars_of(strategy),
-            "causality_cuts": causality_cuts,
-        })
+        try:
+            outcome = run_config(data, cfg,
+                                 skip_causality=args.skip_causality)
+        except CausalityError as exc:
+            where = (f" в конфигурации [{i}] {cfg.name} ({path})"
+                     if sweep_mode else "")
+            print(
+                f"Ошибка: стратегия '{exc.strategy_name}' не прошла "
+                f"проверку причинности{where}: {exc.cause} "
+                f"Прогон остановлен до бэктеста: look-ahead статистикой по "
+                f"результатам не ловится (spec 8.1), поэтому без harness "
+                f"вердикт был бы оптимистичной ложью. Отчёт не записан. "
+                f"Осознанный отказ от проверки — --skip-causality",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+        runs.append({"path": path, "config": cfg, "outcome": outcome})
 
     # Матрица PBO — доходности БАРОВ (result.returns), не сделок: pbo_cscv
     # ожидает периодические доходности T × N. Конфигурации шли по одним и тем
@@ -785,7 +901,7 @@ def _cmd_validate(args) -> int:
         try:
             matrix = build_returns_matrix({
                 f"[{i}] {run['config'].name}":
-                    run["result"].returns.set_axis(ts_index)
+                    run["outcome"].result.returns.set_axis(data.ts_index)
                 for i, run in enumerate(runs)
             })
         except ValueError as exc:
@@ -801,47 +917,40 @@ def _cmd_validate(args) -> int:
         from alpha_lab.validation.significance import pbo_cscv
         pbo_value = pbo_cscv(matrix)
 
-    # ВАЖНО: в валидатор уходят позиции ДВИЖКА (result.positions — удержанные,
-    # held[t] = target[t-1]), а не сырые цели strategy.generate(). Сырые цели
-    # смещены на бар, поэтому permutation-тест сравнил бы сигнал не с той
-    # доходностью: измерено 0.343656 у сырых целей против 0.000999 у позиций
-    # движка — прогон убивался бы за мнимый дефект, а не за реальный.
-    #
     # n_trials у всех конфигураций один — суммарное число попыток семьи: свип
     # целиком был поиском, и каждая его строка обязана нести тот же штраф DSR,
-    # что и заголовочный вердикт.
-    verdicts = []
-    for i, run in enumerate(runs):
-        cfg = run["config"]
-        verdicts.append(validate(
-            returns=run["result"].returns, trade_returns=run["trades"],
-            equity=run["result"].equity, config=cfg.validation,
-            n_trials=n_trials, strategy_name=cfg.name,
-            experiment_id=exp_ids[i],
-            price_returns=run["result"].price_returns,
-            positions=run["result"].positions,
-            warnings=data_warnings, periods_per_year=ppy,
-            returns_matrix=matrix, pbo_value=pbo_value,
-        ))
+    # что и заголовочный вердикт. Валидатор зовётся общей с пакетным свипом
+    # функцией validate_config: она передаёт позиции ДВИЖКА (result.positions —
+    # удержанные, held[t] = target[t-1]), а не сырые цели strategy.generate().
+    # Сырые цели смещены на бар, поэтому permutation-тест сравнил бы сигнал не
+    # с той доходностью: измерено 0.343656 у сырых целей против 0.000999 у
+    # позиций движка — прогон убивался бы за мнимый дефект, а не за реальный.
+    verdicts = [
+        validate_config(run["outcome"], data, experiment_id=exp_ids[i],
+                        n_trials=n_trials, returns_matrix=matrix,
+                        pbo_value=pbo_value, warnings=data_warnings)
+        for i, run in enumerate(runs)
+    ]
     run0 = runs[0]
-    result0 = run0["result"]
+    result0 = run0["outcome"].result
     verdict = verdicts[0]
 
     extra = {
         "symbol": symbol, "timeframe": exp.timeframe,
-        "data_version": dv, "dirty_bars": dirty,
-        "gaps": gaps, "missing_bars": missing_bars,
-        "gap_masked_bars": gap_masked,
-        "history_bars": run0["history"], "periods_per_year": ppy,
+        "data_version": dv, "dirty_bars": data.dirty,
+        "gaps": data.gaps, "missing_bars": data.missing_bars,
+        "gap_masked_bars": data.gap_masked,
+        "history_bars": run0["outcome"].history,
+        "periods_per_year": data.ppy,
         # Провенанс причинности: checked=False — защита отключена флагом;
         # cuts — сколько точек усечения реально оценено (выборочная гарантия
         # harness, а не «все позиции»). Для свипа — по заголовочной
         # конфигурации; прогон каждой описан в extra.sweep.
         "causality_checked": causality_checked,
-        "causality_cuts": run0["causality_cuts"],
-        "funding_available": funding_available,
-        "funding_events": funding_events,
-        "funding_matched": funding_matched,
+        "causality_cuts": run0["outcome"].causality_cuts,
+        "funding_available": data.funding_available,
+        "funding_events": data.funding_events,
+        "funding_matched": data.funding_matched,
         "costs_total": result0.cost_totals,
         "capacity": {
             "cap_hits": result0.cap_hits,
@@ -882,10 +991,10 @@ def _cmd_validate(args) -> int:
         }
 
     payload = build_report(
-        verdict, equity=result0.equity.set_axis(ts_index),
-        close=bars["close"].set_axis(ts_index),
-        positions=result0.positions.set_axis(ts_index),
-        costs=result0.costs.set_axis(ts_index), price_bars=bars.set_axis(ts_index),
+        verdict, equity=result0.equity.set_axis(data.ts_index),
+        close=bars["close"].set_axis(data.ts_index),
+        positions=result0.positions.set_axis(data.ts_index),
+        costs=result0.costs.set_axis(data.ts_index), price_bars=bars.set_axis(data.ts_index),
         extra=extra,
     )
     out = Path(args.out) if args.out else Path("reports") / exp_id
@@ -915,7 +1024,7 @@ def _cmd_validate(args) -> int:
     print(f"  Стратегия      {exp.name}  ({exp.strategy}, {exp.timeframe})")
     # Годовой множитель печатается явно: именно его неверное значение
     # (например, часовое на 1d-эксперименте) незаметно портит метрики.
-    print(f"  Баров в году   {ppy}  (таймфрейм {exp.timeframe})")
+    print(f"  Баров в году   {data.ppy}  (таймфрейм {exp.timeframe})")
     print(f"  Символ         {symbol}")
     print(f"  Experiment ID  {exp_id}")
     if sweep_mode:
@@ -937,10 +1046,10 @@ def _cmd_validate(args) -> int:
     print(f"  Издержки       {result0.cost_totals}")
     # Статус funding печатается всегда: «нет данных» и «ставка была нулевой» —
     # разные вещи, и по одной сумме издержек их не различить.
-    funding_state = "доступен" if funding_available else "НЕДОСТУПЕН"
-    print(f"  Funding        {funding_state} (событий {funding_events}, "
-          f"привязано к барам {funding_matched})")
-    if not funding_available:
+    funding_state = "доступен" if data.funding_available else "НЕДОСТУПЕН"
+    print(f"  Funding        {funding_state} (событий {data.funding_events}, "
+          f"привязано к барам {data.funding_matched})")
+    if not data.funding_available:
         print("                 издержки занижены, вердикт оптимистичен")
     print(f"  Ёмкость        cap_hits={result0.cap_hits}, "
           f"over_capacity={'ДА' if result0.over_capacity else 'нет'}, "
@@ -1026,6 +1135,11 @@ def main(argv: list[str] | None = None) -> int:
                             "look-ahead (spec 8.1): статистика его не ловит, "
                             "поэтому вердикт с этим флагом может быть ложным")
     p_val.set_defaults(func=_cmd_validate)
+
+    # Пакетный свип регистрируется лениво: batch.py берёт production-функции
+    # этого модуля, и импорт на верхнем уровне создал бы цикл.
+    from alpha_lab.batch import add_sweep_subparser
+    add_sweep_subparser(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)
