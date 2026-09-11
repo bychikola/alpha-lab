@@ -9,7 +9,7 @@ SCHEMA_VERSION = "1.0"
 MAJOR_VERSION = int(SCHEMA_VERSION.split(".")[0])
 
 REQUIRED_TOP_LEVEL = ("schema_version", "verdict", "series", "generated_at")
-REQUIRED_SERIES = ("ts", "equity", "drawdown", "close", "position", "fee", "funding")
+REQUIRED_SERIES = ("ts", "equity", "drawdown", "close", "position", "fee", "slippage", "funding")
 
 
 def is_compatible(version: str) -> bool:

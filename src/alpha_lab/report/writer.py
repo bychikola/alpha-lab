@@ -25,11 +25,58 @@ def _round(values, digits: int = 6) -> list:
     return out
 
 
+def _json_safe(value):
+    """Рекурсивно приводит extra к JSON-совместимому виду.
+
+    Нефинитные float (NaN, ±Inf) заменяются на None — так же, как в _round/_num.
+    Иначе json.dumps(..., allow_nan=False) в write_report упал бы на ровном месте,
+    хотя весь остальной payload такие значения уже не пропускает.
+    """
+    if isinstance(value, (float, np.floating)):
+        f = float(value)
+        return None if not np.isfinite(f) else f
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _require_same_length(name: str, values, expected: int) -> None:
+    """Проверяет, что ряд выровнен с equity и совпадает с ним по длине."""
+    actual = len(values)
+    if actual != expected:
+        raise ValueError(
+            f"длина {name} ({actual}) не совпадает с длиной equity ({expected}); "
+            "все ряды должны быть выровнены и иметь одинаковую длину"
+        )
+
+
 def build_report(verdict: Verdict, equity: pd.Series, close: pd.Series,
                  positions: pd.Series, costs: pd.DataFrame,
                  price_bars: pd.DataFrame | None = None,
                  extra: dict | None = None) -> dict:
+    """Собирает payload отчёта по схеме.
+
+    Все ряды обязаны быть взаимно выровнены и одной длины с equity: дашборд
+    сопоставляет их с series.ts по позиции в массиве, поэтому расхождение длин
+    нарисовало бы правдоподобный, но неверный график. Требование проверяется:
+    close, positions, любая колонка costs и переданные колонки price_bars при
+    несовпадении длины дают ValueError. Перевыравнивание (reindex) не делается —
+    выходы движка приходят позиционными, и reindex молча превратил бы их в NaN.
+    """
     eq = pd.Series(equity).astype("float64")
+    n = len(eq)
+
+    _require_same_length("close", close, n)
+    _require_same_length("positions", positions, n)
+    for col in costs.columns:
+        _require_same_length(f"costs['{col}']", costs[col], n)
+    if price_bars is not None:
+        for col in ("open", "high", "low"):
+            if col in price_bars.columns:
+                _require_same_length(f"price_bars['{col}']", price_bars[col], n)
+
     dd = eq / eq.cummax() - 1.0
 
     series = {
@@ -57,8 +104,10 @@ def build_report(verdict: Verdict, equity: pd.Series, close: pd.Series,
         "p_value": _num(verdict.p_value),
         "max_dd": _num(verdict.max_dd),
         "total_return": _num(verdict.total_return),
-        "trades": verdict.trades,
-        "n_configs_tried": verdict.n_configs_tried,
+        # int(): json.dumps не умеет numpy-скаляры, а валидатор не обязан быть
+        # единственным источником вердикта.
+        "trades": int(verdict.trades),
+        "n_configs_tried": int(verdict.n_configs_tried),
         "reasons": list(verdict.reasons),
         "metrics": {k: _num(v) for k, v in (verdict.metrics or {}).items()},
     }
@@ -70,7 +119,7 @@ def build_report(verdict: Verdict, equity: pd.Series, close: pd.Series,
         "series": series,
     }
     if extra:
-        payload["extra"] = extra
+        payload["extra"] = _json_safe(extra)
     return payload
 
 

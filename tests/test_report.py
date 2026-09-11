@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -53,7 +54,7 @@ def test_build_report_has_all_series():
                            positions=pd.Series(1.0, index=ts),
                            costs=pd.DataFrame({"fee": 0.001}, index=ts))
 
-    for key in ("ts", "equity", "drawdown", "close", "position", "fee", "funding"):
+    for key in ("ts", "equity", "drawdown", "close", "position", "fee", "slippage", "funding"):
         assert key in payload["series"], key
 
 
@@ -120,6 +121,44 @@ def test_nan_values_become_null(tmp_path):
     assert from_js["verdict"]["pbo"] is None
 
 
+def test_extra_non_finite_floats_become_null(tmp_path):
+    """Task 18 может класть в extra вычисленные float; NaN/Inf не должны ломать запись."""
+    payload = _payload(5, extra={"nan": float("nan"), "pos_inf": float("inf"),
+                                 "nested": {"neg_inf": float("-inf")}})
+
+    assert payload["extra"]["nan"] is None
+    assert payload["extra"]["pos_inf"] is None
+    assert payload["extra"]["nested"]["neg_inf"] is None
+
+    json_path, js_path = write_report(payload, tmp_path)
+    from_json = json.loads(json_path.read_text(encoding="utf-8"))
+    from_js = json.loads(
+        js_path.read_text(encoding="utf-8").split("=", 1)[1].strip().rstrip(";")
+    )
+
+    expected = {"nan": None, "pos_inf": None, "nested": {"neg_inf": None}}
+    assert from_json["extra"] == expected
+    assert from_js == from_json
+
+
+def test_numpy_integer_verdict_fields_are_coerced(tmp_path):
+    """np.int64 json.dumps не сериализует: writer не должен зависеть от int() валидатора."""
+    verdict = replace(_verdict(), trades=np.int64(250), n_configs_tried=np.int64(12))
+    ts, equity = _series(5)
+
+    payload = build_report(verdict, equity=equity, close=equity * 100,
+                           positions=pd.Series(0.0, index=ts),
+                           costs=pd.DataFrame({"fee": 0.0}, index=ts))
+
+    assert isinstance(payload["verdict"]["trades"], int)
+    assert isinstance(payload["verdict"]["n_configs_tried"], int)
+
+    json_path, _ = write_report(payload, tmp_path)
+    saved = json.loads(json_path.read_text(encoding="utf-8"))
+    assert saved["verdict"]["trades"] == 250
+    assert saved["verdict"]["n_configs_tried"] == 12
+
+
 # --- Усиление контракта: проверки, которых нет в кратком ТЗ, но без них
 # --- дашборд может молча развалиться.
 
@@ -169,8 +208,64 @@ def test_all_series_have_same_length():
                            positions=pd.Series(1.0, index=ts),
                            costs=pd.DataFrame({"fee": 0.001}, index=ts))
 
-    for key in ("ts", "equity", "drawdown", "close", "position", "fee", "funding"):
+    for key in ("ts", "equity", "drawdown", "close", "position", "fee", "slippage", "funding"):
         assert len(payload["series"][key]) == len(ts), key
+
+
+def test_close_length_mismatch_raises():
+    """Короткий close раньше молча уезжал под чужими метками времени."""
+    ts, equity = _series(7)
+    short_close = pd.Series(np.linspace(1.0, 2.0, 3), index=ts[:3])
+
+    with pytest.raises(ValueError) as exc:
+        build_report(_verdict(), equity=equity, close=short_close,
+                     positions=pd.Series(0.0, index=ts),
+                     costs=pd.DataFrame({"fee": 0.0}, index=ts))
+
+    message = str(exc.value)
+    assert "close" in message
+    assert "3" in message and "7" in message
+
+
+def test_positions_length_mismatch_raises():
+    ts, equity = _series(7)
+
+    with pytest.raises(ValueError) as exc:
+        build_report(_verdict(), equity=equity, close=equity * 100,
+                     positions=pd.Series(np.zeros(2), index=ts[:2]),
+                     costs=pd.DataFrame({"fee": 0.0}, index=ts))
+
+    message = str(exc.value)
+    assert "positions" in message
+    assert "2" in message and "7" in message
+
+
+def test_costs_column_length_mismatch_raises():
+    ts, equity = _series(7)
+
+    with pytest.raises(ValueError) as exc:
+        build_report(_verdict(), equity=equity, close=equity * 100,
+                     positions=pd.Series(0.0, index=ts),
+                     costs=pd.DataFrame({"fee": [0.0, 0.0, 0.0]}))
+
+    message = str(exc.value)
+    assert "fee" in message
+    assert "3" in message and "7" in message
+
+
+def test_price_bars_length_mismatch_raises():
+    ts, equity = _series(7)
+    bars = pd.DataFrame({"high": [1.0, 2.0]}, index=ts[:2])
+
+    with pytest.raises(ValueError) as exc:
+        build_report(_verdict(), equity=equity, close=equity * 100,
+                     positions=pd.Series(0.0, index=ts),
+                     costs=pd.DataFrame({"fee": 0.0}, index=ts),
+                     price_bars=bars)
+
+    message = str(exc.value)
+    assert "price_bars" in message
+    assert "2" in message and "7" in message
 
 
 def test_drawdown_is_computed_from_running_max():
