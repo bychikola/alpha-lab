@@ -28,7 +28,8 @@ PARAMS = {"window": 20, "k": 2.0}
 
 
 def _write_fixture_data(root: Path, n: int = N_MINUTES, seed: int = 1,
-                        quote_volume: float = 1e8) -> None:
+                        quote_volume: float = 1e8,
+                        symbol: str = "BTCUSDT") -> None:
     """Кладёт минутные синтетические бары туда, откуда их читает load_bars.
 
     Пишем именно 1m: CLI читает базовый таймфрейм 1m и ресэмплит его в
@@ -51,7 +52,7 @@ def _write_fixture_data(root: Path, n: int = N_MINUTES, seed: int = 1,
         "close": close, "volume": 1e5, "quote_volume": quote_volume,
         "trades": 500, "taker_buy_volume": 5e4,
     }))
-    write_bars(df, root, "BTCUSDT", "1m")
+    write_bars(df, root, symbol, "1m")
 
 
 def _write_configs(tmp_path, root=None, symbols=("BTCUSDT",)):
@@ -363,6 +364,120 @@ def test_unreadable_journal_warns_and_counts_zero(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "Предупреждение" in err
     assert "нечитаем" in err
+
+
+def test_corrupt_journal_lines_warn_with_skip_count(tmp_path, capsys):
+    """Пропущенная строка — потерянная попытка: об этом обязаны предупредить.
+
+    Молчаливый пропуск занижает n_trials и тем завышает DSR, поэтому счётчик
+    пропущенного печатается один раз на весь журнал, как и решение про
+    нечитаемый файл целиком.
+    """
+    journal = tmp_path / "trials.jsonl"
+    key = {"strategy": "mean_reversion", "params": PARAMS,
+           "symbol": "BTCUSDT", "timeframe": "1h"}
+    good = json.dumps({"key": key, "experiment_id": "e1"}).encode()
+    journal.write_bytes(b"\n".join([
+        good,
+        b"null",          # не объект
+        b"\xff\xfe",      # не UTF-8
+        b"{}",            # объект без key
+        good,
+    ]) + b"\n")
+
+    assert count_prior_trials(journal, key) == 2
+    assert "пропущено повреждённых строк: 3" in capsys.readouterr().err
+
+
+def test_unusable_journal_fails_closed_without_report(tmp_path, capsys):
+    """Непригодный журнал останавливает прогон ДО бэктеста и отчёта.
+
+    Иначе на диске остался бы отчёт с n_trials = 1: недодефлированный вердикт
+    выглядит ЛУЧШЕ правды и толкает к ложному «жива» — ровно та ошибка, против
+    которой и существует поправка на множественные сравнения.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+
+    dir_journal = tmp_path / "journal_is_a_dir"
+    dir_journal.mkdir()
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("файл вместо каталога", encoding="utf-8")
+
+    for i, journal in enumerate((dir_journal, blocker / "trials.jsonl")):
+        out = tmp_path / f"out{i}"
+        assert _run_validate(root, u, e, out, journal) == 2
+        assert not (out / "report.json").exists()
+
+        err = capsys.readouterr().err
+        assert "Ошибка" in err
+        assert "журнал" in err
+        assert str(journal) in err
+
+
+def test_ignore_journal_skips_read_and_write(tmp_path, capsys):
+    """--ignore-journal — осознанный отказ от защиты: журнал не читается и не
+    пишется, n_trials = 1, и об этом громко предупреждают."""
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+
+    def run(journal: Path, out: Path) -> int:
+        return main(["validate", "--config", str(e), "--universe", str(u),
+                     "--data-root", str(root), "--symbol", "BTCUSDT",
+                     "--out", str(out), "--journal", str(journal),
+                     "--ignore-journal"])
+
+    # Непригодный путь перестаёт быть препятствием: защита отключена явно.
+    bad = tmp_path / "journal_is_a_dir"
+    bad.mkdir()
+    assert run(bad, tmp_path / "out_bad") == cli.EXIT_OK
+    payload = json.loads((tmp_path / "out_bad" / "report.json")
+                         .read_text(encoding="utf-8"))
+    assert payload["verdict"]["n_configs_tried"] == 1
+    err = capsys.readouterr().err
+    assert "ignore-journal" in err
+    assert "множественных сравнений" in err
+
+    # Чтение тоже пропускается: две прошлые попытки не штрафуют прогон, а
+    # запись не добавляет третью.
+    seeded = tmp_path / "trials.jsonl"
+    key = {"strategy": "mean_reversion", "params": PARAMS,
+           "symbol": "BTCUSDT", "timeframe": "1h"}
+    log_trial(seeded, key, "old1", {"sharpe": 1.0})
+    log_trial(seeded, key, "old2", {"sharpe": 1.0})
+    assert run(seeded, tmp_path / "out_seeded") == cli.EXIT_OK
+    payload = json.loads((tmp_path / "out_seeded" / "report.json")
+                         .read_text(encoding="utf-8"))
+    assert payload["verdict"]["n_configs_tried"] == 1
+    assert len(seeded.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_experiment_id_includes_symbol(tmp_path, monkeypatch):
+    """Символ — часть гипотезы (журнал уже различает его через trial_key).
+
+    Без символа в id прогон того же конфига по другому символу молча затирает
+    reports/<exp_id> первого.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    _write_fixture_data(root, seed=7, symbol="ETHUSDT")
+    u, e = _write_configs(tmp_path, symbols=("BTCUSDT", "ETHUSDT"))
+    monkeypatch.chdir(tmp_path)
+
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        # --out не задан намеренно: проверяем именно каталог по умолчанию.
+        assert main(["validate", "--config", str(e), "--universe", str(u),
+                     "--data-root", str(root), "--symbol", symbol]) == 0
+
+    reports = sorted((tmp_path / "reports").glob("*/report.json"))
+    assert len(reports) == 2, "разные символы обязаны дать разные каталоги"
+    ids = [json.loads(p.read_text(encoding="utf-8"))["verdict"]["experiment_id"]
+           for p in reports]
+    assert ids[0] != ids[1]
+    assert reports[0].parent.name == ids[0]
+    assert reports[1].parent.name == ids[1]
 
 
 def test_dirty_bar_targets_are_forced_flat(tmp_path, capsys):

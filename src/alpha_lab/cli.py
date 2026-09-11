@@ -10,6 +10,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -76,12 +77,14 @@ def count_prior_trials(journal: Path, key: dict) -> int:
               file=sys.stderr)
         return 0
     count = 0
+    skipped = 0
     for line in text.splitlines():
         if not line.strip():
             continue
         try:
             record = json.loads(line)
             if not isinstance(record, dict):
+                skipped += 1
                 continue
             if json.dumps(record["key"], sort_keys=True,
                           ensure_ascii=False) == fingerprint:
@@ -89,8 +92,43 @@ def count_prior_trials(journal: Path, key: dict) -> int:
         except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
             # Валидный JSON не-объект (null/[]/123/"x"), обрыв объекта или
             # запись без "key" — строку пропускаем, счёт остальных не теряем.
+            skipped += 1
             continue
+    if skipped:
+        # Пропущенная запись — потерянная попытка: n_trials занижается, DSR
+        # завышается. Молчать нельзя, как и в случае нечитаемого файла целиком.
+        print(f"Предупреждение: в журнале {journal} пропущено повреждённых "
+              f"строк: {skipped}; n_trials занижен — DSR может быть завышен",
+              file=sys.stderr)
     return count
+
+
+def journal_problem(journal: Path) -> str | None:
+    """Причина, по которой журнал непригоден, или None, если он рабочий.
+
+    Проверяются обе операции CLI над журналом — чтение и дозапись. Зовётся до
+    бэктеста: непригодный журнал нельзя «пережить», потому что n_trials без
+    него занижается, а недодефлированный вердикт выглядит ЛУЧШЕ правды.
+    """
+    journal = Path(journal)
+    try:
+        if journal.is_dir():
+            return "это каталог, а не файл"
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        if journal.exists():
+            # Дозапись в существующий журнал проверяется напрямую.
+            with journal.open("a", encoding="utf-8"):
+                pass
+        else:
+            # Журнала ещё нет: проверяем, что каталог вообще доступен на
+            # запись. Пробник удаляется сразу, чтобы проверка не оставляла
+            # пустой журнал — файл без записи выглядел бы как попытка.
+            with tempfile.NamedTemporaryFile(dir=journal.parent,
+                                             prefix=".journal_probe_"):
+                pass
+    except OSError as exc:
+        return str(exc)
+    return None
 
 
 def log_trial(journal: Path, key: dict, experiment: str, metrics: dict) -> None:
@@ -150,6 +188,10 @@ def _cmd_validate(args) -> int:
         # min_trades делят id, отчёт второго молча затирает первый, а журнал
         # считает их одной попыткой.
         "validation": exp.validation,
+        # Символ — тоже часть гипотезы (trial_key в журнале уже включает его):
+        # без него прогоны того же конфига по разным символам делят id, и
+        # второй молча затирает reports/<exp_id> первого.
+        "symbol": args.symbol,
     }
     exp_id = experiment_id(cfg_payload, dv, git_hash())
 
@@ -176,6 +218,30 @@ def _cmd_validate(args) -> int:
         print(f"Предупреждение: {dirty} грязных баров исключено из торговли",
               file=sys.stderr)
 
+    # Судьба вердикта решается до бэктеста: журнал нужен для n_trials, а
+    # непригодный журнал занижает n_trials и тем завышает DSR. Недодефлиро-
+    # ванный вердикт выглядит ЛУЧШЕ правды и толкает к ложному «жива» —
+    # поэтому плохой журнал останавливает прогон, а не молча льстит ему.
+    journal = Path(args.journal)
+    trial_key = {"strategy": exp.strategy, "params": exp.params,
+                 "symbol": symbol, "timeframe": exp.timeframe}
+    if args.ignore_journal:
+        n_trials = 1
+        print("Предупреждение: --ignore-journal: журнал не читается и не "
+              "пишется, n_trials = 1 — защита от множественных сравнений "
+              "ОТКЛЮЧЕНА, DSR завышен, вердикт «жива» может быть ложным",
+              file=sys.stderr)
+    else:
+        problem = journal_problem(journal)
+        if problem is not None:
+            print(f"Ошибка: журнал попыток непригоден: {journal} ({problem}). "
+                  f"Прогон остановлен: без журнала n_trials занижается, DSR "
+                  f"завышается, и вердикт выглядит лучше правды. Отчёт не "
+                  f"записан. Осознанный отказ от защиты — --ignore-journal",
+                  file=sys.stderr)
+            return EXIT_ERROR
+        n_trials = count_prior_trials(journal, trial_key) + 1
+
     strategy = build_strategy(exp.strategy, exp.params)
     # copy=True: to_numpy() в pandas 3 отдаёт read-only массив, а маска ниже
     # пишет в него на месте.
@@ -187,12 +253,6 @@ def _cmd_validate(args) -> int:
     result = run_backtest(bars, targets, cost_model, funding_rate=funding_rate,
                           max_participation=MAX_PARTICIPATION)
     trades = trade_returns(result)
-
-    # Число попыток берётся из журнала: DSR без этой поправки не работает.
-    journal = Path(args.journal)
-    trial_key = {"strategy": exp.strategy, "params": exp.params,
-                 "symbol": symbol, "timeframe": exp.timeframe}
-    n_trials = count_prior_trials(journal, trial_key) + 1
 
     # ВАЖНО: в валидатор уходят позиции ДВИЖКА (result.positions — удержанные,
     # held[t] = target[t-1]), а не сырые цели strategy.generate(). Сырые цели
@@ -224,10 +284,12 @@ def _cmd_validate(args) -> int:
 
     # Журнал — только после успешного отчёта: если запись отчёта упала,
     # незавершённый прогон не должен остаться в журнале и завысить n_trials
-    # следующего запуска (это молча усилило бы штраф DSR).
-    log_trial(journal, trial_key, exp_id,
-              {"sharpe": verdict.sharpe, "dsr": verdict.dsr,
-               "alive": verdict.alive})
+    # следующего запуска (это молча усилило бы штраф DSR). При
+    # --ignore-journal запись не ведётся вовсе — отказ от защиты явный.
+    if not args.ignore_journal:
+        log_trial(journal, trial_key, exp_id,
+                  {"sharpe": verdict.sharpe, "dsr": verdict.dsr,
+                   "alive": verdict.alive})
 
     status = "ЖИВА" if verdict.alive else "МЕРТВА"
     print(f"\n{'=' * 62}")
@@ -284,6 +346,10 @@ def main(argv: list[str] | None = None) -> int:
     p_val.add_argument("--journal", default=str(DEFAULT_JOURNAL),
                        help="Журнал экспериментов: из него берётся число "
                             "попыток для DSR")
+    p_val.add_argument("--ignore-journal", action="store_true",
+                       help="Сознательно не читать и не писать журнал: "
+                            "n_trials = 1, защита от множественных сравнений "
+                            "отключается")
     p_val.set_defaults(func=_cmd_validate)
 
     args = parser.parse_args(argv)
