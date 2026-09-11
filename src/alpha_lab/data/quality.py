@@ -29,6 +29,12 @@ class QualityReport:
 
     @property
     def bad_rows(self) -> int:
+        """Сумма счётчиков проблем, а не число неторгуемых баров.
+
+        Бар может иметь и объёмную, и ценовую проблему и попасть сразу в оба
+        счётчика, поэтому `total_rows - bad_rows` — не количество торгуемых
+        баров: торгуемость определяет `clean_mask`.
+        """
         return self.zero_volume + self.anomalous
 
     @property
@@ -50,6 +56,41 @@ class QualityReport:
         return f"ПРОБЛЕМЫ ({self.total_rows} баров): " + ", ".join(parts)
 
 
+def _bad_bar_mask(
+    df: pd.DataFrame, *, volume: bool = True, prices: bool = True
+) -> pd.Series:
+    """Единый источник правды о проблемных барах: True — бар исключается.
+
+    Флаги `volume`/`prices` лишь разбивают проверки на группы, чтобы `check_bars`
+    мог посчитать счётчики; решения о торговле всегда принимаются по объединению
+    (флаги по умолчанию), поэтому репортёр и фильтр не могут разойтись.
+    """
+    masks = []
+
+    if volume:
+        vol = pd.to_numeric(df["volume"], errors="coerce")
+        # NaN и нечитаемые значения тоже проблема, а не «объём в норме».
+        masks.append(vol.isna() | (vol <= 0))
+
+    if prices:
+        open_ = df["open"]
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+        masks.append(
+            (high < low)
+            | (high < open_) | (high < close)
+            | (low > open_) | (low > close)
+            | (open_ <= 0) | (high <= 0) | (low <= 0) | (close <= 0)
+            | df[["open", "high", "low", "close"]].isna().any(axis=1)
+        )
+
+    bad = masks[0]
+    for mask in masks[1:]:
+        bad = bad | mask
+    return bad
+
+
 def check_bars(df: pd.DataFrame, freq: str) -> QualityReport:
     if freq not in FREQ_DELTA:
         raise ValueError(f"Неизвестный таймфрейм для проверки: {freq}")
@@ -62,16 +103,9 @@ def check_bars(df: pd.DataFrame, freq: str) -> QualityReport:
     duplicates = int(ts.duplicated().sum())
     gaps = int((ts.diff().dropna() > delta).sum())
 
-    zero_volume = int((pd.to_numeric(df["volume"], errors="coerce") <= 0).sum())
-
-    high, low = df["high"], df["low"]
-    open_, close = df["open"], df["close"]
-    anomalous = int((
-        (high < low)
-        | (high < open_) | (high < close)
-        | (low > open_) | (low > close)
-        | (close <= 0) | (open_ <= 0)
-    ).sum())
+    # Счётчики берутся из того же источника правды, что и clean_mask.
+    zero_volume = int(_bad_bar_mask(df, prices=False).sum())
+    anomalous = int(_bad_bar_mask(df, volume=False).sum())
 
     return QualityReport(
         total_rows=len(df),
@@ -84,10 +118,4 @@ def check_bars(df: pd.DataFrame, freq: str) -> QualityReport:
 
 def clean_mask(df: pd.DataFrame) -> pd.Series:
     """Маска баров, пригодных для торговли. Непригодные исключаются, а не чинятся."""
-    bad = (
-        (pd.to_numeric(df["volume"], errors="coerce") <= 0)
-        | (df["high"] < df["low"])
-        | (df["close"] <= 0) | (df["open"] <= 0)
-        | (df[["open", "high", "low", "close"]].isna().any(axis=1))
-    )
-    return ~bad
+    return ~_bad_bar_mask(df)
