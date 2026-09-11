@@ -30,7 +30,8 @@ from alpha_lab.engine.backtest import run_backtest, trade_returns
 from alpha_lab.engine.costs import RealisticCost
 from alpha_lab.report.writer import build_report, write_report
 from alpha_lab.strategies.base import (
-    PositionLegs, build_strategy, history_bars_of, legs_generator,
+    FUNDING_RATE_COLUMN, PositionLegs, build_strategy, history_bars_of,
+    legs_generator,
 )
 from alpha_lab.validation.validator import (
     SCREENING_WARNING, build_returns_matrix, validate,
@@ -553,6 +554,15 @@ class CausalityError(RuntimeError):
         self.cause = cause
 
 
+class FundingRequiredError(RuntimeError):
+    """Стратегии нужна ставка funding, но данных нет: прогон не запускался.
+
+    Молчаливый прогон без ставок выдал бы отсутствие данных за отсутствие
+    сигнала (стратегия стояла бы вне рынка), а вердикт описывал бы не
+    стратегию, а дыру в хранилище.
+    """
+
+
 @dataclass(frozen=True)
 class RunOutcome:
     """Результат одной конфигурации до вердикта."""
@@ -687,10 +697,27 @@ def run_config(data: LoadedData, exp: Experiment, *,
     меняются ни на одном байте.
     """
     strategy = build_strategy(exp.strategy, exp.params)
+    # Стратегия, чьё решение зависит от ставки funding (needs_funding=True),
+    # получает ставку колонкой в барах — на тех же барах её судит harness.
+    # Без ставки прогон останавливается: молчаливая книга вне рынка выдала бы
+    # отсутствие данных за отсутствие сигнала. Одноногие стратегии флага не
+    # имеют и идут прежним путём (data.bars без единого изменения).
+    signal_bars = data.bars
+    if getattr(strategy, "needs_funding", False):
+        if data.funding_rate is None:
+            raise FundingRequiredError(
+                f"Стратегия '{getattr(strategy, 'name', exp.strategy)}' "
+                f"объявила needs_funding=True, но funding для {data.symbol} "
+                f"недоступен: решение о входе невозможно, а прогон без ставок "
+                f"описал бы отсутствие данных как отсутствие сигнала. "
+                f"Прогон остановлен."
+            )
+        signal_bars = data.bars.assign(
+            **{FUNDING_RATE_COLUMN: data.funding_rate.to_numpy()})
     causality_cuts = 0
     if not skip_causality:
         try:
-            causality_cuts = assert_strategy_is_causal(strategy, data.bars)
+            causality_cuts = assert_strategy_is_causal(strategy, signal_bars)
         except (AssertionError, ValueError) as exc:
             raise CausalityError(
                 getattr(strategy, "name", exp.strategy), exc) from exc
@@ -715,7 +742,7 @@ def run_config(data: LoadedData, exp: Experiment, *,
         # нельзя» обязана обнулить ВСЕ три базы. Обнулить только net значило бы
         # оставить carry-ногу открытой на грязном баре и начислить на неё
         # funding — тихая торговля там, где её быть не должно.
-        legs = _generate_legs_segmented(strategy, data.bars, exp.timeframe)
+        legs = _generate_legs_segmented(strategy, signal_bars, exp.timeframe)
         arrays = {
             name: pd.Series(getattr(legs, name)).astype(
                 "float64").to_numpy(copy=True)
@@ -732,7 +759,7 @@ def run_config(data: LoadedData, exp: Experiment, *,
             carry_position=pd.Series(arrays["carry"], index=idx),
         )
     else:
-        targets = _generate_segmented(strategy, data.bars,
+        targets = _generate_segmented(strategy, signal_bars,
                                       exp.timeframe).to_numpy(
             dtype="float64", copy=True)
         targets[~data.tradable] = 0.0
@@ -970,6 +997,11 @@ def _cmd_validate(args) -> int:
                 f"Осознанный отказ от проверки — --skip-causality",
                 file=sys.stderr,
             )
+            return EXIT_ERROR
+        except FundingRequiredError as exc:
+            where = (f" в конфигурации [{i}] {cfg.name} ({path})"
+                     if sweep_mode else "")
+            print(f"Ошибка: {exc}{where} Отчёт не записан.", file=sys.stderr)
             return EXIT_ERROR
         runs.append({"path": path, "config": cfg, "outcome": outcome})
 

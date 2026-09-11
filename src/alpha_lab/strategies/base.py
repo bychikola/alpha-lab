@@ -20,6 +20,11 @@ import pandas as pd
 # стратегия с более длинной памятью обязана объявить своё значение явно.
 DEFAULT_HISTORY_BARS = 500
 
+# Имя колонки, которой CLI снабжает бары для стратегий, объявивших
+# needs_funding=True: ставка funding, выровненная по барам. Константа одна на
+# стратегию и CLI — разъехавшиеся имена давали бы молчаливый отказ решения.
+FUNDING_RATE_COLUMN = "funding_rate"
+
 
 @runtime_checkable
 class Strategy(Protocol):
@@ -144,9 +149,14 @@ def _registry() -> dict[str, type]:
     требуя правки ни build_strategy, ни модуля сетки. Штатная mean_reversion
     подмешивается каждый раз, чтобы тестовая подмена REGISTRY не теряла её.
     """
+    from alpha_lab.strategies.funding_harvest import FundingHarvestStrategy
     from alpha_lab.strategies.mean_reversion import MeanReversionStrategy
 
-    return {"mean_reversion": MeanReversionStrategy, **REGISTRY}
+    return {
+        "mean_reversion": MeanReversionStrategy,
+        "funding_harvest": FundingHarvestStrategy,
+        **REGISTRY,
+    }
 
 
 # Стратегии, зарегистрированные вне штатного набора (например, расширением).

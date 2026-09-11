@@ -1,0 +1,29 @@
+name: funding_base
+strategy: funding_harvest
+timeframe: 1h
+start: "2022-01-01"
+end: "2025-12-31"
+
+# Параметры — априорное правило S2 (см. docstring
+# src/alpha_lab/strategies/funding_harvest.py), по результатам не подбирались.
+# fee_bps/slippage_bps должны совпадать с costs ниже: ими задан порог
+# окупаемости круглого рейса, и расхождение сдвинуло бы решение.
+params:
+  window: 72          # скользящее среднее ставки, баров (3 суток на 1h)
+  horizon_bars: 720   # горизонт удержания, баров (30 суток на 1h)
+  fee_bps: 5.0        # тейкерская комиссия одной ноги, bps
+  slippage_bps: 1.0   # консервативная оценка проскальзывания, bps
+
+# Издержки Binance USDT-M, VIP0 — те же, что в mr_base.
+costs:
+  taker_fee_bps: 5.0
+  maker_fee_bps: 2.0
+  maker_share: 0.0
+  impact_coef: 0.1
+  min_slippage_bps: 0.5
+
+validation:
+  n_permutations: 1000
+  min_trades: 100
+  max_pbo: 0.5
+  max_p_value: 0.05
