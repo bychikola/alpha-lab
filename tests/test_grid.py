@@ -131,6 +131,22 @@ def test_grid_accepts_new_strategy_without_editing_grid_module(tmp_path,
     assert {c.experiment.params["threshold"] for c in cells} == {1.0, 2.0}
 
 
+def test_grid_omitted_timeframes_axis_falls_back_to_base(tmp_path):
+    """Опущенная ось timeframes — базовый таймфрейм, а не молчаливый 1h.
+
+    Сетка, варьирующая только символы, обязана считать гипотезу на том
+    таймфрейме, который записан в эксперименте: подмена 4h на 1h — это
+    молчаливый прогон другой гипотезы, а не «разумный дефолт».
+    """
+    text = GRID_YAML.replace("timeframe: 1h", "timeframe: 4h") \
+                    .replace("  timeframes: [1h, 4h]\n", "")
+    grid = load_grid(_write_grid(tmp_path, text))
+    assert grid.timeframes == ("4h",)
+    cells = grid.expand()
+    assert len(cells) == 4                       # 2 символа × 2 значения k
+    assert {c.experiment.timeframe for c in cells} == {"4h"}
+
+
 def test_grid_rejects_unknown_parameter(tmp_path):
     """Параметр вне пространства стратегии — ошибка до единого бэктеста."""
     text = GRID_YAML.replace("k: [1.5, 2.0]", "nonexistent: [1, 2]")

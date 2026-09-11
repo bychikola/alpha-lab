@@ -260,7 +260,11 @@ def load_grid(path: str | Path) -> Grid:
         if not isinstance(symbol, str) or not symbol.strip():
             raise ValueError(
                 f"Сетка {path}: символ {symbol!r} — не непустая строка")
-    timeframes = ("1h",) if "timeframes" not in axes_raw else \
+    # Опущенная ось timeframes — базовый таймфрейм эксперимента. Дефолт "1h"
+    # молча подменял бы гипотезу: сетка с base.timeframe=4h, варьирующая
+    # только символы, уходила бы считать 1h — не тот вопрос, который описал
+    # автор. Контракт «ось переопределяет базу, отсутствие оси наследует базу».
+    timeframes = (base.timeframe,) if "timeframes" not in axes_raw else \
         _scalar_axis(axes_raw["timeframes"], "timeframes")
     for timeframe in timeframes:
         if timeframe not in VALID_TIMEFRAMES:
