@@ -67,6 +67,10 @@ DEFAULTS = {
 
 class MeanReversionStrategy:
     name = "mean_reversion"
+    # Пространство параметров — для сетки гипотез (grid.py спрашивает его у
+    # класса). Выводится из DEFAULTS, чтобы новый параметр не забывался в
+    # списке: ключ дефолтов и есть принятое имя.
+    PARAM_NAMES = frozenset(DEFAULTS)
 
     def __init__(self, params: dict | None = None):
         cfg = {**DEFAULTS, **(params or {})}

@@ -129,14 +129,26 @@ def load_manifest(path: str | Path) -> list[Path]:
 
 
 def load_experiment(path: str | Path) -> Experiment:
-    data = _read_yaml(Path(path))
+    return parse_experiment(_read_yaml(Path(path)), Path(path))
+
+
+def parse_experiment(data: dict[str, Any],
+                     source: str | Path = "<словарь>") -> Experiment:
+    """Собирает Experiment из уже разобранного словаря.
+
+    Выделено из load_experiment ради сетки гипотез: базовый эксперимент сетки
+    лежит вложенным словарём, и его форма обязана проверяться ровно тем же
+    кодом, что и одиночный конфиг, — иначе два пути разъедутся.
+    """
     for field_name in ("name", "strategy", "timeframe", "start"):
         if not data.get(field_name):
-            raise ValueError(f"В эксперименте не задано поле '{field_name}'")
+            raise ValueError(
+                f"В эксперименте {source} не задано поле '{field_name}'")
     tf = str(data["timeframe"])
     if tf not in VALID_TIMEFRAMES:
         raise ValueError(
-            f"Неизвестный таймфрейм '{tf}'. Допустимые: {', '.join(VALID_TIMEFRAMES)}"
+            f"Неизвестный таймфрейм '{tf}' в {source}. "
+            f"Допустимые: {', '.join(VALID_TIMEFRAMES)}"
         )
     return Experiment(
         name=str(data["name"]),

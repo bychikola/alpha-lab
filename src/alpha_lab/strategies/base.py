@@ -72,12 +72,50 @@ def history_bars_of(strategy) -> int:
     return int(value)
 
 
-def build_strategy(name: str, params: dict) -> Strategy:
+def _registry() -> dict[str, type]:
+    """Реестр стратегий: штатные плюс добавленные извне.
+
+    REGISTRY — точка расширения: новая стратегия регистрируется в нём, не
+    требуя правки ни build_strategy, ни модуля сетки. Штатная mean_reversion
+    подмешивается каждый раз, чтобы тестовая подмена REGISTRY не теряла её.
+    """
     from alpha_lab.strategies.mean_reversion import MeanReversionStrategy
 
-    registry = {"mean_reversion": MeanReversionStrategy}
+    return {"mean_reversion": MeanReversionStrategy, **REGISTRY}
+
+
+# Стратегии, зарегистрированные вне штатного набора (например, расширением).
+REGISTRY: dict[str, type] = {}
+
+
+def strategy_class(name: str) -> type:
+    registry = _registry()
     if name not in registry:
         raise ValueError(
             f"Неизвестная стратегия: '{name}'. Доступные: {sorted(registry)}"
         )
-    return registry[name](params)
+    return registry[name]
+
+
+def strategy_param_names(name: str) -> frozenset[str]:
+    """Имена параметров, которые стратегия принимает.
+
+    Пространство параметров спрашивается у самого класса (PARAM_NAMES), а не
+    берётся из списка в модуле сетки: иначе каждая новая стратегия требовала бы
+    правки grid.py, а забытая правка молча пропускала бы опечатку в имени
+    параметра. Класс без объявленного PARAM_NAMES — громкая ошибка: сетка по
+    стратегии с неизвестным пространством невалидируема.
+    """
+    cls = strategy_class(name)
+    names = getattr(cls, "PARAM_NAMES", None)
+    if names is None:
+        raise ValueError(
+            f"Стратегия '{name}' не объявила PARAM_NAMES: пространство её "
+            f"параметров неизвестно, поэтому сетку по ней построить нельзя. "
+            f"Объявите кортеж/множество имён на классе стратегии."
+        )
+    return frozenset(str(n) for n in names)
+
+
+def build_strategy(name: str, params: dict) -> Strategy:
+    return strategy_class(name)(params)
