@@ -1,0 +1,2551 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mean Reversion Quant Pro — индикатор для TradingView (Pine Script v6)</title>
+<meta name="description" content="Математическая модель возврата к среднему: z-score, процесс Орнштейна–Уленбека, полужизнь, фильтры волатильности и ATR-риск-менеджмент. Готовый Pine Script для TradingView.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📉</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  html{scroll-behavior:smooth}
+  body{font-family:'Inter',system-ui,sans-serif;background:#0b0e14;color:#cbd5e1;
+    background-image:radial-gradient(1100px 550px at 85% -10%,rgba(56,189,248,.08),transparent 60%),
+    radial-gradient(900px 500px at -10% 35%,rgba(245,158,11,.07),transparent 55%),
+    radial-gradient(700px 500px at 50% 110%,rgba(34,197,94,.05),transparent 60%);}
+  .mono{font-family:'JetBrains Mono',monospace}
+  ::selection{background:rgba(245,158,11,.3)}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:#0b0e14}
+  ::-webkit-scrollbar-thumb{background:#2a3040;border-radius:8px;border:2px solid #0b0e14}
+  ::-webkit-scrollbar-thumb:hover{background:#3b4256}
+
+  /* ── подсветка Pine ── */
+  .tk-c{color:#6b7280;font-style:italic}
+  .tk-s{color:#fbbf24}
+  .tk-n{color:#c084fc}
+  .tk-h{color:#e879f9}
+  .tk-f{color:#38bdf8}
+  .tk-k{color:#f472b6}
+  .tk-t{color:#a78bfa}
+  .tk-b{color:#f59e0b}
+
+  .cl{display:flex}
+  .cl:hover{background:rgba(255,255,255,.03)}
+  .cn{width:3.2rem;flex:none;text-align:right;padding-right:1.1rem;color:#37404f;user-select:none}
+  .cx{white-space:pre;padding-right:1.5rem}
+
+  /* ── появление секций ── */
+  .reveal{opacity:0;transform:translateY(18px);transition:opacity .7s ease,transform .7s ease}
+  .reveal.in{opacity:1;transform:none}
+
+  /* ── слайдеры ── */
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:6px;border-radius:6px;
+    background:linear-gradient(90deg,#f59e0b var(--p,50%),#232a3a var(--p,50%));outline:none;cursor:pointer}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;
+    background:#f59e0b;border:3px solid #0b0e14;box-shadow:0 0 0 2px rgba(245,158,11,.5)}
+  input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#f59e0b;border:3px solid #0b0e14}
+
+  @keyframes pulseDot{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(52,211,153,.5)}50%{opacity:.6;box-shadow:0 0 0 7px rgba(52,211,153,0)}}
+  .pulse{animation:pulseDot 2s infinite}
+  @keyframes floatY{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+  .floaty{animation:floatY 6s ease-in-out infinite}
+
+  .cv-main{height:240px}
+  @media(min-width:768px){.cv-main{height:300px}}
+</style>
+</head>
+<body class="antialiased">
+
+<!-- ═══════════════ NAV ═══════════════ -->
+<nav class="fixed top-0 inset-x-0 z-50 backdrop-blur-xl bg-[#0b0e14]/75 border-b border-white/5">
+  <div class="max-w-6xl mx-auto px-5 h-16 flex items-center justify-between gap-4">
+    <a href="#top" class="flex items-center gap-2.5 shrink-0">
+      <span class="w-9 h-9 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center font-extrabold text-[#0b0e14] text-sm shadow-lg shadow-amber-500/20">MR</span>
+      <span class="font-bold text-slate-100 tracking-tight">Quant<span class="text-amber-400">·</span>Pro</span>
+    </a>
+    <div class="hidden md:flex items-center gap-6 text-[13px] text-slate-400">
+      <a href="#model" class="hover:text-amber-300 transition">Модель</a>
+      <a href="#math" class="hover:text-amber-300 transition">Математика</a>
+      <a href="#code" class="hover:text-amber-300 transition">Код</a>
+      <a href="#demo" class="hover:text-amber-300 transition">Демо</a>
+      <a href="#settings" class="hover:text-amber-300 transition">Настройки</a>
+      <a href="#guide" class="hover:text-amber-300 transition">Установка</a>
+      <a href="#telegram" class="hover:text-amber-300 transition">Telegram</a>
+      <a href="#lab" class="hover:text-amber-300 transition">Тест</a>
+    </div>
+    <button onclick="copyPine()" class="shrink-0 text-[13px] font-semibold px-4 py-2 rounded-lg bg-amber-500/10 text-amber-300 border border-amber-500/30 hover:bg-amber-500/20 transition cursor-pointer">Скопировать код</button>
+  </div>
+</nav>
+
+<!-- ═══════════════ HERO ═══════════════ -->
+<header id="top" class="pt-32 pb-20 px-5">
+  <div class="max-w-6xl mx-auto grid md:grid-cols-[1.15fr_.85fr] gap-12 items-center">
+    <div>
+      <div class="flex flex-wrap gap-2 mb-6">
+        <span class="text-[11px] mono px-2.5 py-1 rounded-md bg-sky-500/10 text-sky-300 border border-sky-500/25">Pine Script v6</span>
+        <span class="text-[11px] mono px-2.5 py-1 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/25">indicator + alerts</span>
+        <span class="text-[11px] mono px-2.5 py-1 rounded-md bg-violet-500/10 text-violet-300 border border-violet-500/25">OU-процесс</span>
+        <span class="text-[11px] mono px-2.5 py-1 rounded-md bg-amber-500/10 text-amber-300 border border-amber-500/25">z-score</span>
+      </div>
+      <h1 class="text-4xl md:text-6xl font-extrabold tracking-tight text-white leading-[1.05]">
+        Mean Reversion<br>
+        <span class="bg-gradient-to-r from-amber-400 via-orange-400 to-red-400 bg-clip-text text-transparent">Quant Pro</span>
+      </h1>
+      <p class="mt-6 text-slate-400 text-base md:text-lg leading-relaxed max-w-xl">
+        Индикатор для TradingView с полноценной статистической моделью возврата к среднему:
+        z-скор цены, динамические полосы μ ± kσ, оценка скорости возврата θ и полужизни по модели
+        <span class="text-slate-200 font-medium">Орнштейна–Уленбека</span>, фильтры режима волатильности, ADX и RSI,
+        а также чёткая разметка стопа и тейка по каждому сигналу: прямые линии с ценами — <span class="text-emerald-400 font-semibold">зелёная TP</span> и <span class="text-red-400 font-semibold">красная SL</span> — с фиксированным соотношением риск:доход <span class="text-slate-200 font-medium">1:3</span> (SL = 2×ATR, TP = 6×ATR).
+        Плюс <span class="text-slate-200 font-medium">Биткоин-контекст</span>: корреляция с BTC задаёт приоритет направления сигналов, а волатильность монеты нормируется к BTC.
+      </p>
+      <div class="mt-8 flex flex-wrap gap-3">
+        <button onclick="copyIndicator()" class="px-6 py-3 rounded-xl bg-gradient-to-r from-amber-500 to-orange-600 text-[#0b0e14] font-bold text-sm hover:brightness-110 active:scale-[.98] transition shadow-lg shadow-amber-500/25 cursor-pointer">📊 Копировать индикатор</button>
+        <button onclick="copyStrategy()" class="px-6 py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 text-[#0b0e14] font-bold text-sm hover:brightness-110 active:scale-[.98] transition shadow-lg shadow-emerald-500/25 cursor-pointer">🧪 Копировать стратегию (тест)</button>
+        <button onclick="downloadPine()" class="px-6 py-3 rounded-xl border border-white/15 text-slate-200 font-semibold text-sm hover:bg-white/5 active:scale-[.98] transition cursor-pointer">⬇ Скачать .pine</button>
+        <a href="#demo" class="px-6 py-3 rounded-xl border border-white/15 text-slate-300 font-semibold text-sm hover:bg-white/5 transition inline-flex items-center gap-2">▶ Живая демо-модель</a>
+      </div>
+      <div class="mt-8 flex flex-wrap gap-x-8 gap-y-3 text-[13px] text-slate-500 mono">
+        <span><b class="text-amber-400">9</b> математических блоков</span>
+        <span><b class="text-amber-400">2</b> версии: индикатор + бэктест</span>
+        <span><b class="text-amber-400">4</b> алерта + Telegram-webhook</span>
+        <span><b class="text-amber-400">0</b> внешних библиотек</span>
+      </div>
+    </div>
+
+    <!-- карточка формулы -->
+    <div class="relative floaty hidden md:block">
+      <div class="absolute -inset-4 bg-gradient-to-tr from-amber-500/20 via-transparent to-sky-500/20 rounded-3xl blur-2xl"></div>
+      <div class="relative bg-[#11151f]/90 border border-white/10 rounded-3xl p-6 shadow-2xl">
+        <div class="flex items-center gap-2 mb-4">
+          <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 pulse"></span>
+          <span class="text-xs mono text-slate-400">МОДЕЛЬ: ОРНШТЕЙН–УЛЕНБЕК</span>
+        </div>
+        <div class="mono text-[15px] leading-8 text-slate-300">
+          <div class="text-slate-500">// дрейф к среднему</div>
+          <div class="text-sky-300">dSₜ = θ(μ − Sₜ)dt + σ·dWₜ</div>
+          <div class="mt-3 text-slate-500">// z-скор цены</div>
+          <div class="text-amber-300">z = (P − μ) / σ</div>
+          <div class="mt-3 text-slate-500">// полужизнь реверсии</div>
+          <div class="text-emerald-300">T½ = ln 2 / θ</div>
+        </div>
+        <div class="mt-5 pt-4 border-t border-white/10 grid grid-cols-3 gap-2 text-center">
+          <div><div class="text-lg font-bold text-white">95%</div><div class="text-[10px] text-slate-500 uppercase tracking-wide">событий внутри ±2σ</div></div>
+          <div><div class="text-lg font-bold text-emerald-400">LONG</div><div class="text-[10px] text-slate-500 uppercase tracking-wide">при z ≤ −2</div></div>
+          <div><div class="text-lg font-bold text-red-400">SHORT</div><div class="text-[10px] text-slate-500 uppercase tracking-wide">при z ≥ +2</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="px-5 pb-10 space-y-24 max-w-6xl mx-auto">
+
+  <!-- ═══════════════ МОДЕЛЬ ═══════════════ -->
+  <section id="model" class="reveal scroll-mt-24">
+    <div class="mb-8">
+      <div class="text-[11px] font-bold tracking-[.2em] text-amber-400 uppercase mb-2">01 · Архитектура</div>
+      <h2 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">Из чего состоит модель</h2>
+      <p class="mt-3 text-slate-400 max-w-2xl">Шесть связанных блоков: каждый решает свою статистическую задачу. Вход в позицию происходит только при одновременном выполнении всех условий.</p>
+    </div>
+    <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 transition group">
+        <div class="text-2xl mb-3">🎯</div>
+        <h3 class="font-bold text-slate-100 mb-2">Z-score цены</h3>
+        <p class="text-[13px] text-slate-400 leading-relaxed">Статистическое расстояние цены от среднего в единицах волатильности: <span class="mono text-amber-300">z = (P − μ)/σ</span>. При |z| ≥ 2 цена попадает в зону статистического экстремума — ожидаем возврат.</p>
+      </div>
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 transition">
+        <div class="text-2xl mb-3">📏</div>
+        <h3 class="font-bold text-slate-100 mb-2">Динамические полосы μ ± kσ</h3>
+        <p class="text-[13px] text-slate-400 leading-relaxed">Адаптивный канал реверсии (обобщённые полосы Боллинджера). Среднее μ выбирается из 5 типов: <span class="mono text-sky-300">SMA, EMA, WMA, VWMA, HMA</span> — под разные классы активов.</p>
+      </div>
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 transition">
+        <div class="text-2xl mb-3">⏳</div>
+        <h3 class="font-bold text-slate-100 mb-2">Полужизнь (OU-процесс)</h3>
+        <p class="text-[13px] text-slate-400 leading-relaxed">Регрессия <span class="mono text-sky-300">ΔS = a + b·S</span> оценивает скорость возврата θ = −b, а полужизнь <span class="mono text-emerald-300">T½ = ln2/θ</span> показывает, за сколько баров цена «забывает» отклонение. Входы — только при значимой реверсии.</p>
+      </div>
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 transition">
+        <div class="text-2xl mb-3">🌡️</div>
+        <h3 class="font-bold text-slate-100 mb-2">Режим волатильности</h3>
+        <p class="text-[13px] text-slate-400 leading-relaxed">Z-скор самого ATR в скользящем окне 100 баров. Входим только при <b class="text-slate-200">повышенной, но не панической</b> волатильности: в штиле нет движения, в панике σ нестабильна.</p>
+      </div>
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 transition">
+        <div class="text-2xl mb-3">🧭</div>
+        <h3 class="font-bold text-slate-100 mb-2">Трендовый фильтр ADX</h3>
+        <p class="text-[13px] text-slate-400 leading-relaxed">Если ADX выше порога (по умолчанию 25) — рынок в тренде и возврат к среднему статистически невыгоден. Сигналы блокируются до восстановления боковика.</p>
+      </div>
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 transition">
+        <div class="text-2xl mb-3">🛡️</div>
+        <h3 class="font-bold text-slate-100 mb-2">Риск-менеджмент ATR</h3>
+        <p class="text-[13px] text-slate-400 leading-relaxed">Индикатор чётко рисует по каждому сигналу линии <b class="text-red-400">SL</b> и <b class="text-emerald-400">TP</b> с ценовыми метками — дефолт SL = 2×ATR, TP = 6×ATR, что даёт <b class="text-slate-200">риск:доход 1:3</b>. В стратегии-версии объём позиции считается от процента риска: <span class="mono text-amber-300">qty = E·r / (SL·pv)</span>.</p>
+      </div>
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 transition">
+        <div class="text-2xl mb-3">🪙</div>
+        <h3 class="font-bold text-slate-100 mb-2">Корреляция с биткоином</h3>
+        <p class="text-[13px] text-slate-400 leading-relaxed">Скользящая корреляция Пирсона <span class="mono text-amber-300">ρ</span> с BTC за 100 баров. При |ρ| ≥ порога (0.6) монета «ходит за битком» — включается <b class="text-slate-200">приоритет направления BTC</b>: бычий BTC (цена выше EMA50) → только LONG, медвежий → только SHORT. Низкая корреляция — монета торгуется независимо, оба направления разрешены.</p>
+      </div>
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 transition">
+        <div class="text-2xl mb-3">🌋</div>
+        <h3 class="font-bold text-slate-100 mb-2">Волатильность монеты</h3>
+        <p class="text-[13px] text-slate-400 leading-relaxed">Двухуровневый контроль: z-скор собственного ATR (режим «повышенная, но не паническая») плюс <b class="text-slate-200">нормировка к BTC</b> — отношение ATR монеты к ATR биткоина. Если альт в 3+ раза волатильнее битка (мемкоины, низкая ликвидность) — сигналы шумные и блокируются.</p>
+      </div>
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-5 hover:border-amber-500/30 transition">
+        <div class="text-2xl mb-3">🔊</div>
+        <h3 class="font-bold text-slate-100 mb-2">Объём и POC профиля</h3>
+        <p class="text-[13px] text-slate-400 leading-relaxed">Дополнительные сигналы для частоты: когда цена приходит к границе MR (мягкий порог |z| ≥ 1.5), ведётся <b class="text-slate-200">проверка объёма</b> — всплеск volume > SMA20 × 1.5 подтверждает разворот. Отдельный триггер — касание <b class="text-slate-200">глобального POC</b> объёмного профиля: уровня максимального проторгованного объёма, который работает как сильная поддержка/сопротивление.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ МАТЕМАТИКА ═══════════════ -->
+  <section id="math" class="reveal scroll-mt-24">
+    <div class="mb-8">
+      <div class="text-[11px] font-bold tracking-[.2em] text-amber-400 uppercase mb-2">02 · Формулы</div>
+      <h2 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">Математический аппарат</h2>
+    </div>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-bold text-slate-100">Z-score и канал реверсии</h3>
+          <span class="text-[10px] mono px-2 py-1 rounded bg-white/5 text-slate-500">блок ①</span>
+        </div>
+        <div class="mono text-sm text-slate-300 bg-[#0d1117] rounded-xl p-4 leading-7">
+          <div><span class="text-slate-500">// оценка среднего и дисперсии</span></div>
+          <div>μ = <span class="tk-f">EMA</span>(P, L) &nbsp; σ = <span class="tk-f">stdev</span>(P, L)</div>
+          <div class="mt-2 text-amber-300">z = (P − μ) / σ</div>
+          <div class="mt-2"><span class="text-sky-300">Верх</span> = μ + k·σ &nbsp;&nbsp; <span class="text-emerald-300">Низ</span> = μ − k·σ</div>
+        </div>
+        <p class="mt-4 text-[13px] text-slate-400 leading-relaxed">По нормальному закону ~95% наблюдений лежат внутри ±2σ. Выход за канал — статистическая аномалия: открываем позицию против экстремума с целью на среднее μ.</p>
+      </div>
+
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-bold text-slate-100">Орнштейн–Уленбек и полужизнь</h3>
+          <span class="text-[10px] mono px-2 py-1 rounded bg-white/5 text-slate-500">блок ②</span>
+        </div>
+        <div class="mono text-sm text-slate-300 bg-[#0d1117] rounded-xl p-4 leading-7">
+          <div><span class="text-slate-500">// стохастический дрейф к среднему</span></div>
+          <div class="text-sky-300">dSₜ = θ(μ − Sₜ)dt + σ·dWₜ</div>
+          <div class="mt-2 text-emerald-300">T½ = ln 2 / θ</div>
+          <div class="mt-2"><span class="text-slate-500">// МНК-оценка: ΔSₜ = a + b·Sₜ₋₁, θ̂ = −b</span></div>
+          <div>b̂ = (n·Σ(S·ΔS) − ΣS·ΣΔS) / (n·ΣS² − (ΣS)²)</div>
+        </div>
+        <p class="mt-4 text-[13px] text-slate-400 leading-relaxed">Если θ близко к нулю (полужизнь огромная) — реверсии нет, модель «молчит». Фильтр отсекает активы и режимы, где стратегия математически не работает.</p>
+      </div>
+
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-bold text-slate-100">Режим волатильности</h3>
+          <span class="text-[10px] mono px-2 py-1 rounded bg-white/5 text-slate-500">блок ③</span>
+        </div>
+        <div class="mono text-sm text-slate-300 bg-[#0d1117] rounded-xl p-4 leading-7">
+          <div><span class="text-slate-500">// нормировка ATR в окне W</span></div>
+          <div>atrZ = (ATR − SMA<sub>W</sub>(ATR)) / σ<sub>W</sub>(ATR)</div>
+          <div class="mt-2"><span class="text-slate-500">// условие входа</span></div>
+          <div class="text-amber-300">volZMin ≤ atrZ ≤ volZMax &nbsp;(0…2)</div>
+        </div>
+        <p class="mt-4 text-[13px] text-slate-400 leading-relaxed">Классика quant-подходов к mean reversion: лучшие результаты даёт умеренно-повышенная волатильность. Экстремальный atrZ (> 2) часто означает новостной шок — σ переоценена.</p>
+      </div>
+
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-bold text-slate-100">Уровни SL/TP и риск</h3>
+          <span class="text-[10px] mono px-2 py-1 rounded bg-white/5 text-slate-500">блок ④</span>
+        </div>
+        <div class="mono text-sm text-slate-300 bg-[#0d1117] rounded-xl p-4 leading-7">
+          <div><span class="text-slate-500">// SL-дистанция в ATR-кратных · фиксированный R:R</span></div>
+          <div>SL = m·ATR &nbsp;&nbsp; TP = t·ATR &nbsp;&nbsp; <span class="text-emerald-300">t/m = 6/2 → 1:3</span></div>
+          <div class="mt-2 text-amber-300">qty = (E · r%) / (SL · pv)</div>
+          <div class="mt-2"><span class="text-slate-500">// безубыток: после +1R стоп → цена входа</span></div>
+          <div class="text-sky-300">P − P₀ ≥ be·SL ⇒ SL := P₀</div>
+          <div class="mt-2"><span class="text-slate-500">// матожидание: E[R] = WR·3R − (1−WR)·1R</span></div>
+          <div class="text-violet-300">MR Score = clamp(50 + 10·z, 0, 100)</div>
+        </div>
+        <p class="mt-4 text-[13px] text-slate-400 leading-relaxed">Индикатор чётко рисует по каждому сигналу две линии с ценовыми метками: <b class="text-red-400">SL</b> и <b class="text-emerald-400">TP</b> — и убирает их при выходе. Дефолт SL = 2×ATR, TP = 6×ATR даёт <b class="text-slate-200">риск:доход 1:3</b>, плюс режимы <b class="text-sky-300">«Держать до SL/TP»</b> (каждый выигрыш — полные 3R) и <b class="text-sky-300">«Безубыток +1R»</b> (стоп переносится на цену входа). Средние 3R/сделку математически невозможны (нужен 100% winrate) — а вот E[R] и PF поднимаются реально. В стратегии-версии формула даёт объём: E — капитал, pv — ценность пункта.</p>
+      </div>
+
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-bold text-slate-100">Корреляция Пирсона с BTC</h3>
+          <span class="text-[10px] mono px-2 py-1 rounded bg-white/5 text-slate-500">блок ⑤</span>
+        </div>
+        <div class="mono text-sm text-slate-300 bg-[#0d1117] rounded-xl p-4 leading-7">
+          <div><span class="text-slate-500">// скользящая корреляция монеты и биткоина</span></div>
+          <div class="text-sky-300">ρ = Σ(xᵢ−x̄)(yᵢ−ȳ) / (σₓ · σᵧ · n)</div>
+          <div class="mt-2"><span class="text-slate-500">// приоритет направления при высокой |ρ|</span></div>
+          <div class="text-amber-300">|ρ| ≥ ρₜₕᵣ ⇒ BTC бычий → только LONG</div>
+          <div class="mt-2"><span class="text-slate-500">// нормировка волатильности монеты</span></div>
+          <div class="text-emerald-300">VR = ATR(монета) / ATR(BTC) ≤ 3.0</div>
+        </div>
+        <p class="mt-4 text-[13px] text-slate-400 leading-relaxed">Для альткоинов корреляция с биткоином — главный системный фактор: при ρ ≥ 0.6 средняя реверсия монеты в направлении против битка почти не работает. Фильтр пропускает LONG только при бычьем BTC (цена выше EMA50) и SHORT — при медвежьем. Если альт в 3+ раза волатильнее BTC — входа нет.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ КОД ═══════════════ -->
+  <section id="code" class="reveal scroll-mt-24">
+    <div class="mb-8 flex flex-wrap items-end justify-between gap-4">
+      <div>
+        <div class="text-[11px] font-bold tracking-[.2em] text-amber-400 uppercase mb-2">03 · Исходный код</div>
+        <h2 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">mr_quant_pro.pine</h2>
+        <p class="mt-3 text-slate-400 max-w-xl">Полный код <b class="text-slate-200">индикатора</b> — как и было задумано. Во вкладке рядом — <b class="text-slate-200">стратегия</b> с той же моделью для бэктеста в Strategy Tester (исполнение сделок, объём от риска).</p>
+      </div>
+      <div class="flex gap-2">
+        <button onclick="copyPine()" class="px-5 py-2.5 rounded-xl bg-amber-500/10 text-amber-300 border border-amber-500/30 hover:bg-amber-500/20 text-sm font-semibold transition cursor-pointer">📋 Копировать</button>
+        <button onclick="downloadPine()" class="px-5 py-2.5 rounded-xl bg-white/5 text-slate-200 border border-white/10 hover:bg-white/10 text-sm font-semibold transition cursor-pointer">⬇ .pine файл</button>
+      </div>
+    </div>
+    <div class="bg-[#0d1117] border border-white/10 rounded-2xl overflow-hidden shadow-2xl">
+      <div class="flex items-center justify-between px-4 py-3 bg-[#131722] border-b border-white/5">
+        <div class="flex items-center gap-3">
+          <div class="flex gap-1.5">
+            <span class="w-3 h-3 rounded-full bg-red-500/80"></span>
+            <span class="w-3 h-3 rounded-full bg-amber-500/80"></span>
+            <span class="w-3 h-3 rounded-full bg-emerald-500/80"></span>
+          </div>
+          <span class="mono text-[12px] text-slate-400" id="code-filename">mr_quant_pro.pine</span>
+        </div>
+        <div class="mono text-[11px] text-slate-500"><span id="code-lines"></span> · <span id="code-chars"></span></div>
+      </div>
+      <div class="px-4 pt-3 pb-2 border-b border-amber-500/20 bg-amber-500/[.06]">
+        <p class="text-[12px] leading-relaxed text-amber-200/90">⚠️ <b>Важно:</b> индикатор нельзя протестировать в Strategy Tester. Для бэктеста на реальном графике откройте вкладку <b>«🧪 Стратегия»</b> ниже и скопируйте её код — при нажатии «Добавить на график» откроется Strategy Tester.</p>
+      </div>
+      <div class="flex gap-1 px-3 pt-2.5 border-b border-white/5">
+        <button id="tab-indicator" onclick="setTab('indicator')" class="px-4 py-2.5 text-[12.5px] font-semibold rounded-t-lg border-b-2 transition cursor-pointer">📊 Индикатор <span class="text-slate-500 font-normal">— сигналы, не тестируется</span></button>
+        <button id="tab-strategy" onclick="setTab('strategy')" class="px-4 py-2.5 text-[12.5px] font-semibold rounded-t-lg border-b-2 transition cursor-pointer">🧪 Стратегия <span class="text-emerald-400/80 font-normal">— для теста ✓</span></button>
+      </div>
+      <div id="code-body" class="mono text-[12.5px] leading-[1.65] overflow-auto max-h-[640px] py-4"></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ ДЕМО ═══════════════ -->
+  <section id="demo" class="reveal scroll-mt-24">
+    <div class="mb-8">
+      <div class="text-[11px] font-bold tracking-[.2em] text-amber-400 uppercase mb-2">04 · Симулятор</div>
+      <h2 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">Живая демо-модель процесса OU</h2>
+      <p class="mt-3 text-slate-400 max-w-2xl">Тот же математический движок, что и в индикаторе: цена генерируется процессом <span class="mono text-sky-300">dS = θ(μ−S)dt + σ·dW</span>, затем вычисляются среднее μ (EMA), σ и z-score. Внизу — оценка полужизни T½ через МНК, как в блоке ② индикатора.</p>
+    </div>
+
+    <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-4 md:p-6">
+      <div class="flex flex-wrap items-center gap-2 mb-4 text-[12px] mono text-slate-400">
+        <span class="flex items-center gap-1.5"><i class="inline-block w-3 h-[2px] bg-slate-300"></i> Цена</span>
+        <span class="flex items-center gap-1.5"><i class="inline-block w-3 h-[2px] bg-amber-400" style="border-top:2px dashed #f59e0b;height:0"></i> Среднее μ</span>
+        <span class="flex items-center gap-1.5"><i class="inline-block w-2.5 h-2.5 rounded-sm bg-sky-500/20 border border-sky-500/40"></i> Канал ±kσ</span>
+        <span class="flex items-center gap-1.5 text-emerald-400">▲ LONG</span>
+        <span class="flex items-center gap-1.5 text-red-400">▼ SHORT</span>
+        <span class="flex items-center gap-1.5"><i class="inline-block w-2 h-2 rounded-full bg-sky-300"></i> Выход (z→0)</span>
+        <span class="flex items-center gap-1.5"><i class="inline-block w-4 h-[2px] bg-emerald-400"></i> TP (прямая + цена)</span>
+        <span class="flex items-center gap-1.5"><i class="inline-block w-4 h-[2px] bg-red-400"></i> SL (прямая + цена)</span>
+      </div>
+
+      <canvas id="chart" class="cv-main w-full block"></canvas>
+      <canvas id="zchart" class="w-full block mt-2" style="height:110px"></canvas>
+
+      <!-- статистика -->
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-2.5 mt-4">
+        <div class="bg-[#0d1117] rounded-xl px-3.5 py-2.5"><div class="text-[10px] uppercase tracking-wide text-slate-500">Сделок</div><div id="stTrades" class="mono text-lg font-semibold text-white">0</div></div>
+        <div class="bg-[#0d1117] rounded-xl px-3.5 py-2.5"><div class="text-[10px] uppercase tracking-wide text-slate-500">Закрыто</div><div id="stClosed" class="mono text-lg font-semibold text-white">0</div></div>
+        <div class="bg-[#0d1117] rounded-xl px-3.5 py-2.5"><div class="text-[10px] uppercase tracking-wide text-slate-500">Средн. удержание</div><div id="stHold" class="mono text-lg font-semibold text-white">—</div></div>
+        <div class="bg-[#0d1117] rounded-xl px-3.5 py-2.5"><div class="text-[10px] uppercase tracking-wide text-slate-500">Средн. |z| входа</div><div id="stZavg" class="mono text-lg font-semibold text-white">—</div></div>
+        <div class="bg-[#0d1117] rounded-xl px-3.5 py-2.5"><div class="text-[10px] uppercase tracking-wide text-slate-500">Полужизнь T½</div><div id="stHL" class="mono text-lg font-semibold text-sky-300">—</div></div>
+        <div class="bg-[#0d1117] rounded-xl px-3.5 py-2.5"><div class="text-[10px] uppercase tracking-wide text-slate-500">Цена входа</div><div id="stEntry" class="mono text-lg font-semibold text-sky-300">—</div></div>
+        <div class="bg-[#0d1117] rounded-xl px-3.5 py-2.5"><div class="text-[10px] uppercase tracking-wide text-slate-500">Текущий z</div><div id="stCurZ" class="mono text-lg font-semibold text-amber-300">—</div></div>
+      </div>
+
+      <!-- история сделок (сворачиваемая) -->
+      <div class="mt-4">
+        <button onclick="toggleHist()" class="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-[#0d1117] border border-white/10 text-[13px] font-semibold text-slate-300 hover:border-amber-500/40 transition cursor-pointer">
+          📜 История сделок <span id="histCount" class="text-amber-300 mono">(0)</span> <span id="histArrow" class="text-slate-500">▸</span>
+        </button>
+        <div id="histPanel" class="hidden mt-3 overflow-x-auto rounded-xl border border-white/5 bg-[#0d1117]">
+          <table class="w-full text-[12px] min-w-[620px]">
+            <thead><tr class="text-left text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/10 bg-white/[.02]">
+              <th class="px-3 py-2">№</th><th class="px-3 py-2">Направление</th><th class="px-3 py-2">Вход</th><th class="px-3 py-2">Выход</th><th class="px-3 py-2">Исход</th><th class="px-3 py-2">R</th><th class="px-3 py-2">Баров</th>
+            </tr></thead>
+            <tbody id="histBody" class="text-slate-300"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- управление -->
+      <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-6">
+        <div class="bg-[#0d1117] rounded-xl p-4">
+          <div class="flex justify-between text-[12px] mb-2"><span class="text-slate-400">Скорость возврата θ</span><span id="lbTheta" class="mono text-amber-300">0.06</span></div>
+          <input type="range" id="slTheta" min="0.01" max="0.30" step="0.01" value="0.06">
+          <div class="text-[11px] text-slate-600 mt-1.5">Больше θ → быстрее реверсия</div>
+        </div>
+        <div class="bg-[#0d1117] rounded-xl p-4">
+          <div class="flex justify-between text-[12px] mb-2"><span class="text-slate-400">Волатильность σ</span><span id="lbSigma" class="mono text-amber-300">0.90</span></div>
+          <input type="range" id="slSigma" min="0.2" max="2.0" step="0.05" value="0.9">
+          <div class="text-[11px] text-slate-600 mt-1.5">Амплитуда случайных шоков</div>
+        </div>
+        <div class="bg-[#0d1117] rounded-xl p-4">
+          <div class="flex justify-between text-[12px] mb-2"><span class="text-slate-400">Порог входа k (сигм)</span><span id="lbK" class="mono text-amber-300">2.0</span></div>
+          <input type="range" id="slK" min="1.0" max="3.0" step="0.1" value="2.0">
+          <div class="text-[11px] text-slate-600 mt-1.5">Аналог zEntry в индикаторе</div>
+        </div>
+        <div class="bg-[#0d1117] rounded-xl p-4">
+          <div class="flex justify-between text-[12px] mb-2"><span class="text-slate-400">Окно μ и σ, баров</span><span id="lbWin" class="mono text-amber-300">20</span></div>
+          <input type="range" id="slWin" min="10" max="60" step="1" value="20">
+          <div class="text-[11px] text-slate-600 mt-1.5">Период EMA и оценка σ</div>
+        </div>
+      </div>
+      <div class="flex flex-wrap gap-3 mt-5">
+        <button id="btnRegen" class="px-5 py-2.5 rounded-xl bg-amber-500/10 text-amber-300 border border-amber-500/30 hover:bg-amber-500/20 text-sm font-semibold transition cursor-pointer">🔄 Новая серия</button>
+        <select id="selExit" class="px-3 py-2.5 rounded-xl bg-[#0d1117] border border-white/10 text-[12.5px] text-slate-200 cursor-pointer hover:border-amber-500/40 transition">
+          <option value="zexit">Выход z→0</option>
+          <option value="hold">Держать до SL/TP (полные 3R)</option>
+          <option value="be">Безубыток +1R</option>
+        </select>
+        <button id="btnLive" class="px-5 py-2.5 rounded-xl bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/20 text-sm font-semibold transition cursor-pointer">▶ Live-режим</button>
+        <span class="text-[12px] text-slate-600 self-center">μ = 100 (фикс.) · серия: 600 баров · SL 2×ATR / TP 6×ATR · режим позиции — выпадающий список</span>
+      </div>
+
+      <!-- Монте-Карло тест по таймфреймам -->
+      <div class="mt-8 pt-6 border-t border-white/5">
+        <div class="flex flex-wrap items-end justify-between gap-3 mb-4">
+          <div>
+            <h3 class="font-bold text-white text-lg">🧪 Тест модели по таймфреймам (Монте-Карло)</h3>
+            <p class="text-[12.5px] text-slate-500 mt-1 max-w-2xl">Для каждого ТФ — 12 синтетических серий × 4000 баров. Сравниваются <b class="text-slate-300">3 режима управления позицией</b>: выход z→0 · держать до SL/TP (каждый выигрыш — полные 3R) · безубыток +1R. SL 2×ATR / TP 6×ATR (R:R 1:3). Синтетика проверяет чувствительность модели — реальную статистику даёт Strategy Tester на вашем инструменте.</p>
+          </div>
+          <button id="btnBacktest" class="px-5 py-2.5 rounded-xl bg-amber-500/10 text-amber-300 border border-amber-500/30 hover:bg-amber-500/20 text-sm font-semibold transition cursor-pointer">🔄 Перезапустить тест</button>
+        </div>
+        <div id="bt-table" class="overflow-x-auto rounded-xl border border-white/5"></div>
+        <div id="bt-verdict" class="mt-4"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ НАСТРОЙКИ ═══════════════ -->
+  <section id="settings" class="reveal scroll-mt-24">
+    <div class="mb-8">
+      <div class="text-[11px] font-bold tracking-[.2em] text-amber-400 uppercase mb-2">05 · Параметры</div>
+      <h2 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">Все настройки и дефолты</h2>
+    </div>
+    <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl overflow-hidden">
+      <table class="w-full text-[13px]">
+        <thead><tr class="text-left text-slate-500 text-[11px] uppercase tracking-wider border-b border-white/10 bg-white/[.02]">
+          <th class="px-5 py-3 font-semibold">Параметр</th><th class="px-5 py-3 font-semibold">По умолчанию</th><th class="px-5 py-3 font-semibold hidden md:table-cell">Описание</th>
+        </tr></thead>
+        <tbody class="divide-y divide-white/5 text-slate-300">
+          <tr class="bg-amber-500/[.04]"><td colspan="3" class="px-5 py-2 mono text-[11px] text-amber-400 font-semibold">① МОДЕЛЬ СРЕДНЕГО</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">meanType — тип среднего μ</td><td class="px-5 py-2.5 mono text-amber-300">EMA</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">SMA / EMA / WMA / VWMA / HMA</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">meanLen — период среднего</td><td class="px-5 py-2.5 mono text-amber-300">20</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Длина оценки μ (увеличивайте для старших ТФ)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">stdLen — период σ</td><td class="px-5 py-2.5 mono text-amber-300">20</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Окно волатильности для z-score и полос</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">zEntry — z-score входа</td><td class="px-5 py-2.5 mono text-amber-300">2.0</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Порог открытия: |z| ≥ zEntry (≈ 2σ)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">zExit — z-score выхода</td><td class="px-5 py-2.5 mono text-amber-300">0.0</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Фиксация при возврате z к уровню (0 = среднее)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">bandK — множитель полос kσ</td><td class="px-5 py-2.5 mono text-amber-300">2.0</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Ширина визуального канала реверсии</td></tr>
+
+          <tr class="bg-amber-500/[.04]"><td colspan="3" class="px-5 py-2 mono text-[11px] text-amber-400 font-semibold">② ПОЛУЖИЗНЬ (OU)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useHL — фильтр полужизни</td><td class="px-5 py-2.5 mono text-amber-300">true</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Торгуем только при значимой реверсии</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">hlLen — окно оценки θ</td><td class="px-5 py-2.5 mono text-amber-300">100</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Баров для МНК-регрессии ΔS на S</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">hlMin / hlMax — границы T½</td><td class="px-5 py-2.5 mono text-amber-300">5 / 300 бар</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Отсечка шума и «нереверсивных» активов</td></tr>
+
+          <tr class="bg-amber-500/[.04]"><td colspan="3" class="px-5 py-2 mono text-[11px] text-amber-400 font-semibold">③ ФИЛЬТРЫ</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useVolR — режим волатильности</td><td class="px-5 py-2.5 mono text-amber-300">true</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Входы при повышенной, но не экстремальной σ</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">atrLen / atrWin</td><td class="px-5 py-2.5 mono text-amber-300">14 / 100</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Период ATR и окно его нормировки</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">volZMin / volZMax</td><td class="px-5 py-2.5 mono text-amber-300">0.0 / 2.0</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Допустимый диапазон z-скора ATR</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">adxLen + adxSm</td><td class="px-5 py-2.5 mono text-amber-300">14 / 14</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Период DI и сглаживание ADX (simple int — требование v6)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useTrend + adxMax</td><td class="px-5 py-2.5 mono text-amber-300">true / 25</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Блокировка входов в тренде (ADX выше порога)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useTrendDir + trendDirLen</td><td class="px-5 py-2.5 mono text-amber-300">true / 100</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell"><b class="text-emerald-300">Антитренд-фильтр:</b> LONG только выше EMA100, SHORT — ниже (резает серии стопов)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useConfirm — ретест границы</td><td class="px-5 py-2.5 mono text-amber-300">false</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Выключен по умолчанию (жёстко режет частоту). Включите для максимального винрейта</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useRSI + rsiLo/rsiHi</td><td class="px-5 py-2.5 mono text-amber-300">true / 30–70</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Подтверждение перекупленности/перепроданности</td></tr>
+
+          <tr class="bg-amber-500/[.04]"><td colspan="3" class="px-5 py-2 mono text-[11px] text-amber-400 font-semibold">⑥ БИТКОИН-КОНТЕКСТ И ВОЛАТИЛЬНОСТЬ</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useBtc — фильтр корреляции с BTC</td><td class="px-5 py-2.5 mono text-amber-300">true</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Приоритет направления сигналов по движению биткоина</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">btcSym — тикер BTC</td><td class="px-5 py-2.5 mono text-amber-300">BINANCE:BTCUSDT</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Символ для расчёта корреляции (можно сменить)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">corrLen / corrThr</td><td class="px-5 py-2.5 mono text-amber-300">100 / 0.6</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Окно корреляции Пирсона и порог «высокой» корреляции |ρ|</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">btcLen — окно направления BTC/монеты</td><td class="px-5 py-2.5 mono text-amber-300">50</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Цена выше EMA → бычий приоритет; окно одно и для BTC, и для направления монеты (строка под «BTC направление»)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useVolRatio + volRatioMax</td><td class="px-5 py-2.5 mono text-amber-300">true / 3.0</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">ATR монеты / ATR BTC: выше порога — входы блокируются</td></tr>
+
+          <tr class="bg-amber-500/[.04]"><td colspan="3" class="px-5 py-2 mono text-[11px] text-amber-400 font-semibold">⑦ ИСТОРИЯ СДЕЛОК (сворачиваемое меню)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">showHist — показывать историю</td><td class="px-5 py-2.5 mono text-amber-300">true</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Таблица справа от графика, слева от панели метрик: №, направление, вход/выход, исход и R</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">histOpen — история развернута</td><td class="px-5 py-2.5 mono text-amber-300">true</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Один клик в настройках → меню сворачивается в одну строку</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">histMaxRows — строк в истории</td><td class="px-5 py-2.5 mono text-amber-300">15</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Сколько последних сделок показывать (до 40)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">Исходы: ТЕЙК · СТОП · БУ · z-выход</td><td class="px-5 py-2.5 mono text-amber-300">4 вида</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Зелёный = тейк, красный = стоп, янтарный = безубыток, голубой = выход по z</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">Итоги истории</td><td class="px-5 py-2.5 mono text-amber-300">Общий R · Винрейт</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Внизу панели: суммарный результат в R и % выигрышных сделок (БУ в винрейт не считается)</td></tr>
+
+          <tr class="bg-amber-500/[.04]"><td colspan="3" class="px-5 py-2 mono text-[11px] text-amber-400 font-semibold">⑧ ДОП. СИГНАЛЫ — ОБЪЁМ И POC ПРОФИЛЯ</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useExtra — доп. сигналы</td><td class="px-5 py-2.5 mono text-amber-300">true</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Увеличивает частоту: мягкий z + проверка объёма, касания глобального POC</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">zEntry2 — мягкий z-порог</td><td class="px-5 py-2.5 mono text-amber-300">1.2</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Цена пришла к границе MR (|z| ≥ 1.2) → проверяется объём → сигнал</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useVolConf / volMult</td><td class="px-5 py-2.5 mono text-amber-300">true / 1.2</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Всплеск объёма: volume > SMA(volume,20) × 1.2</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">usePocSig + pocLen / pocTol</td><td class="px-5 py-2.5 mono text-amber-300">true / 2000 / 0.3</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Касание глобального POC профиля (глубина 2000 баров, допуск 0.3×ATR) даёт сигнал</td></tr>
+
+          <tr class="bg-amber-500/[.04]"><td colspan="3" class="px-5 py-2 mono text-[11px] text-amber-400 font-semibold">④ РИСК-УРОВНИ SL/TP · ОБЪЁМ (стратегия)</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">slMult / tpMult — ×ATR</td><td class="px-5 py-2.5 mono text-amber-300">2.0 / 6.0</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Стоп/тейк в кратных волатильности: <b class="text-emerald-300">R:R = 1:3</b>, линии + метки цен SL/TP на графике</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">exitMode — управление позицией</td><td class="px-5 py-2.5 mono text-amber-300">Выход z→0</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">«Держать до SL/TP» → каждый выигрыш полные 3R · «Безубыток +1R» → стоп на цену входа</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">beMult — порог безубытка, ×R</td><td class="px-5 py-2.5 mono text-amber-300">1.0</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">После +1R стоп переносится на цену входа</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">useRisk — риск-ориентированный объём</td><td class="px-5 py-2.5 mono text-amber-300">true</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">qty = E·r% / (SL·pv) · только во вкладке «Стратегия»</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">riskPct — риск на сделку</td><td class="px-5 py-2.5 mono text-amber-300">1.0%</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Максимальный убыток по стопу, % капитала · только в стратегии</td></tr>
+
+          <tr class="bg-amber-500/[.04]"><td colspan="3" class="px-5 py-2 mono text-[11px] text-amber-400 font-semibold">⑤ ОТОБРАЖЕНИЕ</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">showBands / showDash</td><td class="px-5 py-2.5 mono text-amber-300">true / true</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">Полосы μ±kσ и панель метрик MR Score</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">compactMode — компактный режим</td><td class="px-5 py-2.5 mono text-amber-300">false</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell"><b class="text-emerald-300">Для мобильного:</b> 5 ключевых метрик + история только с итогами</td></tr>
+          <tr><td class="px-5 py-2.5 mono text-slate-200">dashPos — позиция панели</td><td class="px-5 py-2.5 mono text-amber-300">Верхний правый</td><td class="px-5 py-2.5 text-slate-400 hidden md:table-cell">На мобильном удобнее «Правый по центру» или «Нижний правый»</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ═══════════════ УСТАНОВКА ═══════════════ -->
+  <section id="guide" class="reveal scroll-mt-24">
+    <div class="mb-8">
+      <div class="text-[11px] font-bold tracking-[.2em] text-amber-400 uppercase mb-2">06 · Практика</div>
+      <h2 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">Установка и использование</h2>
+    </div>
+
+    <div class="grid lg:grid-cols-2 gap-6">
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <h3 class="font-bold text-slate-100 mb-5">Шаги установки</h3>
+        <ol class="space-y-4">
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-amber-500/15 text-amber-300 mono font-bold flex items-center justify-center text-sm">1</span><p class="text-[13px] text-slate-400 leading-relaxed">В TradingView откройте график и нажмите <b class="text-slate-200">«Pine Editor»</b> на нижней панели (или сайт → «Продукты» → Pine Editor).</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-amber-500/15 text-amber-300 mono font-bold flex items-center justify-center text-sm">2</span><p class="text-[13px] text-slate-400 leading-relaxed">Удалите шаблонный код и вставьте <b class="text-slate-200">mr_quant_pro.pine</b> (кнопка «Копировать» выше). По умолчанию активна версия <b class="text-slate-200">индикатора</b>.</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-amber-500/15 text-amber-300 mono font-bold flex items-center justify-center text-sm">3</span><p class="text-[13px] text-slate-400 leading-relaxed">Нажмите <b class="text-slate-200">«Добавить на график»</b> — появятся полосы μ ± kσ, метки LONG/SHORT, а по каждому сигналу: <b class="text-emerald-400">зелёная прямая TP с ценой</b> и <b class="text-red-400">красная прямая SL с ценой</b>. Для бэктеста откройте вкладку <b class="text-slate-200">«Стратегия»</b> и добавьте её — внизу откроется <b class="text-slate-200">Strategy Tester</b> с чистой прибылью, профит-фактором и просадкой.</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-amber-500/15 text-amber-300 mono font-bold flex items-center justify-center text-sm">4</span><p class="text-[13px] text-slate-400 leading-relaxed">Настройте параметры под таймфрейм (таблица ниже) и проверьте, что <b class="text-slate-200">полужизнь T½</b> в панели метрик попадает в границы фильтра.</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-amber-500/15 text-amber-300 mono font-bold flex items-center justify-center text-sm">5</span><p class="text-[13px] text-slate-400 leading-relaxed">Создайте алерт: ПКМ на графике → «Создать алерт» → условие <b class="text-slate-200">MR Quant Pro</b>. События <b class="text-slate-200">LONG / SHORT / ВЫХОД</b> встроены через динамические <span class="mono text-sky-300">alert()</span> — подробная настройка Telegram в разделе <a href="#telegram" class="text-sky-300 underline underline-offset-2">«Telegram» ↓</a>.</p></li>
+        </ol>
+      </div>
+
+      <div class="space-y-6">
+        <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+          <h3 class="font-bold text-slate-100 mb-4">Правила входов и выходов</h3>
+          <div class="grid grid-cols-2 gap-3 text-[13px]">
+            <div class="bg-emerald-500/[.06] border border-emerald-500/20 rounded-xl p-3.5">
+              <div class="mono font-bold text-emerald-300 mb-2">ВХОД LONG</div>
+              <ul class="text-slate-400 space-y-1.5 leading-snug">
+                <li>· z пересекает −zEntry вниз</li>
+                <li>· полужизнь в границах</li>
+                <li>· ADX ниже порога</li>
+                <li>· atrZ в диапазоне</li>
+                <li>· RSI ≤ порога перепроданности</li>
+                <li>· BTC: |ρ| &lt; 0.6 или BTC бычий</li>
+                <li>· волат./BTC ≤ порога</li>
+                <li class="text-sky-300/80">· тренд: цена выше EMA200</li>
+                <li class="text-amber-300/80">· подтверждение: ретест границы свечой</li>
+                <li class="text-emerald-300/80">· доп.: |z| ≥ 1.5 + всплеск объёма</li>
+                <li class="text-violet-300/80">· доп.: касание POC профиля сверху</li>
+              </ul>
+              <div class="mt-2.5 text-slate-500 text-[12px]">Выход: z → zExit · SL 2×ATR / TP 6×ATR (R:R 1:3)</div>
+            </div>
+            <div class="bg-red-500/[.06] border border-red-500/20 rounded-xl p-3.5">
+              <div class="mono font-bold text-red-300 mb-2">ВХОД SHORT</div>
+              <ul class="text-slate-400 space-y-1.5 leading-snug">
+                <li>· z пересекает +zEntry вверх</li>
+                <li>· полужизнь в границах</li>
+                <li>· ADX ниже порога</li>
+                <li>· atrZ в диапазоне</li>
+                <li>· RSI ≥ порога перекупленности</li>
+                <li>· BTC: |ρ| &lt; 0.6 или BTC медвежий</li>
+                <li>· волат./BTC ≤ порога</li>
+                <li class="text-sky-300/80">· тренд: цена ниже EMA200</li>
+                <li class="text-amber-300/80">· подтверждение: ретест границы свечой</li>
+                <li class="text-emerald-300/80">· доп.: |z| ≥ 1.5 + всплеск объёма</li>
+                <li class="text-violet-300/80">· доп.: касание POC профиля снизу</li>
+              </ul>
+              <div class="mt-2.5 text-slate-500 text-[12px]">Выход: z → −zExit · SL 2×ATR / TP 6×ATR (R:R 1:3)</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+          <h3 class="font-bold text-slate-100 mb-4">Рекомендации по таймфреймам</h3>
+          <table class="w-full text-[12.5px]">
+            <thead><tr class="text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/10"><th class="py-2 text-left">Таймфрейм</th><th class="py-2 text-left">meanLen</th><th class="py-2 text-left">zEntry</th><th class="py-2 text-left">adxMax</th></tr></thead>
+            <tbody class="divide-y divide-white/5 text-slate-400">
+              <tr><td class="py-2 mono text-slate-200">1м–5м</td><td class="py-2 mono text-amber-300">10–20</td><td class="py-2 mono text-amber-300">1.5–2.0</td><td class="py-2 mono text-amber-300">20</td></tr>
+              <tr><td class="py-2 mono text-slate-200">15м–1ч</td><td class="py-2 mono text-amber-300">20–50</td><td class="py-2 mono text-amber-300">2.0</td><td class="py-2 mono text-amber-300">25</td></tr>
+              <tr><td class="py-2 mono text-slate-200">4ч–1д</td><td class="py-2 mono text-amber-300">50–100</td><td class="py-2 mono text-amber-300">2.0–2.5</td><td class="py-2 mono text-amber-300">25–30</td></tr>
+            </tbody>
+          </table>
+          <p class="mt-4 text-[12.5px] text-slate-400 leading-relaxed">📱 <b class="text-slate-200">Мобильный TradingView:</b> в настройках включите <b class="text-emerald-300">«Компактный режим (мобильный)»</b> и поставьте позицию панели «Правый по центру» — панель перестанет закрывать экран (5 метрик + итоги истории вместо полной таблицы).</p>
+          <p class="mt-4 text-[12.5px] text-slate-400 leading-relaxed"><b class="text-amber-300">🎯 Оптимально по модели — 15м–1ч.</b> 4ч–1д подходят для спокойных входов с большим запасом по R:R; 1м–5м — только для ликвидных инструментов с низкими комиссиями и пониженным zEntry. Полный синтетический тест по таймфреймам — в разделе <a href="#demo" class="text-sky-300 underline underline-offset-2">«Демо» ↓</a>. Для акций попробуйте <span class="mono text-sky-300">HMA</span>, для крипты и фьючерсов — <span class="mono text-sky-300">EMA</span>. Сверяйтесь с полужизнью T½ в дашборде.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ═══════════════ TELEGRAM ═══════════════ -->
+  <section id="telegram" class="reveal scroll-mt-24">
+    <div class="mb-8">
+      <div class="text-[11px] font-bold tracking-[.2em] text-amber-400 uppercase mb-2">07 · Уведомления</div>
+      <h2 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">Сигналы в Telegram</h2>
+      <p class="mt-3 text-slate-400 max-w-2xl">Индикатор отправляет динамические сообщения через <span class="mono text-sky-300">alert()</span>: монета, таймфрейм, цена, z-score и уровни SL/TP. Чтобы они приходили в чат Telegram — один раз настройте webhook-алерты в TradingView.</p>
+    </div>
+
+    <div class="grid lg:grid-cols-2 gap-6">
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <h3 class="font-bold text-slate-100 mb-5">Шаг 1 · Бот и chat_id</h3>
+        <ol class="space-y-4">
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-sky-500/15 text-sky-300 mono font-bold flex items-center justify-center text-sm">1</span><p class="text-[13px] text-slate-400 leading-relaxed">В Telegram откройте <b class="text-slate-200">@BotFather</b> → команда <span class="mono text-sky-300">/newbot</span> → придумайте имя → получите <b class="text-slate-200">токен</b> вида <span class="mono text-sky-300">123456789:AAE-xyz...</span></p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-sky-500/15 text-sky-300 mono font-bold flex items-center justify-center text-sm">2</span><p class="text-[13px] text-slate-400 leading-relaxed">Напишите боту любое сообщение (или добавьте его в нужный чат/группу).</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-sky-500/15 text-sky-300 mono font-bold flex items-center justify-center text-sm">3</span><p class="text-[13px] text-slate-400 leading-relaxed">Узнайте <b class="text-slate-200">chat_id</b>: напишите <b class="text-slate-200">@userinfobot</b> (личный чат) или откройте в браузере <span class="mono text-sky-300 break-all">https://api.telegram.org/bot&lt;ТОКЕН&gt;/getUpdates</span> — в ответе найдите <span class="mono text-amber-300">"chat":{"id":123456789}</span>.</p></li>
+        </ol>
+        <div class="mt-5 pt-4 border-t border-white/10 text-[12.5px] text-slate-500 leading-relaxed">💡 Для группы chat_id начинается с минуса (например <span class="mono">-1001234567890</span>) — используйте его целиком.</div>
+      </div>
+
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <h3 class="font-bold text-slate-100 mb-5">Шаг 2 · Webhook-алерт в TradingView</h3>
+        <ol class="space-y-4">
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-emerald-500/15 text-emerald-300 mono font-bold flex items-center justify-center text-sm">1</span><p class="text-[13px] text-slate-400 leading-relaxed">На графике с индикатором: <b class="text-slate-200">ПКМ → «Создать алерт»</b> (или значок часов на панели).</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-emerald-500/15 text-emerald-300 mono font-bold flex items-center justify-center text-sm">2</span><p class="text-[13px] text-slate-400 leading-relaxed">Условие: <b class="text-slate-200">MR Quant Pro</b> → выберите событие <span class="mono text-emerald-300">«MRQ LONG…»</span> (или SHORT / ВЫХОД).</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-emerald-500/15 text-emerald-300 mono font-bold flex items-center justify-center text-sm">3</span><p class="text-[13px] text-slate-400 leading-relaxed">Вкладка «Уведомления» → включите <b class="text-slate-200">«Webhook URL»</b> → вставьте шаблон ниже, заменив <b class="text-amber-300">ТОКЕН</b> и <b class="text-amber-300">ID</b>.</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-emerald-500/15 text-emerald-300 mono font-bold flex items-center justify-center text-sm">4</span><p class="text-[13px] text-slate-400 leading-relaxed">Повторите для событий <b class="text-slate-200">SHORT</b> и <b class="text-slate-200">ВЫХОД</b> — в text укажите соответствующий сигнал.</p></li>
+        </ol>
+        <div class="mono text-[11.5px] bg-[#0d1117] border border-white/10 rounded-xl p-4 mt-5 break-all leading-6">
+          <span class="text-slate-500">// шаблон Webhook URL (LONG)</span><br>
+          <span class="text-sky-300">https://api.telegram.org/bot&lt;ТОКЕН&gt;/sendMessage?chat_id=&lt;ID&gt;&amp;text=MRQ%20LONG:%20{{ticker}}%20{{interval}}%20@%20{{close}}%20z%20{{plot_0}}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-6 bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+      <h3 class="font-bold text-slate-100 mb-4">Что придёт в Telegram</h3>
+      <div class="grid md:grid-cols-3 gap-3">
+        <div class="bg-emerald-500/[.06] border border-emerald-500/20 rounded-xl p-4"><div class="mono text-[12px] text-emerald-300 mb-2">🟢 Сигнал LONG</div><div class="mono text-[11.5px] text-slate-400 leading-6 break-all">MRQ LONG: BTCUSDT 15 @ 64200.5 | z = −2.35 | SL 63910 | TP 65870 | R:R 1:3</div></div>
+        <div class="bg-red-500/[.06] border border-red-500/20 rounded-xl p-4"><div class="mono text-[12px] text-red-300 mb-2">🔴 Сигнал SHORT</div><div class="mono text-[11.5px] text-slate-400 leading-6 break-all">MRQ SHORT: ETHUSDT 1ч @ 3401.2 | z = +2.10 | SL 3460 | TP 3220 | R:R 1:3</div></div>
+        <div class="bg-sky-500/[.06] border border-sky-500/20 rounded-xl p-4"><div class="mono text-[12px] text-sky-300 mb-2">🔵 Выход из позиции</div><div class="mono text-[11.5px] text-slate-400 leading-6 break-all">MRQ ВЫХОД LONG: SOLUSDT @ 154.80 | z = 0.02 (z→среднее или SL/TP)</div></div>
+      </div>
+      <div class="mt-4 text-[12.5px] text-slate-500 leading-relaxed">Сообщения <span class="mono text-sky-300">alert()</span> из Pine содержат монету, сигнал и все уровни — они же приходят в приложение TradingView. Для Telegram webhook использует плейсхолдеры платформы: <span class="mono text-amber-300">{{ticker}}</span> (монета), <span class="mono text-amber-300">{{interval}}</span> (ТФ), <span class="mono text-amber-300">{{close}}</span> (цена), <span class="mono text-amber-300">{{time}}</span> (время). Алерты срабатывают на закрытии бара — по одному сообщению на сигнал.</div>
+    </div>
+  </section>
+
+<!-- ═══════════════ ЛАБОРАТОРИЯ ═══════════════ -->
+  <section id="lab" class="reveal scroll-mt-24">
+    <div class="mb-8">
+      <div class="text-[11px] font-bold tracking-[.2em] text-amber-400 uppercase mb-2">08 · Лаборатория</div>
+      <h2 class="text-3xl md:text-4xl font-extrabold text-white tracking-tight">Стратегия + цикл улучшения модели</h2>
+      <p class="mt-3 text-slate-400 max-w-2xl">Во вкладке <a href="#code" class="text-sky-300 underline underline-offset-2">«Стратегия» ↑</a> лежит та же модель, что и индикатор, но с исполнением сделок — TradingView сам посчитает всю статистику. Прогоняете на реальном графике → снимаете цифры по шаблону → присылаете мне → я дорабатываю модель (пороги, фильтры, режим выхода).</p>
+    </div>
+
+    <div class="grid lg:grid-cols-2 gap-6">
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <h3 class="font-bold text-slate-100 mb-5">Шаг 1 · Запуск стратегии в TradingView</h3>
+        <ol class="space-y-4">
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-red-500/15 text-red-300 mono font-bold flex items-center justify-center text-sm">!</span><p class="text-[13px] text-slate-300 leading-relaxed"><b class="text-red-300">Не копируйте индикатор для теста — он не откроет Strategy Tester!</b> Нужна вкладка <b class="text-emerald-300">«🧪 Стратегия»</b> в разделе «Код» (или зелёная кнопка «Копировать стратегию» вверху страницы). Отличие простое: код стратегии начинается со слова <span class="mono text-emerald-300">strategy(</span>, а индикатора — со слова <span class="mono text-amber-300">indicator(</span>.</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-amber-500/15 text-amber-300 mono font-bold flex items-center justify-center text-sm">2</span><p class="text-[13px] text-slate-400 leading-relaxed">В TradingView откройте график монеты → <b class="text-slate-200">Pine Editor</b> (снизу) → вставьте код → <b class="text-slate-200">«Добавить на график»</b>. Внизу появится <b class="text-slate-200">Strategy Tester</b>.</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-amber-500/15 text-amber-300 mono font-bold flex items-center justify-center text-sm">3</span><p class="text-[13px] text-slate-400 leading-relaxed">Выберите <b class="text-slate-200">таймфрейм</b> (совет: начните с 1ч и 4ч — на них меньше шума) и период: иконка ⚙ у стратегии в панели объектов → <b class="text-slate-200">«Свойства»</b> → диапазон дат (вкладка «Свойства» в Strategy Tester).</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-amber-500/15 text-amber-300 mono font-bold flex items-center justify-center text-sm">4</span><p class="text-[13px] text-slate-400 leading-relaxed">Убедитесь, что график в <b class="text-slate-200">обычных свечах</b> (не Heikin Ashi — искажает статистику). Для глубокой истории на 4ч/1д включите расширенную загрузку истории.</p></li>
+          <li class="flex gap-4"><span class="w-7 h-7 shrink-0 rounded-lg bg-amber-500/15 text-amber-300 mono font-bold flex items-center justify-center text-sm">5</span><p class="text-[13px] text-slate-400 leading-relaxed">Прогон закончен — снимите цифры из вкладки <b class="text-slate-200">«Обзор»</b> (Overview) и «Список сделок» (List of Trades).</p></li>
+        </ol>
+        <div class="mt-5 pt-4 border-t border-white/10 text-[12.5px] text-slate-500 leading-relaxed">💡 Стратегия уже содержит комиссию 0.05%, проскальзывание 1 пункт и стартовый капитал 100 000 — условия близки к реальным.</div>
+      </div>
+
+      <div class="bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+        <h3 class="font-bold text-slate-100 mb-5">Шаг 2 · Какие цифры снять (вкладка «Обзор»)</h3>
+        <table class="w-full text-[13px]">
+          <thead><tr class="text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/10"><th class="py-2 text-left">Метрика</th><th class="py-2 text-left">Зачем мне</th></tr></thead>
+          <tbody class="divide-y divide-white/5 text-slate-400">
+            <tr><td class="py-2 mono text-slate-200">Net Profit</td><td class="py-2">Общий результат системы</td></tr>
+            <tr><td class="py-2 mono text-slate-200">Profit Factor</td><td class="py-2">Главный показатель качества (≥ 1.3 хорошо, &lt; 1 — убыточно)</td></tr>
+            <tr><td class="py-2 mono text-slate-200">Percent Profitable</td><td class="py-2">Винрейт — подскажет, менять ли порог zEntry</td></tr>
+            <tr><td class="py-2 mono text-slate-200">Max Drawdown</td><td class="py-2">Максимальная просадка — для оценки риска</td></tr>
+            <tr><td class="py-2 mono text-slate-200">Avg Trade / Avg # Bars</td><td class="py-2">Средний результат и удержание сделки</td></tr>
+            <tr><td class="py-2 mono text-slate-200">Number of Trades</td><td class="py-2">Частота — достаточна ли выборка (нужно ≥ 50)</td></tr>
+            <tr><td class="py-2 mono text-slate-200">Из «Списка сделок»</td><td class="py-2">Сколько сделок закрылось по СТОПу vs по ТЕЙКу; худшая серия убытков; winrate отдельно по LONG и SHORT</td></tr>
+          </tbody>
+        </table>
+        <div class="mt-5 pt-4 border-t border-white/10 text-[12.5px] text-slate-500 leading-relaxed">📸 «Список сделок» удобно слать скриншотом — по исходам (ТЕЙК/СТОП/БУ/z) я вижу, где модель «ломается».</div>
+      </div>
+    </div>
+
+    <!-- шаблон отчёта -->
+    <div class="mt-6 bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h3 class="font-bold text-slate-100">Шаг 3 · Шаблон отчёта для меня</h3>
+        <button onclick="copyTemplate()" class="px-4 py-2 rounded-xl bg-amber-500/10 text-amber-300 border border-amber-500/30 hover:bg-amber-500/20 text-sm font-semibold transition cursor-pointer">📋 Скопировать шаблон</button>
+      </div>
+      <pre id="lab-template" class="mono text-[12px] leading-6 text-slate-300 bg-[#0d1117] border border-white/10 rounded-xl p-4 overflow-x-auto">📊 ОТЧЁТ MR QUANT PRO — СТРАТЕГИЯ
+
+Тикер: 
+Таймфрейм: 
+Период теста: 
+Режим выхода (exitMode): 
+
+── ИЗ «ОБЗОРА» ──
+Net Profit: 
+Profit Factor: 
+Percent Profitable: 
+Max Drawdown: 
+Avg Trade: 
+Number of Trades: 
+
+── ИЗ «СПИСКА СДЕЛОК» ──
+ТЕЙК / СТОП / БУ / z-выход (сколько чего): 
+Winrate LONG:   Winrate SHORT: 
+Худшая серия убытков (сколько подряд): 
+
+── НАСТРОЙКИ, ОТЛИЧНЫЕ ОТ ДЕФОЛТА ──
+(перечислите, что меняли)
+
+── НАБЛЮДЕНИЯ ──
+(когда теряет: в тренде? на каких монетах? после новостей?)</pre>
+    </div>
+
+    <!-- эксперименты -->
+    <div class="mt-6 bg-[#11151f]/80 border border-white/5 rounded-2xl p-6">
+      <h3 class="font-bold text-slate-100 mb-4">Шаг 4 · Что мы будем крутить по вашим данным</h3>
+      <table class="w-full text-[13px]">
+        <thead><tr class="text-left text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/10 bg-white/[.02]">
+          <th class="px-4 py-2.5 font-semibold">Если наблюдаем</th><th class="px-4 py-2.5 font-semibold">Гипотеза</th><th class="px-4 py-2.5 font-semibold">Что меняем</th>
+        </tr></thead>
+        <tbody class="divide-y divide-white/5 text-slate-400">
+          <tr><td class="px-4 py-2.5">Много СТОПов в тренде</td><td class="px-4 py-2.5">Фильтр ADX слабый</td><td class="px-4 py-2.5 mono text-amber-300">adxMax ↓, useTrend строже</td></tr>
+          <tr><td class="px-4 py-2.5">Низкий винрейт (&lt; 50%)</td><td class="px-4 py-2.5">Слишком ранние входы</td><td class="px-4 py-2.5 mono text-amber-300">zEntry ↑ (2.2–2.5), zEntry2 ↑</td></tr>
+          <tr><td class="px-4 py-2.5">Мало сделок</td><td class="px-4 py-2.5">Фильтры зажаты</td><td class="px-4 py-2.5 mono text-amber-300">useHL/useRSI off, hlMax ↑</td></tr>
+          <tr><td class="px-4 py-2.5">Прибыль режется на выходах</td><td class="px-4 py-2.5">Режим выхода не тот</td><td class="px-4 py-2.5 mono text-amber-300">exitMode → «Держать до SL/TP» или «Безубыток»</td></tr>
+          <tr><td class="px-4 py-2.5">Просадки на шумных барах</td><td class="px-4 py-2.5">Окно среднего мало</td><td class="px-4 py-2.5 mono text-amber-300">meanLen/stdLen ↑ (30–50)</td></tr>
+          <tr><td class="px-4 py-2.5">Проигрыши против BTC-тренда</td><td class="px-4 py-2.5">Порог корреляции низкий</td><td class="px-4 py-2.5 mono text-amber-300">corrThr ↑ (0.7), btcLen ↓</td></tr>
+        </tbody>
+      </table>
+      <p class="mt-4 text-[12.5px] text-slate-500 leading-relaxed">Цель совместного цикла: Profit Factor ≥ 1.3 при количестве сделок ≥ 50 на тикер. Присылайте отчёт — я сразу предлагаю следующую итерацию параметров или правку кода модели.</p>
+    </div>
+  </section>
+
+<!-- ═══════════════ FOOTER ═══════════════ -->
+<footer class="border-t border-white/5 py-10 px-5">
+  <div class="max-w-6xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4 text-[12.5px] text-slate-600">
+    <div class="flex items-center gap-2.5">
+      <span class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center font-extrabold text-[#0b0e14] text-[10px]">MR</span>
+      <span>Mean Reversion Quant Pro · Pine Script v6 · 2025</span>
+    </div>
+    <p class="text-center">Создано в образовательных целях. Не является инвестиционной рекомендацией — торговля на финансовых рынках сопряжена с риском потери капитала.</p>
+  </div>
+</footer>
+
+<!-- тост -->
+<div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-sm font-semibold backdrop-blur-xl opacity-0 pointer-events-none transition-all duration-300 translate-y-3">✅ Код скопирован в буфер обмена</div>
+
+<!-- ═══════════════ PINE SOURCE ═══════════════ -->
+<script type="text/plain" id="pine-strategy">
+//@version=6
+// ═══════════════════════════════════════════════════════════════════
+//  MEAN REVERSION QUANT PRO  v1.1 · СТРАТЕГИЯ
+//  ✅ ЭТО СТРАТЕГИЯ: вставьте в Pine Editor → «Добавить на график» →
+//  внизу откроется Strategy Tester со статистикой сделок.
+//  Математическая модель возврата к среднему (Mean Reversion)
+//  ───────────────────────────────────────────────────────────────
+//  МОДЕЛЬ:
+//    • z-скор:      z = (price − μ) / σ
+//    • Полосы:      μ ± k·σ
+//    • ОУ-процесс:  dS = θ(μ − S)dt + σ·dW  →  полужизнь T½ = ln(2)/θ
+//    • Режим волат.: z-скор ATR (окно нормировки)
+//    • Тренд:       ADX
+//    • Риск:        стоп/тейк в кратных ATR, объём от риска
+// ═══════════════════════════════════════════════════════════════════
+strategy("Mean Reversion Quant Pro", shorttitle="MRQ Pro", overlay=true,
+     initial_capital=100000, currency=currency.NONE,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=1, pyramiding=1, calc_on_every_tick=false,
+     process_orders_on_close=true)
+
+// ─────────────────────────── ① МОДЕЛЬ СРЕДНЕГО ───────────────────────────
+meanType = input.string("EMA", "Тип среднего μ",
+     options=["SMA", "EMA", "WMA", "VWMA", "HMA"], group="① Модель среднего",
+     tooltip="Ядро модели: оценка равновесного уровня, к которому возвращается цена")
+meanLen  = input.int(20, "Период среднего μ", minval=2, maxval=500, group="① Модель среднего")
+stdLen   = input.int(20, "Период σ (волатильность)", minval=2, maxval=500, group="① Модель среднего")
+zEntry   = input.float(2.0, "Z-score входа", minval=0.5, maxval=5.0, step=0.1,
+     group="① Модель среднего", tooltip="Статистический порог открытия: |z| ≥ zEntry (≈95% событий внутри ±2σ)")
+zExit    = input.float(0.0, "Z-score выхода", minval=-2.0, maxval=2.0, step=0.1,
+     group="① Модель среднего", tooltip="Закрытие позиции, когда z возвращается к этому уровню (0 = среднее)")
+bandK    = input.float(2.0, "Множитель полос k·σ", minval=0.5, maxval=4.0, step=0.1, group="① Модель среднего")
+
+// ─────────────────────────── ② ПОЛУЖИЗНЬ (OU) ───────────────────────────
+useHL  = input.bool(true, "Фильтр полужизни (OU)", group="② Полужизнь (ОУ)",
+     tooltip="Торгуем только инструменты, где средняя реверсия статистически значима")
+hlLen  = input.int(100, "Окно оценки θ", minval=20, maxval=1000, group="② Полужизнь (ОУ)")
+hlMin  = input.float(5.0, "Мин. полужизнь, баров", minval=1.0, maxval=100.0, group="② Полужизнь (ОУ)")
+hlMax  = input.float(300.0, "Макс. полужизнь, баров", minval=10.0, maxval=2000.0, group="② Полужизнь (ОУ)")
+
+// ─────────────────────────── ③ ФИЛЬТРЫ ───────────────────────────
+useVolR  = input.bool(true, "Фильтр режима волатильности", group="③ Фильтры")
+atrLen   = input.int(14, "ATR период", minval=2, maxval=100, group="③ Фильтры")
+atrWin   = input.int(100, "Окно нормировки ATR", minval=20, maxval=1000, group="③ Фильтры")
+volZMin  = input.float(0.0, "Мин. ATR z-score", minval=-5.0, maxval=5.0, step=0.1, group="③ Фильтры")
+volZMax  = input.float(2.0, "Макс. ATR z-score", minval=-5.0, maxval=5.0, step=0.1,
+     group="③ Фильтры", tooltip="Входы только при повышенной, но не экстремальной волатильности")
+useTrend = input.bool(true, "Трендовый фильтр (ADX)", group="③ Фильтры")
+adxLen   = input.int(14, "ADX период", minval=2, maxval=100, group="③ Фильтры")
+adxSm    = input.int(14, "ADX сглаживание", minval=1, maxval=100,
+     group="③ Фильтры", tooltip="v6: ta.dmi требует константу simple int, а не series (ошибка CE10123)")
+adxMax   = input.float(25.0, "Макс. ADX для входов", minval=5.0, maxval=60.0, step=1.0,
+     group="③ Фильтры", tooltip="В сильном тренде средняя реверсия не работает — пропускаем вход")
+useRSI   = input.bool(true, "Подтверждение RSI", group="③ Фильтры")
+rsiLen   = input.int(14, "RSI период", minval=2, maxval=100, group="③ Фильтры")
+rsiLo    = input.float(30.0, "Порог перепроданности", minval=1.0, maxval=49.0, group="③ Фильтры")
+rsiHi    = input.float(70.0, "Порог перекупленности", minval=51.0, maxval=99.0, group="③ Фильтры")
+
+// ──────────────────── ⑥ БИТКОИН-КОНТЕКСТ И ВОЛАТИЛЬНОСТЬ ────────────────────
+useBtc   = input.bool(true, "Фильтр корреляции с BTC", group="⑥ Биткоин-контекст",
+     tooltip="При высокой корреляции с биткоином сигналы получают приоритет по направлению движения BTC")
+btcSym   = input.string("BINANCE:BTCUSDT", "Тикер BTC", group="⑥ Биткоин-контекст",
+     tooltip="Символ для расчёта корреляции; на некрипто-инструментах фильтр можно отключить")
+corrLen  = input.int(100, "Окно корреляции", minval=10, maxval=1000, group="⑥ Биткоин-контекст")
+corrThr  = input.float(0.6, "Порог корреляции |ρ|", minval=0.1, maxval=0.95, step=0.05,
+     group="⑥ Биткоин-контекст", tooltip="Если |ρ| ≥ порога — монета «ходит за битком», действует приоритет направления BTC")
+btcLen   = input.int(50, "Окно направления BTC", minval=5, maxval=500, group="⑥ Биткоин-контекст")
+useVolRatio = input.bool(true, "Нормировка волатильности к BTC", group="⑥ Биткоин-контекст",
+     tooltip="Отключаем входы, когда волатильность монеты аномально выше биткоина")
+volRatioMax = input.float(3.0, "Макс. волатильность / BTC", minval=1.0, maxval=10.0, step=0.5,
+     group="⑥ Биткоин-контекст", tooltip="Отношение ATR монеты к ATR биткоина: выше порога — пропускаем сигналы")
+
+// ─────────────────────────── ⑦ ИСТОРИЯ СДЕЛОК ───────────────────────────
+showHist   = input.bool(true, "Показывать историю сделок", group="⑦ История сделок",
+     tooltip="Таблица справа от графика, слева от панели метрик: направление, вход, выход, исход (ТЕЙК/СТОП/БУ/z-выход) и результат в R")
+histOpen   = input.bool(true, "История развернута", group="⑦ История сделок",
+     tooltip="Сворачивание/раскрытие меню истории одним переключателем")
+histMaxRows = input.int(15, "Строк в истории", minval=3, maxval=40, group="⑦ История сделок")
+
+// ───────────────────── ⑧ ДОП. СИГНАЛЫ (ОБЪЁМ И POC) ─────────────────────
+useExtra   = input.bool(true, "Доп. сигналы (объём + POC)", group="⑧ Доп. сигналы",
+     tooltip="Увеличивает частоту сигналов: мягкий z-порог с проверкой объёма и касания глобального POC")
+zEntry2    = input.float(1.2, "Мягкий z-порог", minval=0.8, maxval=2.5, step=0.1,
+     group="⑧ Доп. сигналы", tooltip="Цена пришла к границе MR (|z| ≥ порога) → проверка объёма → сигнал")
+useVolConf = input.bool(true, "Проверка объёма", group="⑧ Доп. сигналы",
+     tooltip="Сигнал подтверждается всплеском объёма относительно SMA(volume, 20)")
+volMult    = input.float(1.2, "Всплеск объёма, ×SMA20", minval=1.0, maxval=5.0, step=0.1, group="⑧ Доп. сигналы")
+usePocSig  = input.bool(true, "Сигналы от POC профиля", group="⑧ Доп. сигналы",
+     tooltip="Касание глобального Point of Control объёмного профиля даёт отдельный сигнал")
+pocLen     = input.int(2000, "Глубина профиля, баров", minval=200, maxval=5000, group="⑧ Доп. сигналы")
+pocBins    = input.int(50, "Корзины профиля", minval=20, maxval=100, group="⑧ Доп. сигналы")
+pocTol     = input.float(0.3, "Допуск до POC, ×ATR", minval=0.1, maxval=2.0, step=0.1, group="⑧ Доп. сигналы")
+useTrendDir = input.bool(true, "Фильтр направления тренда", group="③ Фильтры",
+     tooltip="Блокирует входы против тренда: LONG только выше EMA, SHORT только ниже — режет серии стопов в тренде")
+trendDirLen = input.int(100, "Окно тренда (EMA)", minval=50, maxval=500, group="③ Фильтры")
+useConfirm = input.bool(false, "Подтверждение ретестом границы", group="⑧ Доп. сигналы",
+     tooltip="Выключено по умолчанию — слишком жёстко режет частоту сигналов. Включите, если нужен максимальный винрейт в ущерб количеству сделок")
+
+// ─────────────────────────── ④ РИСК-МЕНЕДЖМЕНТ ───────────────────────────
+slMult  = input.float(2.0, "Stop-loss, ×ATR", minval=0.5, maxval=10.0, step=0.1,
+     group="④ Риск-менеджмент", tooltip="Риск на сделку: дистанция стопа в кратных ATR")
+tpMult  = input.float(6.0, "Take-profit, ×ATR", minval=0.5, maxval=30.0, step=0.1,
+     group="④ Риск-менеджмент", tooltip="Цель в кратных ATR: 6 / 2 = соотношение риск:доход 1:3")
+exitMode = input.string("Частичный тейк +1R", "Управление позицией", options=["Выход z→0", "Держать до SL/TP", "Безубыток +1R", "Частичный тейк +1R"],
+     group="④ Риск-менеджмент", tooltip="Частичный тейк: фикс 50% при +1R и перевод остатка в безубыток — больше зафиксированных выигрышей · Держать: каждый выигрыш даёт полные 3R · Безубыток: после +1R стоп на цену входа · z→0: ранний выход")
+beMult  = input.float(1.0, "Порог безубытка, ×R", minval=0.5, maxval=2.0, step=0.25,
+     group="④ Риск-менеджмент", tooltip="Сколько R прибыли нужно, чтобы перенести стоп на цену входа")
+useRisk = input.bool(true, "Риск-ориентированный объём", group="④ Риск-менеджмент",
+     tooltip="Объём = (капитал × риск%) / (SL-дистанция × ценность пункта)")
+riskPct = input.float(1.0, "Риск на сделку, % капитала", minval=0.1, maxval=10.0, step=0.1, group="④ Риск-менеджмент")
+
+// ─────────────────────────── ⑤ ОТОБРАЖЕНИЕ ───────────────────────────
+showBands = input.bool(true, "Полосы μ ± k·σ", group="⑤ Отображение")
+showDash  = input.bool(true, "Панель метрик", group="⑤ Отображение")
+compactMode = input.bool(false, "Компактный режим (мобильный)", group="⑤ Отображение",
+     tooltip="Для мобильного TradingView: панель сокращается до 5 ключевых метрик, история — только свёрнутая с итогами")
+dashPos = input.string("Верхний правый", "Позиция панели", options=["Верхний правый", "Правый по центру", "Нижний правый"],
+     group="⑤ Отображение", tooltip="На мобильном удобнее «Правый по центру» или «Нижний правый»")
+
+// ═══════════════════════════ ЯДРО МОДЕЛИ ═══════════════════════════
+// Выбор типа среднего μ
+f_mean(t, s, l) =>
+    switch t
+        "SMA"  => ta.sma(s, l)
+        "EMA"  => ta.ema(s, l)
+        "WMA"  => ta.wma(s, l)
+        "VWMA" => ta.vwma(s, l)
+        "HMA"  => ta.hma(s, l)
+        =>      ta.sma(s, l)
+
+src   = close
+mean  = f_mean(meanType, src, meanLen)
+sigma = ta.stdev(src, stdLen)
+z     = sigma > 0 ? (src - mean) / sigma : 0.0
+
+// Полосы канала реверсии
+upper = showBands ? mean + bandK * sigma : na
+lower = showBands ? mean - bandK * sigma : na
+
+// ── Оценка θ и полужизни: МНК-регрессия ΔS = a + b·S ──
+// Суммы МНК считаются на каждом баре в global scope — устраняет warning CW10003
+y     = src - src[1]
+x     = src[1]
+n     = hlLen
+sumX  = math.sum(x, n)
+sumY  = math.sum(y, n)
+sumXY = math.sum(x * y, n)
+sumXX = math.sum(x * x, n)
+
+var float halfLife = na
+var float theta    = na
+if bar_index > hlLen
+    denom    = n * sumXX - sumX * sumX
+    b        = denom != 0 ? (n * sumXY - sumX * sumY) / denom : na
+    theta    := b < 0 ? -b : na
+    halfLife := theta > 0 ? math.log(2) / theta : na
+
+hlOk = not useHL or (not na(halfLife) and halfLife >= hlMin and halfLife <= hlMax)
+
+// ── Режим волатильности: z-скор ATR в окне нормировки ──
+atr  = ta.atr(atrLen)
+atrM = ta.sma(atr, atrWin)
+atrS = ta.stdev(atr, atrWin)
+atrZ = atrS > 0 ? (atr - atrM) / atrS : 0.0
+volOk = not useVolR or (atrZ >= volZMin and atrZ <= volZMax)
+
+// ── Тренд: ADX ──
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxSm)
+trendOk = not useTrend or adx < adxMax
+
+// ── RSI ──
+rsi        = ta.rsi(src, rsiLen)
+rsiOkLong  = not useRSI or rsi <= rsiLo
+rsiOkShort = not useRSI or rsi >= rsiHi
+
+// ── Биткоин-контекст: корреляция Пирсона и приоритет направления ──
+btcClose = request.security(btcSym, timeframe.period, close)
+btcAtr   = request.security(btcSym, timeframe.period, ta.atr(atrLen))
+corr     = ta.correlation(src, btcClose, corrLen)
+btcMom   = ta.ema(btcClose, btcLen)
+btcDir   = btcClose > btcMom ? 1 : btcClose < btcMom ? -1 : 0
+// направление самой монеты: цена выше/ниже своей EMA того же окна
+coinMom  = ta.ema(src, btcLen)
+coinDir  = src > coinMom ? 1 : src < coinMom ? -1 : 0
+highCorr = not na(corr) and math.abs(corr) >= corrThr
+// приоритет: при высокой корреляции LONG только при бычьем BTC, SHORT — при медвежьем
+btcOkLong  = not useBtc or not highCorr or btcDir >= 0
+btcOkShort = not useBtc or not highCorr or btcDir <= 0
+// волатильность монеты относительно BTC
+volRatio   = atr > 0 and btcAtr > 0 ? atr / btcAtr : na
+volRatioOk = not useVolRatio or na(volRatio) or volRatio <= volRatioMax
+
+// ── Объём: всплеск относительно SMA(20) ──
+volAvgS   = ta.sma(volume, 20)
+volBurst  = volume > volAvgS * volMult
+volOK     = not useVolConf or volBurst
+volRatioV = volAvgS > 0 ? volume / volAvgS : na
+
+// ── Глобальный POC объёмного профиля (тяжёлый расчёт — только у полос) ──
+var float globalPoc = na
+var array<float> volBins = array.new_float(pocBins, 0.0)
+if useExtra and usePocSig and (z <= -zEntry2 or z >= zEntry2)
+    loN = ta.lowest(low, pocLen)
+    hiN = ta.highest(high, pocLen)
+    bsize = (hiN - loN) / pocBins
+    if bsize > 0
+        for b = 0 to pocBins - 1
+            array.set(volBins, b, 0.0)
+        for k = 0 to math.min(pocLen - 1, bar_index - 1)
+            bi = math.floor((close[k] - loN) / bsize)
+            bi := math.max(0, math.min(pocBins - 1, bi))
+            array.set(volBins, bi, array.get(volBins, bi) + volume[k])
+        maxVol = 0.0
+        maxIdx = 0
+        for b = 0 to pocBins - 1
+            if array.get(volBins, b) > maxVol
+                maxVol := array.get(volBins, b)
+                maxIdx := b
+        globalPoc := loN + bsize * (maxIdx + 0.5)
+
+// ── Направление тренда: EMA(trendDirLen) — блокирует входы против тренда ──
+trendDirEma = ta.ema(src, trendDirLen)
+trendUp     = close > trendDirEma
+longTrendOk  = not useTrendDir or trendUp
+shortTrendOk = not useTrendDir or not trendUp
+
+// ── Подтверждение: ретест границы канала (отсекает «падающие ножи») ──
+bandLow  = mean - bandK * sigma
+bandHigh = mean + bandK * sigma
+longConf   = not useConfirm or (close[1] < bandLow and close >= bandLow)
+shortConf  = not useConfirm or (close[1] > bandHigh and close <= bandHigh)
+longPocConf  = not useConfirm or close > (high + low) / 2
+shortPocConf = not useConfirm or close < (high + low) / 2
+
+// ── Доп. сигналы: мягкий z + объём · касание POC ──
+crossUnder2 = ta.crossunder(z, -zEntry2)
+crossOver2  = ta.crossover(z, zEntry2)
+pocNear      = useExtra and usePocSig and not na(globalPoc) and math.abs(close - globalPoc) <= pocTol * atr
+pocFromAbove = not na(globalPoc) and close[1] > globalPoc + pocTol * atr
+pocFromBelow = not na(globalPoc) and close[1] < globalPoc - pocTol * atr
+longPocSig  = pocNear and pocFromAbove and volOK and hlOk and volOk and trendOk and btcOkLong and volRatioOk and longTrendOk and longPocConf
+shortPocSig = pocNear and pocFromBelow and volOK and hlOk and volOk and trendOk and btcOkShort and volRatioOk and shortTrendOk and shortPocConf
+longVolSig  = useExtra and crossUnder2 and volOK and hlOk and volOk and trendOk and btcOkLong and volRatioOk and longTrendOk and longConf
+shortVolSig = useExtra and crossOver2 and volOK and hlOk and volOk and trendOk and btcOkShort and volRatioOk and shortTrendOk and shortConf
+
+// ── История сделок: состояние и массивы ──
+var int   mPos = 0              // 1 = LONG, -1 = SHORT (ручное отслеживание)
+var int   lastEntryBar = na
+var array<float> tDir     = array.new_float()
+var array<float> tEntryPx = array.new_float()
+var array<float> tExitPx  = array.new_float()
+var array<float> tRisk    = array.new_float()
+var array<float> tR       = array.new_float()
+var array<int>   tOutcome = array.new_int()
+var table histTbl = na
+var int   histRows = -1
+var bool  histWasOpen = false
+var float histSumR  = 0.0
+var int   histWins  = 0
+var int   histLosses = 0
+
+// ═══════════════════════════ СИГНАЛЫ ═══════════════════════════
+// z пробил нижний порог → статистическая перепроданность
+longSignal  = ta.crossunder(z, -zEntry)
+// z пробил верхний порог → статистическая перекупленность
+shortSignal = ta.crossover(z, zEntry)
+
+longMain  = longSignal and hlOk and volOk and trendOk and rsiOkLong  and btcOkLong  and volRatioOk and longTrendOk and longConf
+shortMain = shortSignal and hlOk and volOk and trendOk and rsiOkShort and btcOkShort and volRatioOk and shortTrendOk and shortConf
+
+// итоговые условия: точный z-пробой ИЛИ мягкий z + объём ИЛИ касание POC
+longCond  = (longMain or longVolSig or longPocSig) and mPos != 1
+shortCond = (shortMain or shortVolSig or shortPocSig) and mPos != -1
+
+// crossover/crossunder считаются на каждом баре — устраняет CW10002
+crossUp   = ta.crossover(z, zExit)
+crossDown = ta.crossunder(z, -zExit)
+exitLong  = exitMode == "Выход z→0" and crossUp and strategy.position_size > 0
+exitShort = exitMode == "Выход z→0" and crossDown and strategy.position_size < 0
+
+// ── Исполнение и риск-менеджмент ──
+var float longStop  = na
+var float longTp    = na
+var float shortStop = na
+var float shortTp   = na
+var float entryPx   = na
+var bool  beDone    = false
+
+// признаки исхода для истории сделок (после объявления уровней)
+longSlHitS  = mPos == 1  and close <= longStop
+longTpHitS  = mPos == 1  and close >= longTp
+shortSlHitS = mPos == -1 and close >= shortStop
+shortTpHitS = mPos == -1 and close <= shortTp
+
+if longCond
+    entryPx := close
+    beDone  := false
+    longStop := close - slMult * atr
+    longTp   := close + tpMult * atr
+    mPos := 1
+    lastEntryBar := bar_index
+    array.push(tDir, 1.0)
+    array.push(tEntryPx, close)
+    array.push(tRisk, slMult * atr)
+    if useRisk
+        riskPerQty = math.max(slMult * atr * syminfo.pointvalue, 1e-9)
+        qty = strategy.equity * riskPct / 100 / riskPerQty
+        strategy.entry("Long", strategy.long, qty=qty)
+    else
+        strategy.entry("Long", strategy.long)
+    strategy.exit("Long SL/TP", from_entry="Long", stop=longStop, limit=longTp)
+    if exitMode == "Частичный тейк +1R"
+        strategy.exit("Long TP1", from_entry="Long", qty_percent=50, limit=close + slMult * atr)
+
+if shortCond
+    entryPx := close
+    beDone  := false
+    shortStop := close + slMult * atr
+    shortTp   := close - tpMult * atr
+    mPos := -1
+    lastEntryBar := bar_index
+    array.push(tDir, -1.0)
+    array.push(tEntryPx, close)
+    array.push(tRisk, slMult * atr)
+    if useRisk
+        riskPerQty = math.max(slMult * atr * syminfo.pointvalue, 1e-9)
+        qty = strategy.equity * riskPct / 100 / riskPerQty
+        strategy.entry("Short", strategy.short, qty=qty)
+    else
+        strategy.entry("Short", strategy.short)
+    strategy.exit("Short SL/TP", from_entry="Short", stop=shortStop, limit=shortTp)
+    if exitMode == "Частичный тейк +1R"
+        strategy.exit("Short TP1", from_entry="Short", qty_percent=50, limit=close - slMult * atr)
+
+// Выход по возврату z к среднему (только режим "Выход z→0")
+if exitLong
+    strategy.close("Long", comment="z→0")
+if exitShort
+    strategy.close("Short", comment="z→0")
+
+// ── Безубыток / Частичный тейк: после +1R стоп переносится на цену входа ──
+if (exitMode == "Безубыток +1R" or exitMode == "Частичный тейк +1R") and not beDone and strategy.position_size != 0
+    if strategy.position_size > 0 and close >= entryPx + beMult * slMult * atr
+        beDone := true
+        longStop := entryPx
+        strategy.cancel("Long SL/TP")
+        strategy.exit("Long SL/TP BE", from_entry="Long", stop=entryPx, limit=entryPx + tpMult * atr)
+    if strategy.position_size < 0 and close <= entryPx - beMult * slMult * atr
+        beDone := true
+        shortStop := entryPx
+        strategy.cancel("Short SL/TP")
+        strategy.exit("Short SL/TP BE", from_entry="Short", stop=entryPx, limit=entryPx - tpMult * atr)
+
+// ── История сделок: запись исхода при закрытии позиции ──
+if mPos == 1 and strategy.position_size <= 0 and bar_index > lastEntryBar
+    outH  = longTpHitS ? 0 : (beDone and close <= entryPx) ? 2 : longSlHitS ? 1 : 3
+    riskH = array.get(tRisk, array.size(tRisk) - 1)
+    rBase = riskH > 0 ? (close - entryPx) / riskH : 0.0
+    array.push(tDir, 1.0)
+    array.push(tEntryPx, entryPx)
+    array.push(tExitPx, close)
+    array.push(tOutcome, outH)
+    array.push(tR, exitMode == "Частичный тейк +1R" ? 0.5 + 0.5 * rBase : rBase)
+    mPos := 0
+if mPos == -1 and strategy.position_size >= 0 and bar_index > lastEntryBar
+    outH  = shortTpHitS ? 0 : (beDone and close >= entryPx) ? 2 : shortSlHitS ? 1 : 3
+    riskH = array.get(tRisk, array.size(tRisk) - 1)
+    rBase = riskH > 0 ? (entryPx - close) / riskH : 0.0
+    array.push(tDir, -1.0)
+    array.push(tEntryPx, entryPx)
+    array.push(tExitPx, close)
+    array.push(tOutcome, outH)
+    array.push(tR, exitMode == "Частичный тейк +1R" ? 0.5 + 0.5 * rBase : rBase)
+    mPos := 0
+if array.size(tR) > 100
+    overflow = array.size(tR) - 100
+    for k = 0 to overflow - 1
+        array.remove(tDir, 0)
+        array.remove(tEntryPx, 0)
+        array.remove(tExitPx, 0)
+        array.remove(tRisk, 0)
+        array.remove(tOutcome, 0)
+        array.remove(tR, 0)
+
+// ── Композитная метрика MR Score: 0..100 ──
+mrScore = math.max(0, math.min(100, 50 + z * 10))
+
+// ═══════════════════════════ ВИЗУАЛИЗАЦИЯ ═══════════════════════════
+plot(mean, "Среднее μ", color=color.new(#f59e0b, 0), linewidth=2)
+uPlot = plot(upper, "Верхняя полоса +kσ", color=color.new(#ef4444, 40), linewidth=1)
+lPlot = plot(lower, "Нижняя полоса −kσ", color=color.new(#22c55e, 40), linewidth=1)
+fill(uPlot, lPlot, color=color.new(#3b82f6, 92), title="Канал реверсии")
+
+bgcolor(z >= zEntry ? color.new(color.red, 90) : z <= -zEntry ? color.new(color.green, 90) : na,
+     title="Зона статистического экстремума")
+
+plotshape(longCond, "LONG сигнал", shape.labelup, location.belowbar,
+     color.new(#22c55e, 0), text="L", textcolor=color.white, size=size.small)
+plotshape(shortCond, "SHORT сигнал", shape.labeldown, location.abovebar,
+     color.new(#ef4444, 0), text="S", textcolor=color.white, size=size.small)
+
+// ── Панель: метрики + ИСТОРИЯ СДЕЛОК ПОД НИМИ (одна таблица, без наложений) ──
+var table dash = na
+var int   dashRows = -1
+
+// позиция панели (на мобильном удобнее центр или низ)
+dashPosVal = dashPos == "Верхний правый" ? position.top_right : dashPos == "Правый по центру" ? position.middle_right : position.bottom_right
+
+if barstate.islast and showDash
+    histCount = array.size(tR)
+    // компактный режим (мобильный): метрики сокращены, история только свёрнутая
+    nShown    = not compactMode and histOpen ? math.min(histCount, histMaxRows) : 0
+    histLines = showHist ? (histOpen and not compactMode ? nShown + 2 : 2) : 0
+    metricLines = compactMode ? 5 : 17
+    rowsNeeded = 1 + metricLines + histLines + (showHist ? 2 : 0)
+    histHdr = 1 + metricLines
+    sumRow0 = histHdr + histLines
+    sumRow1 = sumRow0 + 1
+    if na(dash) or dashRows != rowsNeeded
+        if not na(dash)
+            table.delete(dash)
+        dash := table.new(dashPosVal, 6, rowsNeeded, bgcolor=color.new(#131722, 15),
+             border_width=1, border_color=color.new(#363a45, 30))
+        dashRows := rowsNeeded
+    // ── метрики: подпись слева (колонки 0..3), значение справа (4..5) ──
+    table.merge_cells(dash, 0, 0, 5, 0)
+    table.cell(dash, 0, 0, "MR QUANT PRO", text_color=#f59e0b, text_size=size.normal, bgcolor=color.new(#1e222d, 0))
+    if compactMode
+        table.merge_cells(dash, 0, 1, 3, 1)
+        table.cell(dash, 0, 1, "Z-score", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 1, 5, 1)
+        table.cell(dash, 4, 1, str.tostring(z, "#.##"), text_halign=text.align_right, text_color=z < 0 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.tiny)
+        table.merge_cells(dash, 0, 2, 3, 2)
+        table.cell(dash, 0, 2, "Корр ρ BTC", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 2, 5, 2)
+        table.cell(dash, 4, 2, na(corr) ? "—" : str.tostring(corr, "#.##"), text_halign=text.align_right, text_color=highCorr ? color.new(#f59e0b, 0) : color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 0, 3, 3, 3)
+        table.cell(dash, 0, 3, "BTC", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 3, 5, 3)
+        table.cell(dash, 4, 3, btcDir > 0 ? "▲ LONG" : btcDir < 0 ? "▼ SHORT" : "нейтр.", text_halign=text.align_right, text_color=btcDir > 0 ? color.new(#22c55e, 0) : btcDir < 0 ? color.new(#ef4444, 0) : color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 0, 4, 3, 4)
+        table.cell(dash, 0, 4, "Цена входа", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 4, 5, 4)
+        table.cell(dash, 4, 4, na(entryPx) ? "—" : str.tostring(entryPx, format.mintick), text_halign=text.align_right, text_color=color.new(#38bdf8, 0), text_size=size.tiny)
+        table.merge_cells(dash, 0, 5, 3, 5)
+        table.cell(dash, 0, 5, "MR Score", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 5, 5, 5)
+        table.cell(dash, 4, 5, str.tostring(mrScore, "0"), text_halign=text.align_right, text_color=color.new(#a78bfa, 0), text_size=size.tiny)
+    else
+        table.merge_cells(dash, 0, 1, 3, 1)
+        table.cell(dash, 0, 1, "Z-score", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 1, 5, 1)
+        table.cell(dash, 4, 1, str.tostring(z, "#.##"), text_halign=text.align_right, text_color=z < 0 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 2, 3, 2)
+        table.cell(dash, 0, 2, "Среднее μ", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 2, 5, 2)
+        table.cell(dash, 4, 2, str.tostring(mean, format.mintick), text_halign=text.align_right, text_color=#f59e0b, text_size=size.small)
+        table.merge_cells(dash, 0, 3, 3, 3)
+        table.cell(dash, 0, 3, "Сигма σ", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 3, 5, 3)
+        table.cell(dash, 4, 3, str.tostring(sigma, format.mintick), text_halign=text.align_right, text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 4, 3, 4)
+        table.cell(dash, 0, 4, "Полужизнь T½", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 4, 5, 4)
+        table.cell(dash, 4, 4, na(halfLife) ? "—" : str.tostring(halfLife, "0") + " бар", text_halign=text.align_right, text_color=color.new(#38bdf8, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 5, 3, 5)
+        table.cell(dash, 0, 5, "ATR z-score", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 5, 5, 5)
+        table.cell(dash, 4, 5, str.tostring(atrZ, "#.##"), text_halign=text.align_right, text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 6, 3, 6)
+        table.cell(dash, 0, 6, "ADX", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 6, 5, 6)
+        table.cell(dash, 4, 6, str.tostring(adx, "#.#"), text_halign=text.align_right, text_color=trendOk ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 7, 3, 7)
+        table.cell(dash, 0, 7, "DI+ / DI−", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 7, 5, 7)
+        table.cell(dash, 4, 7, str.tostring(diPlus, "#.#") + " / " + str.tostring(diMinus, "#.#"), text_halign=text.align_right, text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 8, 3, 8)
+        table.cell(dash, 0, 8, "RSI", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 8, 5, 8)
+        table.cell(dash, 4, 8, str.tostring(rsi, "#.#"), text_halign=text.align_right, text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 9, 3, 9)
+        table.cell(dash, 0, 9, "Цена входа", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 9, 5, 9)
+        table.cell(dash, 4, 9, na(entryPx) ? "—" : str.tostring(entryPx, format.mintick), text_halign=text.align_right, text_color=color.new(#38bdf8, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 10, 3, 10)
+        table.cell(dash, 0, 10, "Корреляция ρ BTC", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 10, 5, 10)
+        table.cell(dash, 4, 10, na(corr) ? "—" : str.tostring(corr, "#.##"), text_halign=text.align_right, text_color=highCorr ? color.new(#f59e0b, 0) : color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 11, 3, 11)
+        table.cell(dash, 0, 11, "BTC направление", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 11, 5, 11)
+        table.cell(dash, 4, 11, btcDir > 0 ? "▲ LONG-приоритет" : btcDir < 0 ? "▼ SHORT-приоритет" : "нейтрально", text_halign=text.align_right, text_color=btcDir > 0 ? color.new(#22c55e, 0) : btcDir < 0 ? color.new(#ef4444, 0) : color.new(#b2b5be, 0), text_size=size.small)
+        coinCol = coinDir > 0 ? color.new(#22c55e, 0) : coinDir < 0 ? color.new(#ef4444, 0) : color.new(#b2b5be, 0)
+        // янтарным — расхождение монеты с BTC при высокой корреляции (зона риска)
+        coinCol := highCorr and coinDir != 0 and btcDir != 0 and coinDir != btcDir ? color.new(#f59e0b, 0) : coinCol
+        table.merge_cells(dash, 0, 12, 3, 12)
+        table.cell(dash, 0, 12, "Направление монеты", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 12, 5, 12)
+        table.cell(dash, 4, 12, coinDir > 0 ? "▲ LONG" : coinDir < 0 ? "▼ SHORT" : "нейтрально", text_halign=text.align_right, text_color=coinCol, text_size=size.small)
+        table.merge_cells(dash, 0, 13, 3, 13)
+        table.cell(dash, 0, 13, "Волат. / BTC", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 13, 5, 13)
+        table.cell(dash, 4, 13, na(volRatio) ? "—" : str.tostring(volRatio, "#.##") + "x", text_halign=text.align_right, text_color=volRatioOk ? color.new(#b2b5be, 0) : color.new(#ef4444, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 14, 3, 14)
+        table.cell(dash, 0, 14, "MR Score 0..100", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 14, 5, 14)
+        table.cell(dash, 4, 14, str.tostring(mrScore, "0"), text_halign=text.align_right, text_color=color.new(#a78bfa, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 15, 3, 15)
+        table.cell(dash, 0, 15, "POC профиля", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 15, 5, 15)
+        table.cell(dash, 4, 15, na(globalPoc) ? "—" : str.tostring(globalPoc, format.mintick), text_halign=text.align_right, text_color=color.new(#a78bfa, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 16, 3, 16)
+        table.cell(dash, 0, 16, "Объём / SMA20", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 16, 5, 16)
+        table.cell(dash, 4, 16, na(volRatioV) ? "—" : str.tostring(volRatioV, "#.##") + "x", text_halign=text.align_right, text_color=volBurst ? color.new(#f59e0b, 0) : color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 17, 3, 17)
+        table.cell(dash, 0, 17, "Тренд EMA" + str.tostring(trendDirLen), text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 17, 5, 17)
+        table.cell(dash, 4, 17, trendUp ? "▲ выше — LONG-зона" : "▼ ниже — SHORT-зона", text_halign=text.align_right, text_color=trendUp ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+    // ── ИСТОРИЯ СДЕЛОК (ниже метрик, в этой же таблице) ──
+    
+    if showHist
+        table.merge_cells(dash, 0, histHdr, 5, histHdr)
+        table.cell(dash, 0, histHdr, histOpen and not compactMode ? "ИСТОРИЯ СДЕЛОК ▾ (" + str.tostring(histCount) + ")" : "ИСТОРИЯ СДЕЛОК ▸ (" + str.tostring(histCount) + ")", text_color=#f59e0b, text_size=size.tiny, bgcolor=color.new(#1e222d, 0))
+        if histOpen and not compactMode
+            table.cell(dash, 0, histHdr + 1, "№", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 1, histHdr + 1, "Напр.", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 2, histHdr + 1, "Вход", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 3, histHdr + 1, "Выход", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 4, histHdr + 1, "Исход", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 5, histHdr + 1, "R", text_color=#8a93a5, text_size=size.tiny)
+            for j = 0 to nShown - 1
+                i = histCount - 1 - j
+                row = histHdr + 2 + j
+                isLong = array.get(tDir, i) > 0
+                table.cell(dash, 0, row, str.tostring(i + 1), text_color=#b2b5be, text_size=size.small)
+                table.cell(dash, 1, row, isLong ? "LONG" : "SHORT", text_color=isLong ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+                table.cell(dash, 2, row, str.tostring(array.get(tEntryPx, i), format.mintick), text_color=#b2b5be, text_size=size.small)
+                table.cell(dash, 3, row, str.tostring(array.get(tExitPx, i), format.mintick), text_color=#b2b5be, text_size=size.small)
+                outH = array.get(tOutcome, i)
+                outTxt = outH == 0 ? "ТЕЙК" : outH == 1 ? "СТОП" : outH == 2 ? "БУ" : "z-выход"
+                outCol = outH == 0 ? color.new(#22c55e, 0) : outH == 1 ? color.new(#ef4444, 0) : outH == 2 ? color.new(#f59e0b, 0) : color.new(#38bdf8, 0)
+                table.cell(dash, 4, row, outTxt, text_color=outCol, text_size=size.small)
+                rVal = array.get(tR, i)
+                table.cell(dash, 5, row, (rVal >= 0 ? "+" : "") + str.tostring(rVal, "#.##") + "R", text_color=rVal >= 0 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+        else
+            table.merge_cells(dash, 0, histHdr + 1, 5, histHdr + 1)
+            table.cell(dash, 0, histHdr + 1, "Сделок: " + str.tostring(histCount) + " · раскрыть: настройки → ⑦ История сделок", text_color=#b2b5be, text_size=size.tiny)
+        // ── итоги истории: общий R и % выигрышей ──
+        histSumR := 0.0
+        histWins := 0
+        histLosses := 0
+        for k = 0 to histCount - 1
+            rVal2 = array.get(tR, k)
+            histSumR += rVal2
+            if rVal2 > 0
+                histWins += 1
+            else if rVal2 < 0
+                histLosses += 1
+        histWR = histWins + histLosses > 0 ? 100.0 * histWins / (histWins + histLosses) : na
+        table.merge_cells(dash, 0, sumRow0, 3, sumRow0)
+        table.cell(dash, 0, sumRow0, "Общий R", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, sumRow0, 5, sumRow0)
+        table.cell(dash, 4, sumRow0, (histSumR >= 0 ? "+" : "") + str.tostring(histSumR, "#.##") + "R", text_halign=text.align_right, text_color=histSumR >= 0 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+        table.merge_cells(dash, 0, sumRow1, 3, sumRow1)
+        table.cell(dash, 0, sumRow1, "Выигрыши", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, sumRow1, 5, sumRow1)
+        table.cell(dash, 4, sumRow1, na(histWR) ? "—" : str.tostring(histWins, "0") + " (" + str.tostring(histWR, "0.0") + "%)", text_halign=text.align_right, text_color=na(histWR) ? color.new(#b2b5be, 0) : histWR >= 50 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+else if barstate.islast and not showDash
+    if not na(dash)
+        table.delete(dash)
+        dash := na
+        dashRows := -1
+
+// (история сделок объединена с панелью метрик — см. блок «Панель: метрики + ИСТОРИЯ СДЕЛОК» выше)
+
+// ── Алерты: динамические сообщения по типу сигнала ──
+msgBase = syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(close, format.mintick) + " | z = " + str.tostring(z, "#.##") + " | SL " + str.tostring(close - slMult * atr, format.mintick) + " | TP " + str.tostring(close + tpMult * atr, format.mintick) + " | R:R 1:3"
+if longMain
+    alert("🟢 MRQ LONG (z): " + msgBase, alert.freq_once_per_bar_close)
+if shortMain
+    alert("🔴 MRQ SHORT (z): " + msgBase, alert.freq_once_per_bar_close)
+if longVolSig
+    alert("🟩 MRQ LONG (объём): " + msgBase, alert.freq_once_per_bar_close)
+if shortVolSig
+    alert("🟥 MRQ SHORT (объём): " + msgBase, alert.freq_once_per_bar_close)
+if longPocSig
+    alert("🔶 MRQ LONG (POC): " + msgBase + " | POC " + str.tostring(globalPoc, format.mintick), alert.freq_once_per_bar_close)
+if shortPocSig
+    alert("🔶 MRQ SHORT (POC): " + msgBase + " | POC " + str.tostring(globalPoc, format.mintick), alert.freq_once_per_bar_close)
+if strategy.position_size[1] != 0 and strategy.position_size == 0
+    alert("🔵 MRQ ВЫХОД: " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+</script>
+
+<script type="text/plain" id="pine-indicator">
+//@version=6
+// ═══════════════════════════════════════════════════════════════════
+//  MEAN REVERSION QUANT PRO  v1.1 · ИНДИКАТОР
+//  ⚠️ ЭТО ИНДИКАТОР: показывает сигналы и уровни, но НЕ ТЕСТИРУЕТСЯ.
+//  Для бэктеста в Strategy Tester используйте версию «Стратегия».
+//  Математическая модель возврата к среднему (Mean Reversion)
+//  ───────────────────────────────────────────────────────────────
+//  МОДЕЛЬ:
+//    • z-скор:      z = (price − μ) / σ
+//    • Полосы:      μ ± k·σ
+//    • ОУ-процесс:  dS = θ(μ − S)dt + σ·dW  →  полужизнь T½ = ln(2)/θ
+//    • Режим волат.: z-скор ATR (окно нормировки)
+//    • Тренд:       ADX · Подтверждение: RSI
+//    • Риск:        линии SL/TP в кратных ATR по последнему сигналу
+// ═══════════════════════════════════════════════════════════════════
+indicator("Mean Reversion Quant Pro", shorttitle="MRQ Pro", overlay=true,
+     max_labels_count=500, max_lines_count=500)
+
+// ─────────────────────────── ① МОДЕЛЬ СРЕДНЕГО ───────────────────────────
+meanType = input.string("EMA", "Тип среднего μ",
+     options=["SMA", "EMA", "WMA", "VWMA", "HMA"], group="① Модель среднего",
+     tooltip="Ядро модели: оценка равновесного уровня, к которому возвращается цена")
+meanLen  = input.int(20, "Период среднего μ", minval=2, maxval=500, group="① Модель среднего")
+stdLen   = input.int(20, "Период σ (волатильность)", minval=2, maxval=500, group="① Модель среднего")
+zEntry   = input.float(2.0, "Z-score входа", minval=0.5, maxval=5.0, step=0.1,
+     group="① Модель среднего", tooltip="Статистический порог открытия: |z| ≥ zEntry (≈95% событий внутри ±2σ)")
+zExit    = input.float(0.0, "Z-score выхода", minval=-2.0, maxval=2.0, step=0.1,
+     group="① Модель среднего", tooltip="Закрытие позиции, когда z возвращается к этому уровню (0 = среднее)")
+bandK    = input.float(2.0, "Множитель полос k·σ", minval=0.5, maxval=4.0, step=0.1, group="① Модель среднего")
+
+// ─────────────────────────── ② ПОЛУЖИЗНЬ (OU) ───────────────────────────
+useHL  = input.bool(true, "Фильтр полужизни (OU)", group="② Полужизнь (ОУ)",
+     tooltip="Торгуем только инструменты, где средняя реверсия статистически значима")
+hlLen  = input.int(100, "Окно оценки θ", minval=20, maxval=1000, group="② Полужизнь (ОУ)")
+hlMin  = input.float(5.0, "Мин. полужизнь, баров", minval=1.0, maxval=100.0, group="② Полужизнь (ОУ)")
+hlMax  = input.float(300.0, "Макс. полужизнь, баров", minval=10.0, maxval=2000.0, group="② Полужизнь (ОУ)")
+
+// ─────────────────────────── ③ ФИЛЬТРЫ ───────────────────────────
+useVolR  = input.bool(true, "Фильтр режима волатильности", group="③ Фильтры")
+atrLen   = input.int(14, "ATR период", minval=2, maxval=100, group="③ Фильтры")
+atrWin   = input.int(100, "Окно нормировки ATR", minval=20, maxval=1000, group="③ Фильтры")
+volZMin  = input.float(0.0, "Мин. ATR z-score", minval=-5.0, maxval=5.0, step=0.1, group="③ Фильтры")
+volZMax  = input.float(2.0, "Макс. ATR z-score", minval=-5.0, maxval=5.0, step=0.1,
+     group="③ Фильтры", tooltip="Входы только при повышенной, но не экстремальной волатильности")
+useTrend = input.bool(true, "Трендовый фильтр (ADX)", group="③ Фильтры")
+adxLen   = input.int(14, "ADX период", minval=2, maxval=100, group="③ Фильтры")
+adxSm    = input.int(14, "ADX сглаживание", minval=1, maxval=100,
+     group="③ Фильтры", tooltip="v6: ta.dmi требует константу simple int (ошибка CE10123), а не series")
+adxMax   = input.float(25.0, "Макс. ADX для входов", minval=5.0, maxval=60.0, step=1.0,
+     group="③ Фильтры", tooltip="В сильном тренде средняя реверсия не работает — пропускаем вход")
+useRSI   = input.bool(true, "Подтверждение RSI", group="③ Фильтры")
+rsiLen   = input.int(14, "RSI период", minval=2, maxval=100, group="③ Фильтры")
+rsiLo    = input.float(30.0, "Порог перепроданности", minval=1.0, maxval=49.0, group="③ Фильтры")
+rsiHi    = input.float(70.0, "Порог перекупленности", minval=51.0, maxval=99.0, group="③ Фильтры")
+
+// ──────────────────── ⑥ БИТКОИН-КОНТЕКСТ И ВОЛАТИЛЬНОСТЬ ────────────────────
+useBtc   = input.bool(true, "Фильтр корреляции с BTC", group="⑥ Биткоин-контекст",
+     tooltip="При высокой корреляции с биткоином сигналы получают приоритет по направлению движения BTC")
+btcSym   = input.string("BINANCE:BTCUSDT", "Тикер BTC", group="⑥ Биткоин-контекст",
+     tooltip="Символ для расчёта корреляции; на некрипто-инструментах фильтр можно отключить")
+corrLen  = input.int(100, "Окно корреляции", minval=10, maxval=1000, group="⑥ Биткоин-контекст")
+corrThr  = input.float(0.6, "Порог корреляции |ρ|", minval=0.1, maxval=0.95, step=0.05,
+     group="⑥ Биткоин-контекст", tooltip="Если |ρ| ≥ порога — монета «ходит за битком», действует приоритет направления BTC")
+btcLen   = input.int(50, "Окно направления BTC", minval=5, maxval=500, group="⑥ Биткоин-контекст")
+useVolRatio = input.bool(true, "Нормировка волатильности к BTC", group="⑥ Биткоин-контекст",
+     tooltip="Отключаем входы, когда волатильность монеты аномально выше биткоина")
+volRatioMax = input.float(3.0, "Макс. волатильность / BTC", minval=1.0, maxval=10.0, step=0.5,
+     group="⑥ Биткоин-контекст", tooltip="Отношение ATR монеты к ATR биткоина: выше порога — пропускаем сигналы")
+
+// ─────────────────────────── ⑦ ИСТОРИЯ СДЕЛОК ───────────────────────────
+showHist   = input.bool(true, "Показывать историю сделок", group="⑦ История сделок",
+     tooltip="Таблица справа от графика, слева от панели метрик: направление, вход, выход, исход (ТЕЙК/СТОП/БУ/z-выход) и результат в R")
+histOpen   = input.bool(true, "История развернута", group="⑦ История сделок",
+     tooltip="Сворачивание/раскрытие меню истории одним переключателем")
+histMaxRows = input.int(15, "Строк в истории", minval=3, maxval=40, group="⑦ История сделок")
+
+// ───────────────────── ⑧ ДОП. СИГНАЛЫ (ОБЪЁМ И POC) ─────────────────────
+useExtra   = input.bool(true, "Доп. сигналы (объём + POC)", group="⑧ Доп. сигналы",
+     tooltip="Увеличивает частоту сигналов: мягкий z-порог с проверкой объёма и касания глобального POC")
+zEntry2    = input.float(1.2, "Мягкий z-порог", minval=0.8, maxval=2.5, step=0.1,
+     group="⑧ Доп. сигналы", tooltip="Цена пришла к границе MR (|z| ≥ порога) → проверка объёма → сигнал")
+useVolConf = input.bool(true, "Проверка объёма", group="⑧ Доп. сигналы",
+     tooltip="Сигнал подтверждается всплеском объёма относительно SMA(volume, 20)")
+volMult    = input.float(1.2, "Всплеск объёма, ×SMA20", minval=1.0, maxval=5.0, step=0.1, group="⑧ Доп. сигналы")
+usePocSig  = input.bool(true, "Сигналы от POC профиля", group="⑧ Доп. сигналы",
+     tooltip="Касание глобального Point of Control объёмного профиля даёт отдельный сигнал")
+pocLen     = input.int(2000, "Глубина профиля, баров", minval=200, maxval=5000, group="⑧ Доп. сигналы")
+pocBins    = input.int(50, "Корзины профиля", minval=20, maxval=100, group="⑧ Доп. сигналы")
+pocTol     = input.float(0.3, "Допуск до POC, ×ATR", minval=0.1, maxval=2.0, step=0.1, group="⑧ Доп. сигналы")
+useTrendDir = input.bool(true, "Фильтр направления тренда", group="③ Фильтры",
+     tooltip="Блокирует входы против тренда: LONG только выше EMA, SHORT только ниже — режет серии стопов в тренде")
+trendDirLen = input.int(100, "Окно тренда (EMA)", minval=50, maxval=500, group="③ Фильтры")
+useConfirm = input.bool(false, "Подтверждение ретестом границы", group="⑧ Доп. сигналы",
+     tooltip="Выключено по умолчанию — слишком жёстко режет частоту сигналов. Включите, если нужен максимальный винрейт в ущерб количеству сделок")
+
+// ─────────────────────── ④ РИСК-УРОВНИ (SL/TP) ───────────────────────
+slMult = input.float(2.0, "Stop-loss, ×ATR", minval=0.5, maxval=10.0, step=0.1,
+     group="④ Риск-уровни (SL/TP)", tooltip="Риск на сделку: дистанция стопа в кратных ATR")
+tpMult = input.float(6.0, "Take-profit, ×ATR", minval=0.5, maxval=30.0, step=0.1,
+     group="④ Риск-уровни (SL/TP)", tooltip="Цель в кратных ATR: 6 / 2 = соотношение риск:доход 1:3")
+exitMode = input.string("Частичный тейк +1R", "Управление позицией", options=["Выход z→0", "Держать до SL/TP", "Безубыток +1R", "Частичный тейк +1R"],
+     group="④ Риск-уровни (SL/TP)", tooltip="Частичный тейк: фикс 50% при +1R и перевод остатка в безубыток — больше зафиксированных выигрышей · Держать: каждый выигрыш даёт полные 3R · Безубыток: после +1R стоп на цену входа · z→0: ранний выход")
+beMult  = input.float(1.0, "Порог безубытка, ×R", minval=0.5, maxval=2.0, step=0.25,
+     group="④ Риск-уровни (SL/TP)", tooltip="Сколько R прибыли нужно, чтобы перенести стоп на цену входа")
+
+// ─────────────────────────── ⑤ ОТОБРАЖЕНИЕ ───────────────────────────
+showBands = input.bool(true, "Полосы μ ± k·σ", group="⑤ Отображение")
+showDash  = input.bool(true, "Панель метрик", group="⑤ Отображение")
+compactMode = input.bool(false, "Компактный режим (мобильный)", group="⑤ Отображение",
+     tooltip="Для мобильного TradingView: панель сокращается до 5 ключевых метрик, история — только свёрнутая с итогами")
+dashPos = input.string("Верхний правый", "Позиция панели", options=["Верхний правый", "Правый по центру", "Нижний правый"],
+     group="⑤ Отображение", tooltip="На мобильном удобнее «Правый по центру» или «Нижний правый»")
+
+// ═══════════════════════════ ЯДРО МОДЕЛИ ═══════════════════════════
+// Выбор типа среднего μ
+f_mean(t, s, l) =>
+    switch t
+        "SMA"  => ta.sma(s, l)
+        "EMA"  => ta.ema(s, l)
+        "WMA"  => ta.wma(s, l)
+        "VWMA" => ta.vwma(s, l)
+        "HMA"  => ta.hma(s, l)
+        =>      ta.sma(s, l)
+
+src   = close
+mean  = f_mean(meanType, src, meanLen)
+sigma = ta.stdev(src, stdLen)
+z     = sigma > 0 ? (src - mean) / sigma : 0.0
+
+// Полосы канала реверсии
+upper = showBands ? mean + bandK * sigma : na
+lower = showBands ? mean - bandK * sigma : na
+
+// ── Оценка θ и полужизни: МНК-регрессия ΔS = a + b·S ──
+// Суммы МНК считаются на каждом баре в global scope — устраняет warning CW10003
+y     = src - src[1]
+x     = src[1]
+n     = hlLen
+sumX  = math.sum(x, n)
+sumY  = math.sum(y, n)
+sumXY = math.sum(x * y, n)
+sumXX = math.sum(x * x, n)
+
+var float halfLife = na
+var float theta    = na
+if bar_index > hlLen
+    denom    = n * sumXX - sumX * sumX
+    b        = denom != 0 ? (n * sumXY - sumX * sumY) / denom : na
+    theta    := b < 0 ? -b : na
+    halfLife := theta > 0 ? math.log(2) / theta : na
+
+hlOk = not useHL or (not na(halfLife) and halfLife >= hlMin and halfLife <= hlMax)
+
+// ── Режим волатильности: z-скор ATR в окне нормировки ──
+atr  = ta.atr(atrLen)
+atrM = ta.sma(atr, atrWin)
+atrS = ta.stdev(atr, atrWin)
+atrZ = atrS > 0 ? (atr - atrM) / atrS : 0.0
+volOk = not useVolR or (atrZ >= volZMin and atrZ <= volZMax)
+
+// ── Тренд: ADX (v6: сглаживание — константа simple int) ──
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxSm)
+trendOk = not useTrend or adx < adxMax
+
+// ── RSI ──
+rsi        = ta.rsi(src, rsiLen)
+rsiOkLong  = not useRSI or rsi <= rsiLo
+rsiOkShort = not useRSI or rsi >= rsiHi
+
+// ── Биткоин-контекст: корреляция Пирсона и приоритет направления ──
+btcClose = request.security(btcSym, timeframe.period, close)
+btcAtr   = request.security(btcSym, timeframe.period, ta.atr(atrLen))
+corr     = ta.correlation(src, btcClose, corrLen)
+btcMom   = ta.ema(btcClose, btcLen)
+btcDir   = btcClose > btcMom ? 1 : btcClose < btcMom ? -1 : 0
+// направление самой монеты: цена выше/ниже своей EMA того же окна
+coinMom  = ta.ema(src, btcLen)
+coinDir  = src > coinMom ? 1 : src < coinMom ? -1 : 0
+highCorr = not na(corr) and math.abs(corr) >= corrThr
+// приоритет: при высокой корреляции LONG только при бычьем BTC, SHORT — при медвежьем
+btcOkLong  = not useBtc or not highCorr or btcDir >= 0
+btcOkShort = not useBtc or not highCorr or btcDir <= 0
+// волатильность монеты относительно BTC
+volRatio   = atr > 0 and btcAtr > 0 ? atr / btcAtr : na
+volRatioOk = not useVolRatio or na(volRatio) or volRatio <= volRatioMax
+
+// ── Объём: всплеск относительно SMA(20) ──
+volAvgS   = ta.sma(volume, 20)
+volBurst  = volume > volAvgS * volMult
+volOK     = not useVolConf or volBurst
+volRatioV = volAvgS > 0 ? volume / volAvgS : na
+
+// ── Глобальный POC объёмного профиля (тяжёлый расчёт — только у полос) ──
+var float globalPoc = na
+var array<float> volBins = array.new_float(pocBins, 0.0)
+if useExtra and usePocSig and (z <= -zEntry2 or z >= zEntry2)
+    loN = ta.lowest(low, pocLen)
+    hiN = ta.highest(high, pocLen)
+    bsize = (hiN - loN) / pocBins
+    if bsize > 0
+        for b = 0 to pocBins - 1
+            array.set(volBins, b, 0.0)
+        for k = 0 to math.min(pocLen - 1, bar_index - 1)
+            bi = math.floor((close[k] - loN) / bsize)
+            bi := math.max(0, math.min(pocBins - 1, bi))
+            array.set(volBins, bi, array.get(volBins, bi) + volume[k])
+        maxVol = 0.0
+        maxIdx = 0
+        for b = 0 to pocBins - 1
+            if array.get(volBins, b) > maxVol
+                maxVol := array.get(volBins, b)
+                maxIdx := b
+        globalPoc := loN + bsize * (maxIdx + 0.5)
+
+// ── Направление тренда: EMA(trendDirLen) — блокирует входы против тренда ──
+trendDirEma = ta.ema(src, trendDirLen)
+trendUp     = close > trendDirEma
+longTrendOk  = not useTrendDir or trendUp
+shortTrendOk = not useTrendDir or not trendUp
+
+// ── Подтверждение: ретест границы канала (отсекает «падающие ножи») ──
+bandLow  = mean - bandK * sigma
+bandHigh = mean + bandK * sigma
+longConf   = not useConfirm or (close[1] < bandLow and close >= bandLow)
+shortConf  = not useConfirm or (close[1] > bandHigh and close <= bandHigh)
+longPocConf  = not useConfirm or close > (high + low) / 2
+shortPocConf = not useConfirm or close < (high + low) / 2
+
+// ── Доп. сигналы: мягкий z + объём · касание POC ──
+crossUnder2 = ta.crossunder(z, -zEntry2)
+crossOver2  = ta.crossover(z, zEntry2)
+pocNear      = useExtra and usePocSig and not na(globalPoc) and math.abs(close - globalPoc) <= pocTol * atr
+pocFromAbove = not na(globalPoc) and close[1] > globalPoc + pocTol * atr
+pocFromBelow = not na(globalPoc) and close[1] < globalPoc - pocTol * atr
+longPocSig  = pocNear and pocFromAbove and volOK and hlOk and volOk and trendOk and btcOkLong and volRatioOk and longTrendOk and longPocConf
+shortPocSig = pocNear and pocFromBelow and volOK and hlOk and volOk and trendOk and btcOkShort and volRatioOk and shortTrendOk and shortPocConf
+longVolSig  = useExtra and crossUnder2 and volOK and hlOk and volOk and trendOk and btcOkLong and volRatioOk and longTrendOk and longConf
+shortVolSig = useExtra and crossOver2 and volOK and hlOk and volOk and trendOk and btcOkShort and volRatioOk and shortTrendOk and shortConf
+
+// ═══════════════════════════ СИГНАЛЫ И СОСТОЯНИЕ ═══════════════════════════
+var int   posState  = 0      // 1 = long, -1 = short, 0 = вне позиции
+var float entryPx   = na
+var bool  beDone    = false
+var float longSl    = na
+var float longTp    = na
+var float shortSl   = na
+var float shortTp   = na
+var line  longSlLn  = na
+var line  longTpLn  = na
+var line  shortSlLn = na
+var line  shortTpLn = na
+var label longSlLb  = na
+var label longTpLb  = na
+var label shortSlLb = na
+var label shortTpLb = na
+var label entryLb   = na
+var label partialLb = na
+// ── история сделок ──
+var array<float> tDir     = array.new_float()   // 1 = LONG, -1 = SHORT
+var array<float> tEntryPx = array.new_float()
+var array<float> tExitPx  = array.new_float()
+var array<float> tRisk    = array.new_float()   // риск 1R на сделку
+var array<float> tR       = array.new_float()   // результат в R
+var array<int>   tOutcome = array.new_int()     // 0 ТЕЙК · 1 СТОП · 2 БУ · 3 z-выход
+var table histTbl = na
+var int   histRows = -1
+var bool  histWasOpen = false
+var float histSumR  = 0.0
+var int   histWins  = 0
+var int   histLosses = 0
+
+// z пробил нижний порог → статистическая перепроданность
+longSignal  = ta.crossunder(z, -zEntry)
+// z пробил верхний порог → статистическая перекупленность
+shortSignal = ta.crossover(z, zEntry)
+
+longMain  = longSignal and hlOk and volOk and trendOk and rsiOkLong  and btcOkLong  and volRatioOk and longTrendOk and longConf
+shortMain = shortSignal and hlOk and volOk and trendOk and rsiOkShort and btcOkShort and volRatioOk and shortTrendOk and shortConf
+
+// итоговые условия: точный z-пробой ИЛИ мягкий z + объём ИЛИ касание POC
+longCond  = (longMain or longVolSig or longPocSig) and posState != 1
+shortCond = (shortMain or shortVolSig or shortPocSig) and posState != -1
+
+// выходы: возврат z к среднему / стоп / тейк
+// crossover/crossunder считаются на каждом баре — устраняет CW10002
+crossUp   = ta.crossover(z, zExit)
+crossDown = ta.crossunder(z, -zExit)
+longExit   = exitMode == "Выход z→0" and posState == 1  and crossUp
+shortExit  = exitMode == "Выход z→0" and posState == -1 and crossDown
+longSlHit  = posState == 1  and close <= longSl
+longTpHit  = posState == 1  and close >= longTp
+shortSlHit = posState == -1 and close >= shortSl
+shortTpHit = posState == -1 and close <= shortTp
+exitAny    = longExit or shortExit or longSlHit or longTpHit or shortSlHit or shortTpHit
+
+// вход LONG: рисуем уровни SL/TP с явной разметкой цен
+if longCond
+    posState := 1
+    entryPx := close
+    beDone  := false
+    longSl := close - slMult * atr
+    longTp := close + tpMult * atr
+    // TP — прямая зелёная линия с ценой, SL — прямая красная линия с ценой
+    longSlLn := line.new(bar_index, longSl, bar_index + 1, longSl, color=color.new(#ef4444, 0), style=line.style_solid, width=2, extend=extend.right)
+    longTpLn := line.new(bar_index, longTp, bar_index + 1, longTp, color=color.new(#22c55e, 0), style=line.style_solid, width=2, extend=extend.right)
+    longSlLb := label.new(bar_index, longSl, "SL " + str.tostring(longSl, format.mintick), style=label.style_label_up, color=color.new(#ef4444, 15), textcolor=color.white, size=size.small)
+    longTpLb := label.new(bar_index, longTp, "TP " + str.tostring(longTp, format.mintick), style=label.style_label_down, color=color.new(#22c55e, 15), textcolor=color.white, size=size.small)
+    entryLb  := label.new(bar_index, close, "Вход " + str.tostring(close, format.mintick), style=label.style_label_left, color=color.new(#3b82f6, 10), textcolor=color.white, size=size.small)
+    array.push(tDir, 1.0)
+    array.push(tEntryPx, close)
+    array.push(tRisk, slMult * atr)
+
+// вход SHORT: рисуем уровни SL/TP с явной разметкой цен
+if shortCond
+    posState := -1
+    entryPx := close
+    beDone  := false
+    shortSl := close + slMult * atr
+    shortTp := close - tpMult * atr
+    // TP — прямая зелёная линия с ценой, SL — прямая красная линия с ценой
+    shortSlLn := line.new(bar_index, shortSl, bar_index + 1, shortSl, color=color.new(#ef4444, 0), style=line.style_solid, width=2, extend=extend.right)
+    shortTpLn := line.new(bar_index, shortTp, bar_index + 1, shortTp, color=color.new(#22c55e, 0), style=line.style_solid, width=2, extend=extend.right)
+    shortSlLb := label.new(bar_index, shortSl, "SL " + str.tostring(shortSl, format.mintick), style=label.style_label_down, color=color.new(#ef4444, 15), textcolor=color.white, size=size.small)
+    shortTpLb := label.new(bar_index, shortTp, "TP " + str.tostring(shortTp, format.mintick), style=label.style_label_up, color=color.new(#22c55e, 15), textcolor=color.white, size=size.small)
+    entryLb   := label.new(bar_index, close, "Вход " + str.tostring(close, format.mintick), style=label.style_label_left, color=color.new(#3b82f6, 10), textcolor=color.white, size=size.small)
+    array.push(tDir, -1.0)
+    array.push(tEntryPx, close)
+    array.push(tRisk, slMult * atr)
+
+// выход из позиции: запись исхода в историю + уборка уровней
+if exitAny
+    if posState == 1
+        outH  = longTpHit ? 0 : (beDone and close <= entryPx) ? 2 : longSlHit ? 1 : 3
+        riskH = array.get(tRisk, array.size(tRisk) - 1)
+        rBase = riskH > 0 ? (close - entryPx) / riskH : 0.0
+        array.push(tDir, 1.0)
+        array.push(tEntryPx, entryPx)
+        array.push(tExitPx, close)
+        array.push(tOutcome, outH)
+        array.push(tR, exitMode == "Частичный тейк +1R" ? 0.5 + 0.5 * rBase : rBase)
+    if posState == -1
+        outH  = shortTpHit ? 0 : (beDone and close >= entryPx) ? 2 : shortSlHit ? 1 : 3
+        riskH = array.get(tRisk, array.size(tRisk) - 1)
+        rBase = riskH > 0 ? (entryPx - close) / riskH : 0.0
+        array.push(tDir, -1.0)
+        array.push(tEntryPx, entryPx)
+        array.push(tExitPx, close)
+        array.push(tOutcome, outH)
+        array.push(tR, exitMode == "Частичный тейк +1R" ? 0.5 + 0.5 * rBase : rBase)
+    while array.size(tR) > 100
+        array.remove(tDir, 0)
+        array.remove(tEntryPx, 0)
+        array.remove(tExitPx, 0)
+        array.remove(tRisk, 0)
+        array.remove(tOutcome, 0)
+        array.remove(tR, 0)
+    posState := 0
+    if not na(longSlLn)
+        line.delete(longSlLn)
+        longSlLn := na
+    if not na(longTpLn)
+        line.delete(longTpLn)
+        longTpLn := na
+    if not na(shortSlLn)
+        line.delete(shortSlLn)
+        shortSlLn := na
+    if not na(shortTpLn)
+        line.delete(shortTpLn)
+        shortTpLn := na
+    if not na(longSlLb)
+        label.delete(longSlLb)
+        longSlLb := na
+    if not na(longTpLb)
+        label.delete(longTpLb)
+        longTpLb := na
+    if not na(shortSlLb)
+        label.delete(shortSlLb)
+        shortSlLb := na
+    if not na(shortTpLb)
+        label.delete(shortTpLb)
+        shortTpLb := na
+    if not na(entryLb)
+        label.delete(entryLb)
+        entryLb := na
+    if not na(partialLb)
+        label.delete(partialLb)
+        partialLb := na
+
+// ── Безубыток: после +1R стоп переносится на цену входа ──
+if posState == 1 and (exitMode == "Безубыток +1R" or exitMode == "Частичный тейк +1R") and not beDone and not na(entryPx) and not na(longSlLn)
+    if close >= entryPx + beMult * slMult * atr
+        beDone := true
+        longSl := entryPx
+        // обновляем ОБЕ точки линии, чтобы она осталась горизонтальной
+        line.set_xy1(longSlLn, bar_index, entryPx)
+        line.set_xy2(longSlLn, bar_index + 1, entryPx)
+        label.set_y(longSlLb, entryPx)
+        label.set_text(longSlLb, "SL BE " + str.tostring(entryPx, format.mintick))
+        if exitMode == "Частичный тейк +1R"
+            partialLb := label.new(bar_index, entryPx + beMult * slMult * atr, "TP1 50% +1R", style=label.style_label_up, color=color.new(color.green, 25), textcolor=color.white, size=size.tiny)
+if posState == -1 and (exitMode == "Безубыток +1R" or exitMode == "Частичный тейк +1R") and not beDone and not na(entryPx) and not na(shortSlLn)
+    if close <= entryPx - beMult * slMult * atr
+        beDone := true
+        shortSl := entryPx
+        // обновляем ОБЕ точки линии, чтобы она осталась горизонтальной
+        line.set_xy1(shortSlLn, bar_index, entryPx)
+        line.set_xy2(shortSlLn, bar_index + 1, entryPx)
+        label.set_y(shortSlLb, entryPx)
+        label.set_text(shortSlLb, "SL BE " + str.tostring(entryPx, format.mintick))
+        if exitMode == "Частичный тейк +1R"
+            partialLb := label.new(bar_index, entryPx - beMult * slMult * atr, "TP1 50% +1R", style=label.style_label_down, color=color.new(color.green, 25), textcolor=color.white, size=size.tiny)
+
+// ── Композитная метрика MR Score: 0..100 ──
+mrScore = math.max(0, math.min(100, 50 + z * 10))
+
+// ═══════════════════════════ ВИЗУАЛИЗАЦИЯ ═══════════════════════════
+plot(mean, "Среднее μ", color=color.new(#f59e0b, 0), linewidth=2)
+uPlot = plot(upper, "Верхняя полоса +kσ", color=color.new(#ef4444, 40), linewidth=1)
+lPlot = plot(lower, "Нижняя полоса −kσ", color=color.new(#22c55e, 40), linewidth=1)
+fill(uPlot, lPlot, color=color.new(#3b82f6, 92), title="Канал реверсии")
+
+bgcolor(z >= zEntry ? color.new(color.red, 90) : z <= -zEntry ? color.new(color.green, 90) : na,
+     title="Зона статистического экстремума")
+
+plotshape(longMain, "LONG (z-пробой)", shape.labelup, location.belowbar,
+     color.new(#22c55e, 0), text="L", textcolor=color.white, size=size.small)
+plotshape(shortMain, "SHORT (z-пробой)", shape.labeldown, location.abovebar,
+     color.new(#ef4444, 0), text="S", textcolor=color.white, size=size.small)
+plotshape(longVolSig, "LONG (объём)", shape.triangleup, location.belowbar,
+     color.new(#34d399, 0), size=size.tiny)
+plotshape(shortVolSig, "SHORT (объём)", shape.triangledown, location.abovebar,
+     color.new(#f87171, 0), size=size.tiny)
+plotshape(longPocSig, "LONG (POC)", shape.diamond, location.belowbar,
+     color.new(#a78bfa, 0), size=size.tiny)
+plotshape(shortPocSig, "SHORT (POC)", shape.diamond, location.abovebar,
+     color.new(#a78bfa, 0), size=size.tiny)
+plotshape(exitAny, "Выход из позиции", shape.xcross, location.abovebar,
+     color.new(#38bdf8, 0), size=size.tiny)
+
+// ── Панель: метрики + ИСТОРИЯ СДЕЛОК ПОД НИМИ (одна таблица, без наложений) ──
+var table dash = na
+var int   dashRows = -1
+
+// позиция панели (на мобильном удобнее центр или низ)
+dashPosVal = dashPos == "Верхний правый" ? position.top_right : dashPos == "Правый по центру" ? position.middle_right : position.bottom_right
+
+if barstate.islast and showDash
+    posText = posState == 1 ? "LONG" : posState == -1 ? "SHORT" : "—"
+    posCol  = posState == 1 ? color.new(#22c55e, 0) : posState == -1 ? color.new(#ef4444, 0) : color.new(#b2b5be, 0)
+    sltpText = posState == 1 ? str.tostring(longSl, format.mintick) + " / " + str.tostring(longTp, format.mintick) : posState == -1 ? str.tostring(shortSl, format.mintick) + " / " + str.tostring(shortTp, format.mintick) : "—"
+    histCount = array.size(tR)
+    // компактный режим (мобильный): метрики сокращены, история только свёрнутая
+    nShown    = not compactMode and histOpen ? math.min(histCount, histMaxRows) : 0
+    histLines = showHist ? (histOpen and not compactMode ? nShown + 2 : 2) : 0
+    metricLines = compactMode ? 5 : 19
+    rowsNeeded = 1 + metricLines + histLines + (showHist ? 2 : 0)
+    histHdr = 1 + metricLines
+    sumRow0 = histHdr + histLines
+    sumRow1 = sumRow0 + 1
+    if na(dash) or dashRows != rowsNeeded
+        if not na(dash)
+            table.delete(dash)
+        dash := table.new(dashPosVal, 6, rowsNeeded, bgcolor=color.new(#131722, 15),
+             border_width=1, border_color=color.new(#363a45, 30))
+        dashRows := rowsNeeded
+    // ── метрики: подпись слева (колонки 0..3), значение справа (4..5) ──
+    table.merge_cells(dash, 0, 0, 5, 0)
+    table.cell(dash, 0, 0, "MR QUANT PRO", text_color=#f59e0b, text_size=size.normal, bgcolor=color.new(#1e222d, 0))
+    if compactMode
+        table.merge_cells(dash, 0, 1, 3, 1)
+        table.cell(dash, 0, 1, "Z-score", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 1, 5, 1)
+        table.cell(dash, 4, 1, str.tostring(z, "#.##"), text_halign=text.align_right, text_color=z < 0 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.tiny)
+        table.merge_cells(dash, 0, 2, 3, 2)
+        table.cell(dash, 0, 2, "Позиция", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 2, 5, 2)
+        table.cell(dash, 4, 2, posText, text_halign=text.align_right, text_color=posCol, text_size=size.tiny)
+        table.merge_cells(dash, 0, 3, 3, 3)
+        table.cell(dash, 0, 3, "SL / TP", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 3, 5, 3)
+        table.cell(dash, 4, 3, sltpText, text_halign=text.align_right, text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 0, 4, 3, 4)
+        table.cell(dash, 0, 4, "Цена входа", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 4, 5, 4)
+        table.cell(dash, 4, 4, na(entryPx) ? "—" : str.tostring(entryPx, format.mintick), text_halign=text.align_right, text_color=color.new(#38bdf8, 0), text_size=size.tiny)
+        table.merge_cells(dash, 0, 5, 3, 5)
+        table.cell(dash, 0, 5, "MR Score", text_color=color.new(#b2b5be, 0), text_size=size.tiny)
+        table.merge_cells(dash, 4, 5, 5, 5)
+        table.cell(dash, 4, 5, str.tostring(mrScore, "0"), text_halign=text.align_right, text_color=color.new(#a78bfa, 0), text_size=size.tiny)
+    else
+        table.merge_cells(dash, 0, 1, 3, 1)
+        table.cell(dash, 0, 1, "Z-score", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 1, 5, 1)
+        table.cell(dash, 4, 1, str.tostring(z, "#.##"), text_halign=text.align_right, text_color=z < 0 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 2, 3, 2)
+        table.cell(dash, 0, 2, "Среднее μ", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 2, 5, 2)
+        table.cell(dash, 4, 2, str.tostring(mean, format.mintick), text_halign=text.align_right, text_color=#f59e0b, text_size=size.small)
+        table.merge_cells(dash, 0, 3, 3, 3)
+        table.cell(dash, 0, 3, "Сигма σ", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 3, 5, 3)
+        table.cell(dash, 4, 3, str.tostring(sigma, format.mintick), text_halign=text.align_right, text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 4, 3, 4)
+        table.cell(dash, 0, 4, "Полужизнь T½", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 4, 5, 4)
+        table.cell(dash, 4, 4, na(halfLife) ? "—" : str.tostring(halfLife, "0") + " бар", text_halign=text.align_right, text_color=color.new(#38bdf8, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 5, 3, 5)
+        table.cell(dash, 0, 5, "ATR z-score", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 5, 5, 5)
+        table.cell(dash, 4, 5, str.tostring(atrZ, "#.##"), text_halign=text.align_right, text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 6, 3, 6)
+        table.cell(dash, 0, 6, "ADX", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 6, 5, 6)
+        table.cell(dash, 4, 6, str.tostring(adx, "#.#"), text_halign=text.align_right, text_color=trendOk ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 7, 3, 7)
+        table.cell(dash, 0, 7, "RSI", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 7, 5, 7)
+        table.cell(dash, 4, 7, str.tostring(rsi, "#.#"), text_halign=text.align_right, text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 8, 3, 8)
+        table.cell(dash, 0, 8, "Позиция", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 8, 5, 8)
+        table.cell(dash, 4, 8, posText, text_halign=text.align_right, text_color=posCol, text_size=size.small)
+        table.merge_cells(dash, 0, 9, 3, 9)
+        table.cell(dash, 0, 9, "SL / TP", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 9, 5, 9)
+        table.cell(dash, 4, 9, sltpText, text_halign=text.align_right, text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 10, 3, 10)
+        table.cell(dash, 0, 10, "Цена входа", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 10, 5, 10)
+        table.cell(dash, 4, 10, na(entryPx) ? "—" : str.tostring(entryPx, format.mintick), text_halign=text.align_right, text_color=color.new(#38bdf8, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 11, 3, 11)
+        table.cell(dash, 0, 11, "R:R (риск:доход)", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 11, 5, 11)
+        table.cell(dash, 4, 11, str.tostring(tpMult / slMult, "0.0") + " : 1", text_halign=text.align_right, text_color=color.new(#22c55e, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 12, 3, 12)
+        table.cell(dash, 0, 12, "Корреляция ρ BTC", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 12, 5, 12)
+        table.cell(dash, 4, 12, na(corr) ? "—" : str.tostring(corr, "#.##"), text_halign=text.align_right, text_color=highCorr ? color.new(#f59e0b, 0) : color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 13, 3, 13)
+        table.cell(dash, 0, 13, "BTC направление", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 13, 5, 13)
+        table.cell(dash, 4, 13, btcDir > 0 ? "▲ LONG-приоритет" : btcDir < 0 ? "▼ SHORT-приоритет" : "нейтрально", text_halign=text.align_right, text_color=btcDir > 0 ? color.new(#22c55e, 0) : btcDir < 0 ? color.new(#ef4444, 0) : color.new(#b2b5be, 0), text_size=size.small)
+        coinCol = coinDir > 0 ? color.new(#22c55e, 0) : coinDir < 0 ? color.new(#ef4444, 0) : color.new(#b2b5be, 0)
+        // янтарным — расхождение монеты с BTC при высокой корреляции (зона риска)
+        coinCol := highCorr and coinDir != 0 and btcDir != 0 and coinDir != btcDir ? color.new(#f59e0b, 0) : coinCol
+        table.merge_cells(dash, 0, 14, 3, 14)
+        table.cell(dash, 0, 14, "Направление монеты", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 14, 5, 14)
+        table.cell(dash, 4, 14, coinDir > 0 ? "▲ LONG" : coinDir < 0 ? "▼ SHORT" : "нейтрально", text_halign=text.align_right, text_color=coinCol, text_size=size.small)
+        table.merge_cells(dash, 0, 15, 3, 15)
+        table.cell(dash, 0, 15, "Волат. / BTC", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 15, 5, 15)
+        table.cell(dash, 4, 15, na(volRatio) ? "—" : str.tostring(volRatio, "#.##") + "x", text_halign=text.align_right, text_color=volRatioOk ? color.new(#b2b5be, 0) : color.new(#ef4444, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 16, 3, 16)
+        table.cell(dash, 0, 16, "MR Score 0..100", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 16, 5, 16)
+        table.cell(dash, 4, 16, str.tostring(mrScore, "0"), text_halign=text.align_right, text_color=color.new(#a78bfa, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 17, 3, 17)
+        table.cell(dash, 0, 17, "POC профиля", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 17, 5, 17)
+        table.cell(dash, 4, 17, na(globalPoc) ? "—" : str.tostring(globalPoc, format.mintick), text_halign=text.align_right, text_color=color.new(#a78bfa, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 18, 3, 18)
+        table.cell(dash, 0, 18, "Объём / SMA20", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 18, 5, 18)
+        table.cell(dash, 4, 18, na(volRatioV) ? "—" : str.tostring(volRatioV, "#.##") + "x", text_halign=text.align_right, text_color=volBurst ? color.new(#f59e0b, 0) : color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 0, 19, 3, 19)
+        table.cell(dash, 0, 19, "Тренд EMA" + str.tostring(trendDirLen), text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, 19, 5, 19)
+        table.cell(dash, 4, 19, trendUp ? "▲ выше — LONG-зона" : "▼ ниже — SHORT-зона", text_halign=text.align_right, text_color=trendUp ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+    // ── ИСТОРИЯ СДЕЛОК (ниже метрик, в этой же таблице) ──
+    if showHist
+        table.merge_cells(dash, 0, histHdr, 5, histHdr)
+        table.cell(dash, 0, histHdr, histOpen and not compactMode ? "ИСТОРИЯ СДЕЛОК ▾ (" + str.tostring(histCount) + ")" : "ИСТОРИЯ СДЕЛОК ▸ (" + str.tostring(histCount) + ")", text_color=#f59e0b, text_size=size.tiny, bgcolor=color.new(#1e222d, 0))
+        if histOpen and not compactMode
+            table.cell(dash, 0, histHdr + 1, "№", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 1, histHdr + 1, "Напр.", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 2, histHdr + 1, "Вход", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 3, histHdr + 1, "Выход", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 4, histHdr + 1, "Исход", text_color=#8a93a5, text_size=size.tiny)
+            table.cell(dash, 5, histHdr + 1, "R", text_color=#8a93a5, text_size=size.tiny)
+            for j = 0 to nShown - 1
+                i = histCount - 1 - j
+                row = histHdr + 2 + j
+                isLong = array.get(tDir, i) > 0
+                table.cell(dash, 0, row, str.tostring(i + 1), text_color=#b2b5be, text_size=size.small)
+                table.cell(dash, 1, row, isLong ? "LONG" : "SHORT", text_color=isLong ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+                table.cell(dash, 2, row, str.tostring(array.get(tEntryPx, i), format.mintick), text_color=#b2b5be, text_size=size.small)
+                table.cell(dash, 3, row, str.tostring(array.get(tExitPx, i), format.mintick), text_color=#b2b5be, text_size=size.small)
+                outH = array.get(tOutcome, i)
+                outTxt = outH == 0 ? "ТЕЙК" : outH == 1 ? "СТОП" : outH == 2 ? "БУ" : "z-выход"
+                outCol = outH == 0 ? color.new(#22c55e, 0) : outH == 1 ? color.new(#ef4444, 0) : outH == 2 ? color.new(#f59e0b, 0) : color.new(#38bdf8, 0)
+                table.cell(dash, 4, row, outTxt, text_color=outCol, text_size=size.small)
+                rVal = array.get(tR, i)
+                table.cell(dash, 5, row, (rVal >= 0 ? "+" : "") + str.tostring(rVal, "#.##") + "R", text_color=rVal >= 0 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+        else
+            table.merge_cells(dash, 0, histHdr + 1, 5, histHdr + 1)
+            table.cell(dash, 0, histHdr + 1, "Сделок: " + str.tostring(histCount) + " · раскрыть: настройки → ⑦ История сделок", text_color=#b2b5be, text_size=size.tiny)
+        // ── итоги истории: общий R и % выигрышей ──
+        histSumR := 0.0
+        histWins := 0
+        histLosses := 0
+        for k = 0 to histCount - 1
+            rVal2 = array.get(tR, k)
+            histSumR += rVal2
+            if rVal2 > 0
+                histWins += 1
+            else if rVal2 < 0
+                histLosses += 1
+        histWR = histWins + histLosses > 0 ? 100.0 * histWins / (histWins + histLosses) : na
+        table.merge_cells(dash, 0, sumRow0, 3, sumRow0)
+        table.cell(dash, 0, sumRow0, "Общий R", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, sumRow0, 5, sumRow0)
+        table.cell(dash, 4, sumRow0, (histSumR >= 0 ? "+" : "") + str.tostring(histSumR, "#.##") + "R", text_halign=text.align_right, text_color=histSumR >= 0 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+        table.merge_cells(dash, 0, sumRow1, 3, sumRow1)
+        table.cell(dash, 0, sumRow1, "Выигрыши", text_color=color.new(#b2b5be, 0), text_size=size.small)
+        table.merge_cells(dash, 4, sumRow1, 5, sumRow1)
+        table.cell(dash, 4, sumRow1, na(histWR) ? "—" : str.tostring(histWins, "0") + " (" + str.tostring(histWR, "0.0") + "%)", text_halign=text.align_right, text_color=na(histWR) ? color.new(#b2b5be, 0) : histWR >= 50 ? color.new(#22c55e, 0) : color.new(#ef4444, 0), text_size=size.small)
+else if barstate.islast and not showDash
+    if not na(dash)
+        table.delete(dash)
+        dash := na
+        dashRows := -1
+
+// (история сделок объединена с панелью метрик — см. блок «Панель: метрики + ИСТОРИЯ СДЕЛОК» выше)
+
+// ── Алерты: динамические сообщения по типу сигнала ──
+msgBase = syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(close, format.mintick) + " | z = " + str.tostring(z, "#.##") + " | SL " + str.tostring(close - slMult * atr, format.mintick) + " | TP " + str.tostring(close + tpMult * atr, format.mintick) + " | R:R 1:3"
+if longMain
+    alert("🟢 MRQ LONG (z): " + msgBase, alert.freq_once_per_bar_close)
+if shortMain
+    alert("🔴 MRQ SHORT (z): " + msgBase, alert.freq_once_per_bar_close)
+if longVolSig
+    alert("🟩 MRQ LONG (объём): " + msgBase, alert.freq_once_per_bar_close)
+if shortVolSig
+    alert("🟥 MRQ SHORT (объём): " + msgBase, alert.freq_once_per_bar_close)
+if longPocSig
+    alert("🔶 MRQ LONG (POC): " + msgBase + " | POC " + str.tostring(globalPoc, format.mintick), alert.freq_once_per_bar_close)
+if shortPocSig
+    alert("🔶 MRQ SHORT (POC): " + msgBase + " | POC " + str.tostring(globalPoc, format.mintick), alert.freq_once_per_bar_close)
+if longExit or longSlHit or longTpHit
+    alert("🔵 MRQ ВЫХОД LONG: " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if shortExit or shortSlHit or shortTpHit
+    alert("🔵 MRQ ВЫХОД SHORT: " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+</script>
+
+<!-- ═══════════════ APP ═══════════════ -->
+<script>
+/* ───────────── Получение и подсветка Pine-кода ───────────── */
+const RAW = {
+  indicator: document.getElementById('pine-indicator').textContent.replace(/^\n+/, '').replace(/\s+$/, '\n'),
+  strategy:  document.getElementById('pine-strategy').textContent.replace(/^\n+/, '').replace(/\s+$/, '\n')
+};
+const FILES = { indicator: 'mr_quant_pro_indicator.pine', strategy: 'mr_quant_pro_strategy.pine' };
+let ACTIVE = 'indicator';
+const PINE = () => RAW[ACTIVE];
+
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+const TOKEN_RE = /(\/\/[^\n]*)|("[^"\n]*")|(#[0-9a-fA-F]{3,8}\b)|(\b\d+(?:\.\d+)?\b)|\b((?:ta|math|strategy|input|color|array|matrix|request|alert|syminfo|timeframe|label|table|box|line|chart|plotshape|plotchar|format|location|shape|size|position|currency|commission_type|percent_of_equity|commission|percent|equity|position_size|pointvalue|entry|exit|close|top_right|small|labelup|labeldown|belowbar|abovebar|islast|new)\.[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)?)|\b(plot|fill|bgcolor|alertcondition|hline|strategy|indicator)\s*(?=\()|\b(if|else|var|varip|and|or|not|true|false|switch|na|for|while|continue|break)\b|\b(float|int|bool|string|color|series|simple)\b/g;
+
+function highlightPine(src){
+  return esc(src).replace(TOKEN_RE, (m, c, s, h, n, f, b, k, t) => {
+    if (c) return '<span class="tk-c">' + m + '</span>';
+    if (s) return '<span class="tk-s">' + m + '</span>';
+    if (h) return '<span class="tk-h">' + m + '</span>';
+    if (n) return '<span class="tk-n">' + m + '</span>';
+    if (f) return '<span class="tk-f">' + m + '</span>';
+    if (b) return '<span class="tk-b">' + m + '</span>';
+    if (k) return '<span class="tk-k">' + m + '</span>';
+    if (t) return '<span class="tk-t">' + m + '</span>';
+    return m;
+  });
+}
+
+function renderCode(){
+  const body = document.getElementById('code-body');
+  const lines = PINE().split('\n');
+  let html = '';
+  for (let i = 0; i < lines.length; i++){
+    html += '<div class="cl"><span class="cn">' + (i + 1) + '</span><span class="cx">' + (highlightPine(lines[i]) || '&nbsp;') + '</span></div>';
+  }
+  body.innerHTML = html;
+  document.getElementById('code-lines').textContent = lines.length + ' строк';
+  document.getElementById('code-chars').textContent = PINE().length + ' симв.';
+  document.getElementById('code-filename').textContent = FILES[ACTIVE];
+  const on  = 'px-4 py-2.5 text-[12.5px] font-semibold rounded-t-lg border-b-2 transition cursor-pointer border-amber-400 text-amber-300';
+  const off = 'px-4 py-2.5 text-[12.5px] font-semibold rounded-t-lg border-b-2 transition cursor-pointer border-transparent text-slate-500 hover:text-slate-300';
+  document.getElementById('tab-indicator').className = ACTIVE === 'indicator' ? on : off;
+  document.getElementById('tab-strategy').className  = ACTIVE === 'strategy' ? on : off;
+}
+function setTab(t){ ACTIVE = t; renderCode(); }
+renderCode();
+
+/* ───────────── Копирование и скачивание ───────────── */
+const toast = document.getElementById('toast');
+let toastTimer = null;
+function showToast(msg){
+  toast.textContent = msg;
+  toast.classList.remove('opacity-0','translate-y-3');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.add('opacity-0','translate-y-3'), 2200);
+}
+function copyPine(){
+  const done = () => showToast('✅ Код скопирован (' + FILES[ACTIVE] + ')');
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(PINE()).then(done).catch(() => { fallbackCopy(PINE()); done(); });
+  } else { fallbackCopy(PINE()); done(); }
+}
+function fallbackCopy(text){
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch(e){}
+  document.body.removeChild(ta);
+}
+function copyIndicator(){
+  ACTIVE = 'indicator';
+  renderCode();
+  copyPine();
+}
+function copyStrategy(){
+  ACTIVE = 'strategy';
+  renderCode();
+  copyPine();
+  setTimeout(() => showToast('🧪 Вставьте в Pine Editor → «Добавить на график» → откроется Strategy Tester'), 2400);
+}
+function copyTemplate(){
+  const t = document.getElementById('lab-template').textContent;
+  const done = () => showToast('✅ Шаблон отчёта скопирован');
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(done).catch(() => { fallbackCopy(t); done(); });
+  } else { fallbackCopy(t); done(); }
+}
+function downloadPine(){
+  const blob = new Blob([PINE()], {type:'text/plain;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = FILES[ACTIVE];
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+  showToast('⬇ Файл ' + FILES[ACTIVE] + ' скачан');
+}
+
+/* ───────────── Появление секций ───────────── */
+const io = new IntersectionObserver(es => es.forEach(e => {
+  if (e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); }
+}), {threshold: .08});
+document.querySelectorAll('.reveal').forEach(el => io.observe(el));
+
+/* ═════════════ ДЕМО: симуляция OU-процесса ═════════════ */
+const mainCv = document.getElementById('chart');
+const zCv    = document.getElementById('zchart');
+const ctx  = mainCv.getContext('2d');
+const zctx = zCv.getContext('2d');
+
+const cfg = { mu: 100, theta: 0.06, sigma: 0.9, k: 2.0, win: 20, exitMode: 'zexit' };
+const st = { data: [], mean: [], varr: [], sig: [], z: [], atr: [], trades: [], closed: [], open: 0, entryIdx: -1, entryZ: 0, entryP: null, entrySl: null, entryTp: null, entryR: 0, beDone: false, live: false, timer: null };
+const MAXLEN = 1000;
+
+function gauss(){
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+function alpha(){ return 2 / (cfg.win + 1); }
+
+function updateTrade(i, p, z){
+  const atr = st.atr[i] || cfg.sigma;
+  if (st.open === 0){
+    if (z <= -cfg.k){
+      st.open = 1; st.entryIdx = i; st.entryZ = z;
+      st.entryP = p; st.entryR = 2 * atr; st.entrySl = p - 2 * atr; st.entryTp = p + 6 * atr;   // R:R 1:3
+      st.beDone = false;
+      st.trades.push({t:'long', i});
+    } else if (z >= cfg.k){
+      st.open = -1; st.entryIdx = i; st.entryZ = z;
+      st.entryP = p; st.entryR = 2 * atr; st.entrySl = p + 2 * atr; st.entryTp = p - 6 * atr;   // R:R 1:3
+      st.beDone = false;
+      st.trades.push({t:'short', i});
+    }
+    return;
+  }
+  const hold = cfg.exitMode === 'hold', be = cfg.exitMode === 'be';
+  if (st.open > 0){
+    if (be && !st.beDone && p - st.entryP >= st.entryR){ st.entrySl = st.entryP; st.beDone = true; }  // безубыток
+    const exitZ = !hold && !be && z >= 0;
+    if (exitZ || p <= st.entrySl || p >= st.entryTp){
+      const exit = p <= st.entrySl ? st.entrySl : (p >= st.entryTp ? st.entryTp : p);
+      const outcome = exit === st.entryTp ? 'teik' : (exit === st.entrySl && st.beDone) ? 'bu' : (exit === st.entrySl) ? 'stop' : 'z';
+      st.closed.push({i: st.entryIdx, hold: i - st.entryIdx, z: st.entryZ, t: 'long', r: (exit - st.entryP) / st.entryR, outcome: outcome, entryP: st.entryP, exitP: exit});
+      st.open = 0;
+    }
+  } else if (st.open < 0){
+    if (be && !st.beDone && st.entryP - p >= st.entryR){ st.entrySl = st.entryP; st.beDone = true; }  // безубыток
+    const exitZ = !hold && !be && z <= 0;
+    if (exitZ || p >= st.entrySl || p <= st.entryTp){
+      const exit = p >= st.entrySl ? st.entrySl : (p <= st.entryTp ? st.entryTp : p);
+      const outcome = exit === st.entryTp ? 'teik' : (exit === st.entrySl && st.beDone) ? 'bu' : (exit === st.entrySl) ? 'stop' : 'z';
+      st.closed.push({i: st.entryIdx, hold: i - st.entryIdx, z: st.entryZ, t: 'short', r: (st.entryP - exit) / st.entryR, outcome: outcome, entryP: st.entryP, exitP: exit});
+      st.open = 0;
+    }
+  }
+}
+
+function pushBar(){
+  const { mu, theta, sigma } = cfg;
+  const a = alpha();
+  const n = st.data.length;
+  const prev = n ? st.data[n-1] : mu + gauss() * sigma;
+  const p = prev + theta * (mu - prev) + sigma * gauss();
+  const m = n ? a * p + (1 - a) * st.mean[n-1] : p;
+  const v = n ? a * Math.pow(p - m, 2) + (1 - a) * st.varr[n-1] : 0;
+  const s = Math.sqrt(v);
+  const z = s > 1e-9 ? (p - m) / s : 0;
+  const aA = 2 / 15;
+  const atr = n ? aA * Math.abs(p - prev) + (1 - aA) * st.atr[n-1] : Math.abs(p - prev);
+  st.data.push(p); st.mean.push(m); st.varr.push(v); st.sig.push(s); st.z.push(z); st.atr.push(atr);
+  updateTrade(n, p, z);
+  if (st.data.length > MAXLEN){
+    st.data.shift(); st.mean.shift(); st.varr.shift(); st.sig.shift(); st.z.shift(); st.atr.shift();
+    if (st.open !== 0) st.entryIdx--;
+    st.trades.forEach(t => t.i--);
+    st.closed.forEach(c => c.i--);
+    st.trades = st.trades.filter(t => t.i >= 0);
+    st.closed = st.closed.filter(c => c.i >= 0);
+  }
+}
+
+function genSeries(n){
+  st.data = []; st.mean = []; st.varr = []; st.sig = []; st.z = []; st.atr = [];
+  st.trades = []; st.closed = []; st.open = 0; st.entryIdx = -1; st.entryZ = 0;
+  st.entryP = null; st.entrySl = null; st.entryTp = null; st.entryR = 0; st.beDone = false;
+  for (let i = 0; i < n; i++) pushBar();
+}
+
+function halfLifeEst(){
+  const n = Math.min(st.data.length - 1, 200);
+  if (n < 30) return NaN;
+  let sx = 0, sy = 0, sxy = 0, sxx = 0;
+  const start = st.data.length - n;
+  for (let i = start; i < st.data.length; i++){
+    const x = st.data[i-1], y = st.data[i] - st.data[i-1];
+    sx += x; sy += y; sxy += x * y; sxx += x * x;
+  }
+  const den = n * sxx - sx * sx;
+  if (Math.abs(den) < 1e-12) return NaN;
+  const b = (n * sxy - sx * sy) / den;
+  if (b >= 0) return NaN;
+  return Math.log(2) / (-b);
+}
+
+/* ───────────── отрисовка ───────────── */
+function fit(cv){
+  const d = window.devicePixelRatio || 1;
+  const w = Math.max(1, cv.clientWidth * d), h = Math.max(1, cv.clientHeight * d);
+  if (cv.width !== w || cv.height !== h){ cv.width = w; cv.height = h; }
+}
+
+function drawMain(){
+  fit(mainCv);
+  const d = window.devicePixelRatio || 1;
+  const W = mainCv.clientWidth, H = mainCv.clientHeight;
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const data = st.data, n = data.length;
+  if (!n) return;
+  const padL = 48, padR = 14, padT = 14, padB = 20;
+
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < n; i++){
+    const u = st.mean[i] + cfg.k * st.sig[i];
+    const l = st.mean[i] - cfg.k * st.sig[i];
+    if (l < lo) lo = l; if (u > hi) hi = u;
+    if (data[i] < lo) lo = data[i]; if (data[i] > hi) hi = data[i];
+  }
+  if (!isFinite(lo)){ lo = 90; hi = 110; }
+  const span = hi - lo || 1;
+  lo -= span * 0.06; hi += span * 0.06;
+
+  const X = i => padL + (W - padL - padR) * i / (n - 1);
+  const Y = v => padT + (H - padT - padB) * (hi - v) / (hi - lo);
+
+  // сетка
+  ctx.strokeStyle = 'rgba(148,163,184,.07)';
+  ctx.fillStyle = '#475569'; ctx.font = '10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'left';
+  for (let g = 0; g <= 5; g++){
+    const v = lo + (hi - lo) * g / 5, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(v.toFixed(1), 6, y + 3);
+  }
+
+  // канал ±kσ
+  ctx.beginPath();
+  for (let i = 0; i < n; i++){ const x = X(i), y = Y(st.mean[i] + cfg.k * st.sig[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+  for (let i = n - 1; i >= 0; i--){ const x = X(i), y = Y(st.mean[i] - cfg.k * st.sig[i]); ctx.lineTo(x, y); }
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(56,189,248,.07)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(56,189,248,.25)'; ctx.stroke();
+
+  // среднее μ
+  ctx.beginPath();
+  for (let i = 0; i < n; i++){ const x = X(i), y = Y(st.mean[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+  ctx.setLineDash([6, 4]); ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 1.4; ctx.stroke();
+  ctx.setLineDash([]);
+
+  // цена
+  ctx.beginPath();
+  for (let i = 0; i < n; i++){ const x = X(i), y = Y(data[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+  ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1.6; ctx.stroke();
+
+  // выходы
+  ctx.fillStyle = '#38bdf8';
+  st.closed.forEach(c => {
+    const i = c.i + c.hold; if (i < 0 || i >= n) return;
+    ctx.beginPath(); ctx.arc(X(i), Y(data[i]), 2.4, 0, Math.PI * 2); ctx.fill();
+  });
+
+  // сигналы
+  st.trades.forEach(t => {
+    if (t.i < 0 || t.i >= n) return;
+    const x = X(t.i), y = Y(data[t.i]);
+    ctx.beginPath();
+    if (t.t === 'long'){ ctx.moveTo(x, y + 9); ctx.lineTo(x - 6, y + 18); ctx.lineTo(x + 6, y + 18); ctx.fillStyle = '#22c55e'; }
+    else { ctx.moveTo(x, y - 9); ctx.lineTo(x - 6, y - 18); ctx.lineTo(x + 6, y - 18); ctx.fillStyle = '#ef4444'; }
+    ctx.closePath(); ctx.fill();
+  });
+
+  // SL/TP открытой позиции: прямые линии с ценами (зелёная TP, красная SL)
+  if (st.open !== 0 && st.entryIdx >= 0 && st.entryIdx < n){
+    const x0 = X(st.entryIdx), x1 = W - padR;
+    ctx.font = 'bold 10px "JetBrains Mono", monospace';
+    ctx.textAlign = 'left';
+    const be = st.beDone;
+    // цена входа: точка и подпись на баре входа
+    const ey = Y(st.entryP);
+    ctx.beginPath(); ctx.arc(x0, ey, 3, 0, Math.PI * 2); ctx.fillStyle = '#38bdf8'; ctx.fill();
+    ctx.fillStyle = '#7dd3fc';
+    ctx.fillText('Вход ' + st.entryP.toFixed(2), x0 + 6, ey + 3);
+    // SL: красная прямая (янтарная после безубытка) + цена · TP: зелёная прямая + цена
+    ctx.strokeStyle = be ? 'rgba(245,158,11,.9)' : 'rgba(239,68,68,.85)'; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(x0, Y(st.entrySl)); ctx.lineTo(x1, Y(st.entrySl)); ctx.stroke();
+    ctx.fillStyle = be ? '#fbbf24' : '#f87171';
+    ctx.fillText((be ? 'SL BE ' : 'SL ') + st.entrySl.toFixed(2), x0 + 6, Y(st.entrySl) - 4);
+    ctx.strokeStyle = 'rgba(34,197,94,.85)';
+    ctx.beginPath(); ctx.moveTo(x0, Y(st.entryTp)); ctx.lineTo(x1, Y(st.entryTp)); ctx.stroke();
+    ctx.fillStyle = '#4ade80';
+    ctx.fillText('TP ' + st.entryTp.toFixed(2), x0 + 6, Y(st.entryTp) - 4);
+  }
+
+  // текущий z
+  const zz = st.z[n-1];
+  ctx.textAlign = 'right'; ctx.font = 'bold 11px "JetBrains Mono", monospace';
+  ctx.fillStyle = zz < 0 ? '#4ade80' : '#f87171';
+  ctx.fillText('z = ' + zz.toFixed(2), W - 12, padT + 10);
+}
+
+function drawZ(){
+  fit(zCv);
+  const d = window.devicePixelRatio || 1;
+  const W = zCv.clientWidth, H = zCv.clientHeight;
+  zctx.setTransform(d, 0, 0, d, 0, 0);
+  zctx.clearRect(0, 0, W, H);
+  const n = st.z.length;
+  if (!n) return;
+  const padL = 48, padR = 14, padT = 10, padB = 16;
+
+  let lo = Math.min(-cfg.k - 0.8, Math.min.apply(null, st.z));
+  let hi = Math.max(cfg.k + 0.8, Math.max.apply(null, st.z));
+  const span = hi - lo || 1; lo -= span * .05; hi += span * .05;
+
+  const X = i => padL + (W - padL - padR) * i / (n - 1);
+  const Y = v => padT + (H - padT - padB) * (hi - v) / (hi - lo);
+
+  // зоны за порогами
+  zctx.fillStyle = 'rgba(34,197,94,.06)';
+  zctx.fillRect(padL, Y(-cfg.k), W - padL - padR, Y(Math.min(-cfg.k - 0.01, hi)) - Y(-cfg.k));
+  zctx.fillStyle = 'rgba(239,68,68,.06)';
+  zctx.fillRect(padL, Y(Math.max(cfg.k + 0.01, lo)), W - padL - padR, Y(cfg.k) - Y(Math.max(cfg.k + 0.01, lo)));
+
+  // нулевая линия
+  zctx.strokeStyle = '#475569'; zctx.lineWidth = 1;
+  zctx.beginPath(); zctx.moveTo(padL, Y(0)); zctx.lineTo(W - padR, Y(0)); zctx.stroke();
+  zctx.setLineDash([4, 4]);
+  zctx.strokeStyle = 'rgba(239,68,68,.5)';
+  zctx.beginPath(); zctx.moveTo(padL, Y(cfg.k)); zctx.lineTo(W - padR, Y(cfg.k)); zctx.stroke();
+  zctx.strokeStyle = 'rgba(34,197,94,.5)';
+  zctx.beginPath(); zctx.moveTo(padL, Y(-cfg.k)); zctx.lineTo(W - padR, Y(-cfg.k)); zctx.stroke();
+  zctx.setLineDash([]);
+
+  // линия z
+  zctx.beginPath();
+  for (let i = 0; i < n; i++){ const x = X(i), y = Y(st.z[i]); i ? zctx.lineTo(x, y) : zctx.moveTo(x, y); }
+  zctx.strokeStyle = '#38bdf8'; zctx.lineWidth = 1.5; zctx.stroke();
+
+  zctx.fillStyle = '#64748b'; zctx.font = '10px "JetBrains Mono", monospace'; zctx.textAlign = 'left';
+  zctx.fillText('+' + cfg.k.toFixed(1) + 'σ', 6, Y(cfg.k) + 3);
+  zctx.fillText('−' + cfg.k.toFixed(1) + 'σ', 6, Y(-cfg.k) + 3);
+  zctx.fillText('0', 6, Y(0) + 3);
+}
+
+function drawAll(){ drawMain(); drawZ(); }
+
+/* ───────────── статистика ───────────── */
+function updStats(){
+  document.getElementById('stTrades').textContent = st.trades.length;
+  document.getElementById('stClosed').textContent = st.closed.length;
+  const holds = st.closed.map(c => c.hold);
+  document.getElementById('stHold').textContent = holds.length ? (holds.reduce((a,b)=>a+b,0)/holds.length).toFixed(1) + ' бар' : '—';
+  const zs = st.closed.map(c => c.z);
+  document.getElementById('stZavg').textContent = zs.length ? (zs.reduce((a,b)=>a+Math.abs(b),0)/zs.length).toFixed(2) : '—';
+  const hl = halfLifeEst();
+  document.getElementById('stHL').textContent = isNaN(hl) ? '—' : Math.round(hl) + ' бар';
+  document.getElementById('stEntry').textContent = st.open !== 0 && st.entryP !== null ? st.entryP.toFixed(2) : '—';
+  const z = st.z.length ? st.z[st.z.length-1] : 0;
+  const el = document.getElementById('stCurZ');
+  el.textContent = z.toFixed(2);
+  el.className = 'mono text-lg font-semibold ' + (z < 0 ? 'text-emerald-400' : 'text-red-400');
+  renderHist();
+}
+
+/* ───────────── история сделок (сворачиваемая) ───────────── */
+function toggleHist(){
+  const p = document.getElementById('histPanel');
+  p.classList.toggle('hidden');
+  document.getElementById('histArrow').textContent = p.classList.contains('hidden') ? '▸' : '▾';
+  if (!p.classList.contains('hidden')) renderHist();
+}
+
+function renderHist(){
+  const body = document.getElementById('histBody');
+  const list = st.closed.slice(-15).reverse();
+  document.getElementById('histCount').textContent = '(' + st.closed.length + ')';
+  if (!list.length){
+    body.innerHTML = '<tr><td colspan="7" class="px-3 py-3 text-slate-500">Закрытых сделок пока нет</td></tr>';
+    return;
+  }
+  const badge = o => o === 'teik'
+    ? '<span class="px-2 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">ТЕЙК</span>'
+    : o === 'stop'
+    ? '<span class="px-2 py-0.5 rounded-md bg-red-500/10 border border-red-500/30 text-red-300">СТОП</span>'
+    : o === 'bu'
+    ? '<span class="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-300">БУ</span>'
+    : '<span class="px-2 py-0.5 rounded-md bg-sky-500/10 border border-sky-500/30 text-sky-300">z-выход</span>';
+  body.innerHTML = list.map((c, idx) => {
+    const num = st.closed.length - idx;
+    const dir = c.t === 'long'
+      ? '<span class="text-emerald-300">LONG</span>'
+      : '<span class="text-red-300">SHORT</span>';
+    const rCls = c.r >= 0 ? 'text-emerald-300' : 'text-red-300';
+    return '<tr class="border-b border-white/5">' +
+      '<td class="px-3 py-2 mono text-slate-500">' + num + '</td>' +
+      '<td class="px-3 py-2 mono text-[11px] font-semibold">' + dir + '</td>' +
+      '<td class="px-3 py-2 mono">' + c.entryP.toFixed(2) + '</td>' +
+      '<td class="px-3 py-2 mono">' + c.exitP.toFixed(2) + '</td>' +
+      '<td class="px-3 py-2">' + badge(c.outcome) + '</td>' +
+      '<td class="px-3 py-2 mono font-semibold ' + rCls + '">' + (c.r >= 0 ? '+' : '') + c.r.toFixed(2) + 'R</td>' +
+      '<td class="px-3 py-2 mono text-slate-400">' + c.hold + ' бар</td></tr>';
+  }).join('');
+  // ── итоги: общий R и % выигрышей ──
+  let sumR = 0, wins = 0, losses = 0;
+  st.closed.forEach(c => { sumR += c.r; if (c.r > 0) wins++; else if (c.r < 0) losses++; });
+  const decided = wins + losses;
+  const wr = decided > 0 ? wins / decided * 100 : null;
+  body.innerHTML += '<tr class="bg-white/[.03]">' +
+    '<td colspan="4" class="px-3 py-2 text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Итог · общий R · винрейт</td>' +
+    '<td class="px-3 py-2 text-slate-600">—</td>' +
+    '<td class="px-3 py-2 mono font-bold ' + (sumR >= 0 ? 'text-emerald-300' : 'text-red-300') + '">' + (sumR >= 0 ? '+' : '') + sumR.toFixed(2) + 'R</td>' +
+    '<td class="px-3 py-2 mono font-bold ' + (wr !== null && wr >= 50 ? 'text-emerald-300' : 'text-slate-300') + '">' + (wr === null ? '—' : wr.toFixed(0) + '%') + '</td></tr>';
+}
+
+/* ───────────── управление ───────────── */
+const sliders = [
+  ['slTheta','lbTheta','theta', v => v.toFixed(2)],
+  ['slSigma','lbSigma','sigma', v => v.toFixed(2)],
+  ['slK','lbK','k', v => v.toFixed(1)],
+  ['slWin','lbWin','win', v => String(v)]
+];
+sliders.forEach(([id, lb, key, fmt]) => {
+  const el = document.getElementById(id);
+  const paint = () => {
+    document.getElementById(lb).textContent = fmt(Number(el.value));
+    el.style.setProperty('--p', ((el.value - el.min) / (el.max - el.min) * 100) + '%');
+  };
+  el.addEventListener('input', () => { cfg[key] = Number(el.value); paint(); drawAll(); });
+  paint();
+});
+
+document.getElementById('selExit').addEventListener('change', e => {
+  cfg.exitMode = e.target.value;
+  genSeries(600); drawAll(); updStats();
+});
+
+document.getElementById('btnRegen').addEventListener('click', () => {
+  genSeries(600); drawAll(); updStats();
+});
+
+document.getElementById('btnLive').addEventListener('click', function(){
+  st.live = !st.live;
+  if (st.live){
+    this.textContent = '⏸ Пауза';
+    this.className = 'px-5 py-2.5 rounded-xl bg-red-500/10 text-red-300 border border-red-500/30 hover:bg-red-500/20 text-sm font-semibold transition cursor-pointer';
+    st.timer = setInterval(() => { pushBar(); drawAll(); updStats(); }, 80);
+  } else {
+    this.textContent = '▶ Live-режим';
+    this.className = 'px-5 py-2.5 rounded-xl bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/20 text-sm font-semibold transition cursor-pointer';
+    clearInterval(st.timer);
+  }
+});
+
+/* ═════════════ МОНТЕ-КАРЛО ТЕСТ ПО ТАЙМФРЕЙМАМ ═════════════ */
+const TF_PRESETS = [
+  { name: '1м',  mu: 100, theta: 0.150, sigma: 0.80, win: 10, k: 1.5 },
+  { name: '5м',  mu: 100, theta: 0.100, sigma: 0.90, win: 15, k: 1.8 },
+  { name: '15м', mu: 100, theta: 0.070, sigma: 1.00, win: 20, k: 2.0 },
+  { name: '1ч',  mu: 100, theta: 0.050, sigma: 1.10, win: 30, k: 2.0 },
+  { name: '4ч',  mu: 100, theta: 0.030, sigma: 1.20, win: 50, k: 2.2 },
+  { name: '1д',  mu: 100, theta: 0.018, sigma: 1.30, win: 50, k: 2.5 }
+];
+
+function lcg(seed){ let s = seed % 2147483647; if (s <= 0) s += 2147483646; return () => (s = s * 16807 % 2147483647) / 2147483647; }
+function gaussR(rnd){ let u = 0, v = 0; while (u === 0) u = rnd(); while (v === 0) v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+// mode: 'zexit' — выход z→0 + SL/TP · 'hold' — только SL/TP (полные 3R) · 'be' — безубыток +1R
+function runTrades(cfg, rnd, n, mode){
+  const aM = 2 / (cfg.win + 1), aA = 2 / 15;
+  let m = cfg.mu, v = 0, atr = cfg.sigma, pos = 0, entryP = 0, sl = 0, tp = 0, entryAt = 0, atrE = 1e-9, beDone = false;
+  let price = cfg.mu + gaussR(rnd) * cfg.sigma, prev = price;
+  const trades = [];
+  for (let i = 0; i < n; i++){
+    if (i > 0){ prev = price; price = prev + cfg.theta * (cfg.mu - prev) + cfg.sigma * gaussR(rnd); }
+    atr = aA * Math.abs(price - prev) + (1 - aA) * atr;
+    m = aM * price + (1 - aM) * m;
+    v = aM * (price - m) * (price - m) + (1 - aM) * v;
+    const s = Math.sqrt(v), z = s > 1e-9 ? (price - m) / s : 0;
+    if (pos === 0){
+      if (z <= -cfg.k){ pos = 1; entryP = price; atrE = Math.max(atr, 1e-9); sl = price - 2 * atrE; tp = price + 6 * atrE; entryAt = i; beDone = false; }
+      else if (z >= cfg.k){ pos = -1; entryP = price; atrE = Math.max(atr, 1e-9); sl = price + 2 * atrE; tp = price - 6 * atrE; entryAt = i; beDone = false; }
+    } else if (pos > 0){
+      if (mode === 'be' && !beDone && price - entryP >= 2 * atrE){ sl = entryP; beDone = true; }
+      const exitZ = mode === 'zexit' && z >= 0;
+      if (exitZ || price <= sl || price >= tp){
+        const exit = price <= sl ? sl : (price >= tp ? tp : price);
+        trades.push({ r: (exit - entryP) / (2 * atrE), bars: i - entryAt, win: exit > entryP });
+        pos = 0;
+      }
+    } else {
+      if (mode === 'be' && !beDone && entryP - price >= 2 * atrE){ sl = entryP; beDone = true; }
+      const exitZ = mode === 'zexit' && z <= 0;
+      if (exitZ || price >= sl || price <= tp){
+        const exit = price >= sl ? sl : (price <= tp ? tp : price);
+        trades.push({ r: (entryP - exit) / (2 * atrE), bars: i - entryAt, win: exit < entryP });
+        pos = 0;
+      }
+    }
+  }
+  return trades;
+}
+
+const MODES = [
+  { id: 'zexit', label: 'Выход z→0' },
+  { id: 'hold',  label: 'Держать до SL/TP' },
+  { id: 'be',    label: 'Безубыток +1R' }
+];
+function fmtR(v){ return (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+
+function runBacktests(){
+  const results = TF_PRESETS.map(cfg => {
+    const modes = MODES.map(md => {
+      let trades = [];
+      for (let seed = 1; seed <= 12; seed++) trades = trades.concat(runTrades(cfg, lcg(seed * 7919 + cfg.win * 131), 4000, md.id));
+      const wins = trades.filter(t => t.win).length;
+      const wr = trades.length ? wins / trades.length * 100 : 0;
+      const gp = trades.reduce((a, t) => a + Math.max(t.r, 0), 0);
+      const gl = Math.abs(trades.reduce((a, t) => a + Math.min(t.r, 0), 0));
+      const pf = gl > 1e-9 ? gp / gl : (gp > 0 ? Infinity : 0);
+      const avgR = trades.length ? trades.reduce((a, t) => a + t.r, 0) / trades.length : 0;
+      const winT = trades.filter(t => t.win);
+      const avgWinR = winT.length ? winT.reduce((a, t) => a + t.r, 0) / winT.length : 0;
+      return { md, trades: trades.length, wr, pf, avgR, avgWinR };
+    });
+    return { cfg, modes };
+  });
+
+  let rows = '<table class="w-full text-[12.5px] min-w-[1040px]"><thead><tr class="text-left text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/10 bg-white/[.02]"><th class="px-3 py-2.5">Таймфрейм</th><th class="px-3 py-2.5">θ · σ</th><th class="px-3 py-2.5">Сделок</th>' +
+    MODES.map(m => '<th class="px-3 py-2.5">' + m.label + '<span class="block font-normal normal-case text-slate-600">средн. R · WR · R выигрыша</span></th>').join('') +
+    '<th class="px-3 py-2.5">Лучший режим</th></tr></thead><tbody>';
+
+  let bestGlobal = null;
+  results.forEach(r => {
+    let bestMode = null;
+    r.modes.forEach(m => { if (!bestMode || m.avgR > bestMode.avgR) bestMode = m; });
+    if (!bestGlobal || bestMode.avgR > bestGlobal.avgR) bestGlobal = { tf: r.cfg.name, mode: bestMode };
+    rows += '<tr class="border-b border-white/5">' +
+      '<td class="px-3 py-2.5 mono font-bold text-slate-200">' + r.cfg.name + '</td>' +
+      '<td class="px-3 py-2.5 mono text-slate-500">θ ' + r.cfg.theta.toFixed(3) + ' · σ ' + r.cfg.sigma.toFixed(2) + '</td>' +
+      '<td class="px-3 py-2.5 mono text-slate-400">' + r.modes[0].trades + '</td>' +
+      r.modes.map(m => {
+        const isBest = m === bestMode;
+        return '<td class="px-3 py-2.5 ' + (isBest ? 'bg-emerald-500/[.07]' : '') + '">' +
+          '<div class="mono font-semibold ' + (isBest ? 'text-emerald-300' : 'text-slate-200') + '">' + fmtR(m.avgR) + (isBest ? ' ★' : '') + '</div>' +
+          '<div class="text-[10px] text-slate-500 mt-0.5">WR ' + m.wr.toFixed(0) + '% · выигр. ' + fmtR(m.avgWinR) + ' · PF ' + (isFinite(m.pf) ? m.pf.toFixed(2) : '∞') + '</div></td>';
+      }).join('') +
+      '<td class="px-3 py-2.5 mono text-[11.5px] text-amber-300">' + bestMode.md.label + '</td></tr>';
+  });
+  rows += '</tbody></table>';
+  document.getElementById('bt-table').innerHTML = rows;
+  document.getElementById('bt-verdict').innerHTML =
+    '<div class="grid lg:grid-cols-2 gap-3">' +
+    '<div class="bg-emerald-500/[.07] border border-emerald-500/25 rounded-xl px-4 py-3.5 text-[13px] leading-relaxed">' +
+    '<b class="text-emerald-300">🏆 Лучший результат по модели: ' + bestGlobal.tf.name + ' · «' + bestGlobal.mode.md.label + '»</b> — средний <b class="text-emerald-300">' + fmtR(bestGlobal.mode.avgR) + '</b>/сделку. ' +
+    '<span class="text-slate-400">«Безубыток +1R» отсекает убыточные исходы (стоп переносится на цену входа после +1R), а «Держать до SL/TP» даёт каждому выигрышу полные 3R — видно в колонке «R выигрыша».</span></div>' +
+    '<div class="bg-amber-500/[.06] border border-amber-500/25 rounded-xl px-4 py-3.5 text-[13px] leading-relaxed">' +
+    '<b class="text-amber-300">⚠️ Почему средний R не бывает 3R:</b> 3R — потолок одной выигрышной сделки (TP 6×ATR / SL 2×ATR). Матожидание E[R] = WR·3R − (1−WR)·1R: даже при WR 70% максимум +1.8R/сделку, а средние +3R требовали бы 100% выигрышей. Рабочая цель — поднять средний R и PF режимом безубытка.</div></div>';
+}
+
+document.getElementById('btnBacktest').addEventListener('click', runBacktests);
+
+window.addEventListener('resize', drawAll);
+
+/* ───────────── старт ───────────── */
+genSeries(600);
+drawAll();
+updStats();
+runBacktests();
+</script>
+</body>
+</html>
