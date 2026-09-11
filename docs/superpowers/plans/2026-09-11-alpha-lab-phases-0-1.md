@@ -1170,7 +1170,9 @@ from alpha_lab.data.schema import normalize_bars
 
 
 def _make(root, n=600, freq="1m"):
-    ts = pd.date_range("2024-01-01", periods=n, freq=freq, tz="UTC")
+    # pandas 3: freq="1m" означает конец месяца, а не минуту — отображаем явно
+    pd_freq = {"1m": "1min", "5m": "5min", "15m": "15min"}.get(freq, freq)
+    ts = pd.date_range("2024-01-01", periods=n, freq=pd_freq, tz="UTC")
     close = pd.Series(range(n), dtype="float64") + 100.0
     df = normalize_bars(pd.DataFrame({
         "ts": ts, "open": close, "high": close + 1, "low": close - 1,
