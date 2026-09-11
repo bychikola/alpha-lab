@@ -1,5 +1,8 @@
+import warnings
+
 import numpy as np
 import pytest
+from scipy import stats
 
 from alpha_lab.validation.significance import (
     _sharpe_raw, deflated_sharpe_ratio, pbo_cscv, permutation_pvalue,
@@ -40,12 +43,65 @@ def test_dsr_handles_short_series():
     assert deflated_sharpe_ratio(np.array([0.01, 0.02]), n_trials=1) == 0.0
 
 
+def test_dsr_constant_series_is_zero_and_silent():
+    """Ненулевая константа: нулевая дисперсия → ровно 0.0 и ни одного warning.
+
+    simplefilter("error") превращает любой warning scipy в исключение, поэтому
+    регресс «Precision loss … catastrophic cancellation» снова уронит тест.
+    """
+    r = np.full(100, 0.001)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert deflated_sharpe_ratio(r, n_trials=10) == 0.0
+
+
+def test_dsr_all_zero_series_is_zero_and_silent():
+    """Все нули: нулевая дисперсия → ровно 0.0 и ни одного warning."""
+    r = np.zeros(100)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert deflated_sharpe_ratio(r, n_trials=10) == 0.0
+
+
 def test_dsr_rejects_bad_n_trials():
     rng = np.random.default_rng(4)
     r = rng.normal(0.001, 0.01, 1000)
 
     with pytest.raises(ValueError, match="n_trials"):
         deflated_sharpe_ratio(r, n_trials=0)
+
+
+def test_dsr_explicit_sr_variance_deflates_more_and_matches_hand_formula():
+    """Явная межтрековая дисперсия Sharpe должна использоваться в sr0 напрямую.
+
+    Ручной пересчёт: z1 = Φ⁻¹(1 − 1/N), z2 = Φ⁻¹(1 − 1/(N·e)),
+    sr0 = sqrt(var)·((1 − γ)·z1 + γ·z2), γ = 0.5772156649015329,
+    DSR = Φ((sr − sr0)·sqrt(n − 1)/denom). Большая дисперсия даёт больший sr0
+    и, значит, меньший DSR при тех же доходностях и n_trials.
+    """
+    rng = np.random.default_rng(12)
+    r = rng.normal(0.001, 0.01, 2000)
+    n_trials = 50
+    small_var, large_var = 1e-4, 4e-4
+
+    small = deflated_sharpe_ratio(r, n_trials=n_trials, sr_variance=small_var)
+    large = deflated_sharpe_ratio(r, n_trials=n_trials, sr_variance=large_var)
+
+    assert large < small
+
+    gamma = 0.5772156649015329
+    sr = _sharpe_raw(r)
+    z1 = stats.norm.ppf(1.0 - 1.0 / n_trials)
+    z2 = stats.norm.ppf(1.0 - 1.0 / (n_trials * np.e))
+    sr0 = np.sqrt(large_var) * ((1.0 - gamma) * z1 + gamma * z2)
+    skew = float(stats.skew(r))
+    kurt = float(stats.kurtosis(r, fisher=False))
+    denom = np.sqrt(1.0 - skew * sr + ((kurt - 1.0) / 4.0) * sr ** 2)
+    expected = stats.norm.cdf((sr - sr0) * np.sqrt(len(r) - 1) / denom)
+
+    assert large == pytest.approx(expected, rel=1e-12)
 
 
 def test_pbo_high_when_performance_is_random():

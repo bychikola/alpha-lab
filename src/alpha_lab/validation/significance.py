@@ -36,7 +36,10 @@ def deflated_sharpe_ratio(returns, n_trials: int,
     r = np.asarray(returns, dtype="float64")
     r = r[np.isfinite(r)]
     n = len(r)
-    if n < 3:
+    # Слишком короткий ряд или нулевая дисперсия: Sharpe не определён, моменты
+    # (skew/kurtosis) вырождаются и scipy шумит RuntimeWarning. Возвращаем 0.0,
+    # как _sharpe_raw, чтобы контракт P ∈ [0, 1] выполнялся и без предупреждений.
+    if n < 3 or r.std(ddof=1) < 1e-12:
         return 0.0
 
     sr = _sharpe_raw(r)
