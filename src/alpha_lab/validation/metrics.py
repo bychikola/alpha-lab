@@ -50,10 +50,20 @@ def max_drawdown(equity) -> float:
 
 
 def calmar_ratio(returns, equity, periods_per_year: int = DEFAULT_PERIODS) -> float:
+    """Калмар: годовая доходность к абсолютной максимальной просадке.
+
+    Годовая доходность аннуализируется арифметически —
+    mean(returns) * periods_per_year. Геометрическое компаундирование (CAGR)
+    для коротких серий, которые оценивает polygon, не имеет смысла: на
+    нескольких барах оно вырождается и даёт нестабильные значения.
+    """
+    r = _clean(returns)
+    if len(r) < 2:
+        return 0.0
     dd = abs(max_drawdown(equity))
     if dd < 1e-12:
         return 0.0
-    ann_return = sharpe_ratio(returns, periods_per_year, annualize=False) * periods_per_year
+    ann_return = float(np.mean(r) * periods_per_year)
     return float(ann_return / dd)
 
 

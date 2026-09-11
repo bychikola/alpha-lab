@@ -3,7 +3,8 @@ import pandas as pd
 import pytest
 
 from alpha_lab.validation.metrics import (
-    calmar_ratio, max_drawdown, profit_factor, sharpe_ratio, sortino_ratio, summarize,
+    DEFAULT_PERIODS, calmar_ratio, max_drawdown, profit_factor, sharpe_ratio,
+    sortino_ratio, summarize,
 )
 
 
@@ -47,12 +48,16 @@ def test_max_drawdown_monotonic_equity_is_zero():
     assert max_drawdown(pd.Series([1.0, 1.1, 1.2, 1.3])) == pytest.approx(0.0)
 
 
-def test_sortino_ignores_upside_volatility():
-    rng = np.random.default_rng(4)
-    r = pd.Series(rng.normal(0.001, 0.01, 3000))
+def test_sortino_uses_only_downside_deviation():
+    r = pd.Series([0.02, -0.01, 0.03, -0.02, 0.01, -0.015])
+    downside = r[r < 0]
+    expected = r.mean() / downside.std(ddof=1) * np.sqrt(DEFAULT_PERIODS)
 
-    # Сортино ≥ Шарпа: в знаменателе только нисходящая волатильность
-    assert sortino_ratio(r) >= sharpe_ratio(r) * 0.9
+    # Знаменатель — только нисходящее СКО, а не полное: в этом весь смысл
+    # Сортино. Проверяем арифметикой, а не неравенством, которое прошло бы
+    # и при полном СКО (тогда Сортино совпал бы с Шарпом).
+    assert sortino_ratio(r) == pytest.approx(expected, rel=1e-9)
+    assert sortino_ratio(r) != pytest.approx(sharpe_ratio(r), rel=1e-9)
 
 
 def test_profit_factor():
@@ -65,13 +70,52 @@ def test_profit_factor_no_losses_is_inf():
     assert profit_factor(pd.Series([0.01, 0.02])) == float("inf")
 
 
-def test_calmar_ratio():
+def test_calmar_ratio_hand_computed():
     equity = pd.Series([1.0, 1.5, 1.2, 1.8])
     returns = equity.pct_change().fillna(0.0)
 
-    c = calmar_ratio(returns, equity)
+    # returns = [0, 0.5, -0.2, 0.5], mean = 0.2, max_dd = -0.2.
+    # Годовая доходность = 0.2 * 8760 = 1752, Calmar = 1752 / 0.2 = 8760.
+    assert calmar_ratio(returns, equity) == pytest.approx(0.2 * 8760 / 0.2, rel=1e-9)
 
-    assert c > 0
+
+def test_calmar_is_frequency_invariant():
+    daily = np.array([0.02, -0.01, 0.03, -0.02, 0.01])
+    # Та же траектория в часовой дискретизации: доходность дня набирается
+    # за один час, остальные 23 часа нулевые. Границы дней совпадают с
+    # дневной серией, внутридневной путь монотонен, поэтому максимальная
+    # просадка у серий одинаковая. В общем случае точного равенства быть не
+    # может — просадка зависит от внутрипериодного пути, который при
+    # агрегации теряется; здесь он сохранён конструкцией.
+    hourly = np.zeros(len(daily) * 24)
+    hourly[::24] = daily
+    eq_daily = pd.Series(np.concatenate([[1.0], np.cumprod(1.0 + daily)]))
+    eq_hourly = pd.Series(np.concatenate([[1.0], np.cumprod(1.0 + hourly)]))
+
+    # Годовая доходность арифметическая и не зависит от частоты:
+    # mean(d/24) * 8760 == mean(d) * 365.
+    assert hourly.mean() * DEFAULT_PERIODS == pytest.approx(daily.mean() * 365, rel=1e-12)
+
+    c_daily = calmar_ratio(daily, eq_daily, periods_per_year=365)
+    c_hourly = calmar_ratio(hourly, eq_hourly, periods_per_year=DEFAULT_PERIODS)
+
+    # Старая формула (mean/std * P) давала здесь расхождение в разы.
+    assert c_hourly == pytest.approx(c_daily, rel=1e-9)
+
+
+def test_calmar_positive_mean_small_drawdown_is_of_ordinary_magnitude():
+    # 249 часов по +0.06% и один час -5%: mean = 0.0003976,
+    # ann = mean * 365 = 0.1451, max_dd = 0.05, Calmar ≈ 2.90.
+    returns = pd.Series([0.0006] * 249 + [-0.05])
+    equity = (1.0 + returns).cumprod()
+
+    c = calmar_ratio(returns, equity, periods_per_year=365)
+
+    # Опубликованные Calmar живут в диапазоне ~0.5–3: при положительном
+    # среднем и просадке 5% значение обязано быть больше 1, но оставаться
+    # обычным (меньше 10). Старая формула давала здесь ~907, потому что
+    # делила на СКО периода вместо годовой доходности.
+    assert 1.0 < c < 10.0
 
 
 def test_summarize_returns_all_keys():
