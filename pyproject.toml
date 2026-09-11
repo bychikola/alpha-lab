@@ -17,6 +17,9 @@ dependencies = [
 [dependency-groups]
 dev = ["pytest>=8.0"]
 
+[project.scripts]
+alpha-lab = "alpha_lab.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
