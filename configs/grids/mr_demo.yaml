@@ -1,0 +1,39 @@
+# Демонстрационная сетка фазы 2 (P4): 4 символа × 3 таймфрейма × 3 k × 4 window
+# = 144 конфигурации. Нужна для реального сквозного прогона и воронки отбора;
+# это не исследовательский манифест, а воспроизводимый пример масштаба.
+# ВНИМАНИЕ: impact_coef в costs откалиброван под долю заявки в объёме бара 1h;
+# на 4h/1d его следовало бы пересчитать (масштаб ~ с горизонтом). Для
+# чернового демо-прогона это зафиксированное упрощение, а не незамеченная ошибка.
+experiment:
+  name: mr_demo
+  strategy: mean_reversion
+  timeframe: 1h            # базовый; ось timeframes переопределяет
+  start: "2022-01-01"
+  end: "2025-12-31"
+  params:
+    window: 20
+    k: 2.0
+    atr_len: 14
+    sl_atr: 2.0
+    tp_atr: 6.0
+    use_hl_filter: false
+    hl_min: 5.0
+    hl_max: 100.0
+  costs:
+    taker_fee_bps: 5.0
+    maker_fee_bps: 2.0
+    maker_share: 0.0
+    impact_coef: 0.1
+    min_slippage_bps: 0.5
+  validation:
+    n_permutations: 1000
+    min_trades: 100
+    max_pbo: 0.5
+    max_p_value: 0.05
+
+axes:
+  symbols: [BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT]
+  timeframes: [1h, 4h, 1d]
+  params:
+    k: [1.5, 2.0, 2.5]
+    window: [10, 20, 30, 40]

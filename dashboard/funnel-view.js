@@ -75,7 +75,7 @@
           <div style="height:6px;border-radius:3px;width:${width}%;background:#38bdf8"></div></div></td>
       </tr>`;
     }).join('') + (block.n === 0 ? '' :
-      `<tr><td><b>${block.alive ? 'alive' : 'alive'}</b></td>
+      `<tr><td><b>alive</b></td>
         <td class="num mono"><b>${int(block.alive.n)}</b></td>
         <td class="num mono">${pct(block.alive.fraction_of_total)}</td>
         <td class="num mono">${pct(block.alive.fraction_of_previous)}</td>
