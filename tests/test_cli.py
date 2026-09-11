@@ -1584,3 +1584,232 @@ def test_causality_provenance_is_recorded_for_protected_run(tmp_path):
     # 500-баровый ряд: политика n <= 600 — сплошное покрытие, k = 2..n-1.
     assert extra["causality_cuts"] == 498
     assert not any("ОТКЛЮЧЕНА" in w for w in payload["verdict"]["warnings"])
+
+
+# ── W5: свип конфигураций и PBO ──────────────────────────────────────────────
+
+# Три k с заведомо разным поведением на фикстуре (14/12/6 сделок): одинаковые
+# ряды доходностей отвергаются, поэтому свип обязан быть настоящим.
+SWEEP_PARAMS = (
+    {"window": 20, "k": 1.5},
+    {"window": 20, "k": 2.0},
+    {"window": 20, "k": 2.5},
+)
+
+
+def _write_experiment(tmp_path: Path, name: str, params: dict, timeframe="1h",
+                      start="2024-01-01", end="2024-06-30") -> Path:
+    p = tmp_path / f"{name}.yaml"
+    p.write_text(
+        f"name: {name}\n"
+        "strategy: mean_reversion\n"
+        f"timeframe: {timeframe}\n"
+        f"start: '{start}'\nend: '{end}'\n"
+        f"params: {params}\n"
+        "costs: {taker_fee_bps: 5.0}\n"
+        "validation: {min_trades: 1}\n",
+        encoding="utf-8")
+    return p
+
+
+def _write_manifest(tmp_path: Path, paths, name="manifest") -> Path:
+    m = tmp_path / f"{name}.txt"
+    m.write_text("# свип\n" + "\n".join(str(p) for p in paths) + "\n",
+                 encoding="utf-8")
+    return m
+
+
+def _write_sweep_configs(tmp_path, params_list=None, **kwargs):
+    """Конфиги свипа + манифест; возвращает (манифест, пути конфигов)."""
+    params_list = list(params_list if params_list is not None else SWEEP_PARAMS)
+    paths = [_write_experiment(tmp_path, f"sweep{i}", params, **kwargs)
+             for i, params in enumerate(params_list)]
+    return _write_manifest(tmp_path, paths, "sweep_manifest"), paths
+
+
+def _run_validate_configs(root: Path, u: Path, manifest: Path, out: Path,
+                          journal: Path, *extra: str) -> int:
+    return main(["validate", "--configs", str(manifest), "--universe", str(u),
+                 "--data-root", str(root), "--out", str(out),
+                 "--journal", str(journal), *extra])
+
+
+def test_configs_manifest_computes_pbo_and_records_sweep(tmp_path, capsys):
+    """Манифест из N конфигураций делает четвёртый гейт вычислимым.
+
+    PBO обязан считаться по матрице доходностей БАРОВ (T × N), а не сделок:
+    форма [500, 3] — это 500 часовых баров фикстуры, то есть T = числу баров.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, _ = _write_configs(tmp_path, root)
+    manifest, paths = _write_sweep_configs(tmp_path)
+    out = tmp_path / "out"
+
+    code = _run_validate_configs(root, u, manifest, out,
+                                 tmp_path / "trials.jsonl")
+
+    assert code == 0
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    verdict = payload["verdict"]
+    assert verdict["pbo"] is not None
+    assert 0.0 <= verdict["pbo"] <= 1.0
+    assert not any("PBO не оценён" in w for w in verdict["warnings"])
+
+    sweep = payload["extra"]["sweep"]
+    assert sweep["matrix_shape"] == [500, 3]
+    assert sweep["headline"]["index"] == 0
+    assert sweep["headline"]["name"] == "sweep0"
+    assert "первая" in sweep["rule"]
+    assert len(sweep["configs"]) == 3
+    for i, row in enumerate(sweep["configs"]):
+        assert row["index"] == i
+        assert row["experiment_id"]
+        assert row["params"]["k"] == SWEEP_PARAMS[i]["k"]
+        assert row["dsr"] is not None
+        assert row["p_value"] is not None
+    # Заголовочная — первая в манифесте; её метрики и есть verdict отчёта.
+    assert sweep["configs"][0]["experiment_id"] == verdict["experiment_id"]
+
+    printed = capsys.readouterr().out
+    assert "Свип" in printed
+    assert "500×3" in printed
+    for row in sweep["configs"]:
+        assert row["name"] in printed
+
+
+def test_sweep_journals_every_config_and_deflates_headline(tmp_path):
+    """20 конфигураций — это 20 попыток, а не одна.
+
+    Каждая конфигурация пишется в журнал отдельной записью, а n_trials
+    заголовочного вердикта — сумма (прошлых попыток + текущей) по всем
+    конфигурациям манифеста. Иначе штраф DSR считался бы от одной попытки,
+    и свип выглядел бы честнее, чем он есть.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, _ = _write_configs(tmp_path, root)
+    manifest, _ = _write_sweep_configs(tmp_path)
+    journal = tmp_path / "trials.jsonl"
+
+    trials = []
+    for i in range(2):
+        out = tmp_path / f"out{i}"
+        assert _run_validate_configs(root, u, manifest, out, journal) == 0
+        payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+        trials.append(payload["verdict"]["n_configs_tried"])
+
+    assert trials == [3, 6]
+    records = [json.loads(line) for line
+               in journal.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 6
+    keys = {json.dumps(r["key"], sort_keys=True, ensure_ascii=False)
+            for r in records}
+    assert len(keys) == 3
+
+
+def test_sweep_rejects_identical_hypotheses(tmp_path, capsys):
+    """Два одинаковых конфига — не свип: PBO на идентичных колонках вырожден."""
+    manifest, _ = _write_sweep_configs(
+        tmp_path, [{"window": 20, "k": 2.0}, {"window": 20, "k": 2.0}])
+    out = tmp_path / "out"
+
+    code = _run_validate_configs(tmp_path / "data", tmp_path / "u.yaml",
+                                 manifest, out, tmp_path / "trials.jsonl")
+
+    assert code == cli.EXIT_ERROR
+    assert "идентичн" in capsys.readouterr().err
+    assert not (out / "report.json").exists()
+
+
+def test_sweep_rejects_configs_with_another_period_or_timeframe(tmp_path, capsys):
+    """Свип обязан идти на одном символе, периоде и таймфрейме.
+
+    Иначе ряды не выравниваются, и PBO считался бы по несогласованной матрице —
+    ровно та тихая порча, от которой защищает проект.
+    """
+    u = tmp_path / "u.yaml"
+    u.write_text("market: futures-um\nstart: '2024-01-01'\nend: '2024-06-30'\n"
+                 "symbols: [BTCUSDT]\n", encoding="utf-8")
+
+    for n, (field_name, bad_value) in enumerate(
+            (("timeframe", "4h"), ("start", "2024-02-01"),
+             ("end", "2024-07-01"))):
+        a = _write_experiment(tmp_path, f"a{n}", {"window": 20, "k": 2.0})
+        b = _write_experiment(tmp_path, f"b{n}", {"window": 30, "k": 2.0},
+                              **{field_name: bad_value})
+        manifest = _write_manifest(tmp_path, [a, b], f"m{n}")
+        out = tmp_path / f"out{n}"
+
+        code = _run_validate_configs(tmp_path / "data", u, manifest, out,
+                                     tmp_path / f"j{n}.jsonl")
+
+        assert code == cli.EXIT_ERROR, field_name
+        err = capsys.readouterr().err
+        assert field_name in err, (field_name, err)
+        assert not (out / "report.json").exists()
+
+
+def test_validate_requires_exactly_one_of_config_or_configs(tmp_path, capsys):
+    base = ["validate", "--universe", str(tmp_path / "u.yaml"),
+            "--data-root", str(tmp_path / "data"), "--out", str(tmp_path / "out")]
+
+    assert main(list(base)) == cli.EXIT_ERROR
+    assert "ровно один" in capsys.readouterr().err
+
+    assert main([*base, "--config", "a.yaml", "--configs", "m.txt"]) == \
+        cli.EXIT_ERROR
+    assert "ровно один" in capsys.readouterr().err
+
+
+def test_sweep_manifest_with_one_config_is_rejected(tmp_path, capsys):
+    """Одна конфигурация — не свип: CSCV требует минимум две колонки."""
+    only = _write_experiment(tmp_path, "only", {"window": 20, "k": 2.0})
+    manifest = _write_manifest(tmp_path, [only])
+    out = tmp_path / "out"
+
+    code = _run_validate_configs(tmp_path / "data", tmp_path / "u.yaml",
+                                 manifest, out, tmp_path / "trials.jsonl")
+
+    assert code == cli.EXIT_ERROR
+    assert "минимум 2" in capsys.readouterr().err
+    assert not (out / "report.json").exists()
+
+
+def test_single_config_keeps_pbo_warning_and_has_no_sweep(tmp_path):
+    """Одиночный путь не изменился: PBO не оценён, предупреждение на месте."""
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert payload["verdict"]["pbo"] is None
+    assert any("PBO не оценён" in w for w in payload["verdict"]["warnings"])
+    assert "sweep" not in payload["extra"]
+
+
+def test_sweep_pbo_gate_kills_headline_and_names_value(tmp_path, monkeypatch,
+                                                       capsys):
+    """Гейт spec 6.5 срабатывает и в CLI: pbo ≥ max_pbo — смерть с причиной."""
+    import alpha_lab.validation.significance as significance
+
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, _ = _write_configs(tmp_path, root)
+    manifest, _ = _write_sweep_configs(tmp_path)
+    out = tmp_path / "out"
+    monkeypatch.setattr(significance, "pbo_cscv",
+                        lambda matrix, n_blocks=10: 0.75)
+
+    assert _run_validate_configs(root, u, manifest, out,
+                                 tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    verdict = payload["verdict"]
+    assert verdict["alive"] is False
+    assert any("PBO 0.75" in reason and "0.5" in reason
+               for reason in verdict["reasons"]), verdict["reasons"]
+    assert "0.75" in capsys.readouterr().out

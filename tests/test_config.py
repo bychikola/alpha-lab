@@ -1,7 +1,7 @@
 import pytest
 import yaml
 
-from alpha_lab.config import load_experiment, load_universe
+from alpha_lab.config import load_experiment, load_manifest, load_universe
 
 
 def test_load_universe(tmp_path):
@@ -98,3 +98,44 @@ def test_experiment_rejects_unknown_timeframe(tmp_path):
 
     with pytest.raises(ValueError, match="таймфрейм"):
         load_experiment(p)
+
+
+def test_load_manifest_skips_comments_and_resolves_relative_paths(tmp_path):
+    """Манифест — текстовый список путей: строки и комментарии, пути от него.
+
+    Относительные пути разрешаются от каталога манифеста, а не от CWD: манифест
+    переносится вместе с конфигами и не зависит от того, откуда его запустили.
+    """
+    cfgs = tmp_path / "cfgs"
+    cfgs.mkdir()
+    for name in ("a.yaml", "b.yaml"):
+        (cfgs / name).write_text("name: x", encoding="utf-8")
+    m = tmp_path / "sweep.txt"
+    m.write_text("# свип\n\ncfgs/a.yaml\n  cfgs/b.yaml  \n# конец\n",
+                 encoding="utf-8")
+
+    assert load_manifest(m) == [cfgs / "a.yaml", cfgs / "b.yaml"]
+
+
+def test_load_manifest_rejects_missing_file(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Манифест"):
+        load_manifest(tmp_path / "nope.txt")
+
+
+def test_load_manifest_rejects_empty_file(tmp_path):
+    m = tmp_path / "empty.txt"
+    m.write_text("# только комментарии\n\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="пуст"):
+        load_manifest(m)
+
+
+def test_load_manifest_rejects_duplicate_paths(tmp_path):
+    """Дубликат пути — одна гипотеза, а не две: PBO на такой матрице вырожден."""
+    cfg = tmp_path / "a.yaml"
+    cfg.write_text("name: x", encoding="utf-8")
+    m = tmp_path / "sweep.txt"
+    m.write_text("a.yaml\na.yaml\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="[Дд]убликат"):
+        load_manifest(m)

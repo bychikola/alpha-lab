@@ -50,6 +50,66 @@ class Verdict:
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
+def build_returns_matrix(columns: dict[str, pd.Series]) -> pd.DataFrame:
+    """Собирает матрицу доходностей конфигураций (T × N) для PBO/CSCV.
+
+    columns — отображение «имя конфигурации → ряд доходностей БАРОВ» (не
+    сделок): pbo_cscv ожидает периодические доходности, T — число баров одной
+    и той же истории, N — число конфигураций. Порядок колонок сохраняется.
+
+    Выравнивание проверяется, а не чинится: reindex или обрезка сдвинули бы
+    доходности конфигураций друг относительно друга, и PBO посчитался бы по
+    несогласованным рядам — правдоподобная тихая ложь, ровно тот класс ошибок,
+    против которого существует полигон. Несовпадение длины или временного
+    индекса, нефинитные значения и идентичные колонки (одна гипотеза, а не
+    свип) — ValueError.
+    """
+    if len(columns) < 2:
+        raise ValueError(
+            f"матрица доходностей требует минимум 2 конфигурации, получено "
+            f"{len(columns)}: PBO на одной колонке неопределён"
+        )
+    items = list(columns.items())
+    ref_name, ref = items[0]
+    ref_index = pd.Index(ref.index)
+    ref_values = np.asarray(ref, dtype="float64")
+    if not np.isfinite(ref_values).all():
+        raise ValueError(
+            f"ряд '{ref_name}' содержит нефинитные доходности: PBO на таком "
+            f"ряде неопределён"
+        )
+    for name, series in items[1:]:
+        values = np.asarray(series, dtype="float64")
+        index = pd.Index(series.index)
+        if len(values) != len(ref_values) or not index.equals(ref_index):
+            left = index[0] if len(index) else "—"
+            right = index[-1] if len(index) else "—"
+            ref_left = ref_index[0] if len(ref_index) else "—"
+            ref_right = ref_index[-1] if len(ref_index) else "—"
+            raise ValueError(
+                f"конфигурация '{name}' не выровнена с '{ref_name}': длина "
+                f"{len(values)} против {len(ref_values)}, индекс {left}..{right} "
+                f"против {ref_left}..{ref_right}. Матрица PBO строится только "
+                f"из рядов на общем временном индексе; молча выравнивать нельзя."
+            )
+        if not np.isfinite(values).all():
+            raise ValueError(
+                f"ряд '{name}' содержит нефинитные доходности: PBO на таком "
+                f"ряде неопределён"
+            )
+    for name, series in items[1:]:
+        if np.array_equal(ref_values, np.asarray(series, dtype="float64")):
+            raise ValueError(
+                f"конфигурации '{ref_name}' и '{name}' дают идентичные ряды "
+                f"доходностей: это одна гипотеза, а не свип, и PBO на такой "
+                f"матрице вырожден."
+            )
+    return pd.DataFrame(
+        {name: np.asarray(series, dtype="float64") for name, series in items},
+        index=ref_index,
+    )
+
+
 def validate(returns, trade_returns, equity, config: dict, n_trials: int,
              strategy_name: str, experiment_id: str,
              returns_matrix=None, price_returns=None, positions=None,
@@ -60,6 +120,13 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
     price_returns и positions обязательны для permutation-теста: он перемешивает
     позиции относительно доходностей. Без них проверка невозможна, и вердикт
     выносится отрицательный — тихая деградация недопустима.
+
+    returns_matrix — матрица (T × N) доходностей БАРОВ разных конфигураций на
+    общем временном индексе (см. build_returns_matrix). Если она передана,
+    PBO считается и гейт spec 6.5 «pbo < 0.5» срабатывает. Если нет (одиночный
+    прогон), PBO остаётся NaN, а непроверенный гейт честно называется в
+    warnings — не в reasons: отсутствие матрицы свойство прогона, а не дефект
+    стратегии.
 
     warnings — внешние (собранные CLI) предупреждения о непроверенных гейтах;
     к ним добавляется предупреждение о неоценённом PBO. Предупреждения — plain
@@ -108,9 +175,10 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
         # условие spec 6.5 «pbo < 0.5» остаётся непроверенным, и вердикт
         # обязан сказать об этом явно, отдельным каналом warnings.
         warn.append(
-            "PBO не оценён: матрица доходностей конфигураций не передана. "
-            "Условие spec 6.5 «pbo < 0.5» для этого прогона не проверено; "
-            "PBO требует многоконфигурационную матрицу (возможность фазы 2)."
+            "PBO не оценён: матрица доходностей конфигураций не передана "
+            "(одиночный прогон). Условие spec 6.5 «pbo < 0.5» для этого "
+            "прогона не проверено; PBO требует многоконфигурационную матрицу "
+            "— её строит свип по манифесту (--configs)."
         )
 
     reasons: list[str] = []

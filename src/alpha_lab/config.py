@@ -78,6 +78,50 @@ def load_universe(path: str | Path) -> Universe:
     )
 
 
+def load_manifest(path: str | Path) -> list[Path]:
+    """Читает манифест свипа: один путь к эксперименту на строку.
+
+    Формат выбран текстовым списком, а не перечислением через запятую:
+    путь на Windows содержит двоеточие и обратные слэши, а запятая в имени
+    файла сделала бы разбор неоднозначным; манифест к тому же переносится
+    вместе с конфигами. Правила:
+
+    * пустые строки игнорируются;
+    * строки, начинающиеся с '#', — комментарии;
+    * относительные пути разрешаются от каталога манифеста, а не от CWD;
+    * дубликат пути отвергается: один файл — одна гипотеза, а PBO на
+      идентичных колонках вырожден, поэтому «свип» из копий бессмыслен.
+
+    Существование самих конфигов здесь не проверяется — это делает
+    load_experiment с внятным сообщением.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Манифест не найден: {path}")
+    entries: list[Path] = []
+    for lineno, raw in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        entry = Path(line)
+        if not entry.is_absolute():
+            entry = path.parent / entry
+        if entry in entries:
+            raise ValueError(
+                f"Манифест {path}: путь {line} (строка {lineno}) указан дважды. "
+                f"Дубликат — это одна гипотеза, а не две: PBO на идентичных "
+                f"колонках вырожден."
+            )
+        entries.append(entry)
+    if not entries:
+        raise ValueError(
+            f"Манифест {path} пуст: нужен хотя бы один путь к эксперименту "
+            f"(для свипа с PBO — минимум два)."
+        )
+    return entries
+
+
 def load_experiment(path: str | Path) -> Experiment:
     data = _read_yaml(Path(path))
     for field_name in ("name", "strategy", "timeframe", "start"):

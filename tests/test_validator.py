@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from alpha_lab.validation.metrics import sharpe_ratio
-from alpha_lab.validation.validator import Verdict, validate
+from alpha_lab.validation.validator import Verdict, build_returns_matrix, validate
 
 
 def _case(n=5000, seed=1, strength=0.8, drift=0.0):
@@ -261,3 +261,98 @@ def test_external_warnings_are_preserved_and_do_not_kill():
     assert v.alive
     assert "внешнее предупреждение о данных" in v.warnings
     assert v.reasons == ()
+
+
+def _matrix_columns(n=200, seed=40) -> dict[str, pd.Series]:
+    """Выровненные ряды доходностей трёх «конфигураций» по общему индексу баров."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
+    return {
+        "cfg_a": pd.Series(rng.normal(0.0, 0.01, n), index=idx),
+        "cfg_b": pd.Series(rng.normal(0.0, 0.01, n), index=idx),
+        "cfg_c": pd.Series(rng.normal(0.0, 0.01, n), index=idx),
+    }
+
+
+def test_build_returns_matrix_aligns_columns_on_shared_index():
+    columns = _matrix_columns()
+
+    matrix = build_returns_matrix(columns)
+
+    assert matrix.shape == (200, 3)
+    assert list(matrix.columns) == ["cfg_a", "cfg_b", "cfg_c"]
+    assert matrix.index.equals(columns["cfg_a"].index)
+    np.testing.assert_allclose(matrix["cfg_b"].to_numpy(),
+                               columns["cfg_b"].to_numpy())
+
+
+def test_build_returns_matrix_rejects_length_mismatch():
+    """Разная длина — это разные ряды, а не «общий кусок»: ValueError, не обрезка."""
+    columns = _matrix_columns()
+    columns["cfg_short"] = columns["cfg_a"].iloc[:-1]
+
+    with pytest.raises(ValueError, match="cfg_short"):
+        build_returns_matrix(columns)
+
+
+def test_build_returns_matrix_rejects_index_mismatch():
+    """Одинаковая длина при сдвинутом времени — молчаливая порча PBO.
+
+    Доходности конфигураций относились бы к разным барам, и CSCV сравнивал бы
+    несовместимые ряды. Выравнивать (reindex) нельзя: NaN или сдвиг внутри
+    матрицы неотличимы от честных данных.
+    """
+    columns = _matrix_columns()
+    shifted = columns["cfg_a"].copy()
+    shifted.index = shifted.index + pd.Timedelta(hours=1)
+    columns["cfg_b"] = shifted
+
+    with pytest.raises(ValueError, match="cfg_b"):
+        build_returns_matrix(columns)
+
+
+def test_build_returns_matrix_rejects_single_config():
+    """PBO на одной колонке неопределён: вызывающий обязан не делать вид, что нет."""
+    columns = _matrix_columns()
+    single = {"cfg_a": columns["cfg_a"]}
+
+    with pytest.raises(ValueError, match="2"):
+        build_returns_matrix(single)
+
+
+def test_build_returns_matrix_rejects_identical_columns():
+    """Идентичные ряды — одна гипотеза, а не свип: CSCV на них вырожден."""
+    columns = _matrix_columns()
+    columns["cfg_b"] = columns["cfg_a"].copy()
+
+    with pytest.raises(ValueError, match="идентичн"):
+        build_returns_matrix(columns)
+
+
+def test_build_returns_matrix_rejects_nonfinite_values():
+    columns = _matrix_columns()
+    bad = columns["cfg_a"].copy()
+    bad.iloc[7] = np.nan
+    columns["cfg_b"] = bad
+
+    with pytest.raises(ValueError, match="cfg_b"):
+        build_returns_matrix(columns)
+
+
+def test_pbo_above_threshold_kills_and_names_value(monkeypatch):
+    """Гейт PBO обязан срабатывать по порогу из конфига и называть значение.
+
+    Матрица здесь валидна, а число подменено: проверяется именно сравнение
+    pbo >= max_pbo и текст причины, а не статистика CSCV.
+    """
+    import alpha_lab.validation.significance as significance
+
+    monkeypatch.setattr(significance, "pbo_cscv", lambda matrix, n_blocks=10: 0.75)
+    matrix = np.column_stack(
+        [s.to_numpy(dtype="float64") for s in _matrix_columns().values()])
+    v = _run(_case(seed=21, strength=0.8), _trades(300, 21),
+             config={"max_pbo": 0.5}, returns_matrix=matrix)
+
+    assert not v.alive
+    assert any("PBO 0.75" in reason and "0.5" in reason for reason in v.reasons)
+    assert not any("PBO" in w for w in v.warnings)
