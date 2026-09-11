@@ -47,10 +47,26 @@ def test_slippage_capped_when_order_exceeds_bar_volume():
     assert c.slippage_bps(10_000_000.0, 1_000_000.0) == pytest.approx(0.5 + 1e4 * 0.1)
 
 
+def test_slippage_clamped_at_full_bar_volume():
+    c = RealisticCost(impact_coef=0.1, min_slippage_bps=0.5)
+
+    # заявка ровно в объём бара тоже упирается в потолок доли —
+    # это предохранитель, а не модель исполнения
+    assert c.slippage_bps(1_000_000.0, 1_000_000.0) == pytest.approx(0.5 + 1e4 * 0.1)
+
+
 def test_slippage_handles_zero_volume():
     c = RealisticCost(min_slippage_bps=0.5)
 
     assert c.slippage_bps(1000.0, 0.0) == pytest.approx(0.5)
+
+
+def test_slippage_handles_non_finite_volume():
+    c = RealisticCost(min_slippage_bps=0.5)
+
+    # NaN не ловится сравнением <= 0 и отравил бы кривую эквити
+    assert c.slippage_bps(1000.0, float("nan")) == pytest.approx(0.5)
+    assert c.slippage_bps(1000.0, float("inf")) == pytest.approx(0.5)
 
 
 def test_funding_cost_sign_follows_position():
@@ -83,3 +99,12 @@ def test_from_config_ignores_unknown_keys():
 def test_from_config_empty_and_none_use_defaults():
     assert RealisticCost.from_config({}) == RealisticCost()
     assert RealisticCost.from_config(None) == RealisticCost()
+
+
+def test_from_config_none_value_falls_back_to_default():
+    # YAML-ключ без значения парсится в None: должно применяться значение
+    # по умолчанию, а не падение в арифметике
+    c = RealisticCost.from_config({"taker_fee_bps": None, "maker_share": 0.5})
+
+    assert c.taker_fee_bps == 5.0
+    assert c.maker_share == 0.5
