@@ -151,7 +151,9 @@ def test_control_constant_positive_rate_earns_exact_sum_minus_round_trip():
         np.full(_CONTROL_POSITIVE_BARS, _CONTROL_RATE),
         np.zeros(_CONTROL_N - _CONTROL_POSITIVE_BARS),
     ])
-    bars = _bars(_CONTROL_N, funding_rate=rate)
+    # Бары — БЕЗ колонки funding: ставку обязан прикрепить CLI (needs_funding),
+    # иначе этот тест не проверял бы проводку, а читал бы колонку напрямую.
+    bars = _bars(_CONTROL_N)
     exp = _exp(params={"window": _CONTROL_WINDOW,
                        "horizon_bars": _CONTROL_HORIZON,
                        "fee_bps": _FEE_BPS, "slippage_bps": 0.0})
@@ -162,8 +164,9 @@ def test_control_constant_positive_rate_earns_exact_sum_minus_round_trip():
     # Решение: дельта-нейтрально, 100 баров в книге (72..171), вход/выход 1/1.
     assert res.positions.tolist() == [0.0] * _CONTROL_N
     assert outcome.history == _CONTROL_WINDOW
+    signal_bars = bars.assign(**{FUNDING_RATE_COLUMN: rate})
     legs = _strategy(window=_CONTROL_WINDOW, horizon_bars=_CONTROL_HORIZON,
-                     fee_bps=_FEE_BPS, slippage_bps=0.0).generate_legs(bars)
+                     fee_bps=_FEE_BPS, slippage_bps=0.0).generate_legs(signal_bars)
     assert legs.carry.tolist() == [0.0] * 71 + [-1.0] * 100 + [0.0] * 29
     assert _entries_exits(legs.gross) == (1, 1)
     in_book = float((legs.carry != 0.0).mean())
