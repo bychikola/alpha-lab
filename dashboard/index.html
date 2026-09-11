@@ -32,8 +32,12 @@
 </div>
 
 <!-- Данные подключаются как скрипт: fetch() к file:// блокируется CORS,
-     поэтому writer отдаёт report.js, а не только report.json. -->
+     поэтому writer отдаёт report.js, а не только report.json.
+     funnel.js (P4) — воронка отбора по всему хранилищу свипа; если файла нет,
+     funnel-view.js молча ничего не рисует. -->
 <script src="report.js"></script>
 <script src="app.js"></script>
+<script src="funnel.js"></script>
+<script src="funnel-view.js"></script>
 </body>
 </html>

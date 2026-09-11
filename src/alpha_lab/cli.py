@@ -1136,10 +1136,12 @@ def main(argv: list[str] | None = None) -> int:
                             "поэтому вердикт с этим флагом может быть ложным")
     p_val.set_defaults(func=_cmd_validate)
 
-    # Пакетный свип регистрируется лениво: batch.py берёт production-функции
-    # этого модуля, и импорт на верхнем уровне создал бы цикл.
+    # Пакетный свип и воронка регистрируются лениво: batch.py берёт
+    # production-функции этого модуля, и импорт на верхнем уровне создал бы цикл.
     from alpha_lab.batch import add_sweep_subparser
     add_sweep_subparser(sub)
+    from alpha_lab.funnel import add_report_subparser
+    add_report_subparser(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)
