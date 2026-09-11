@@ -329,6 +329,28 @@ def test_build_returns_matrix_rejects_identical_columns():
         build_returns_matrix(columns)
 
 
+def test_build_returns_matrix_rejects_identical_non_reference_pair():
+    """Идентичность проверяется попарно, а не только с опорной колонкой.
+
+    Матрица (A, B, B) — это две гипотезы, а не три: PBO на дублирующихся
+    колонках вырожден, а штраф за перебор занижен. Сравнение лишь с первой
+    колонкой пропускало такой дубликат, поэтому каждая пара обязана быть
+    проверена.
+    """
+    columns = _matrix_columns()
+    columns["cfg_c"] = columns["cfg_b"].copy()
+
+    with pytest.raises(ValueError, match="cfg_c") as excinfo:
+        build_returns_matrix(columns)
+
+    message = str(excinfo.value)
+    # Сообщение обязано называть обе конфигурации и их позиции в матрице,
+    # иначе по тексту нельзя понять, какую пару чинить.
+    assert "cfg_b" in message
+    assert "[1]" in message
+    assert "[2]" in message
+
+
 def test_build_returns_matrix_rejects_nonfinite_values():
     columns = _matrix_columns()
     bad = columns["cfg_a"].copy()
@@ -337,6 +359,38 @@ def test_build_returns_matrix_rejects_nonfinite_values():
 
     with pytest.raises(ValueError, match="cfg_b"):
         build_returns_matrix(columns)
+
+
+def test_validate_uses_precomputed_pbo_without_recomputing(monkeypatch):
+    """CLI считает CSCV один раз на свип: готовый float не пересчитывается.
+
+    Иначе на N конфигураций приходилось бы N одинаковых вызовов CSCV — тот же
+    результат за N-кратную плату.
+    """
+    import alpha_lab.validation.significance as significance
+
+    def boom(matrix, n_blocks=10):
+        pytest.fail("pbo_cscv не должен вызываться при готовом pbo_value")
+
+    monkeypatch.setattr(significance, "pbo_cscv", boom)
+    rng = np.random.default_rng(22)
+    matrix = rng.normal(0.0, 0.01, size=(200, 5))
+    v = _run(_case(seed=22, strength=0.8), _trades(300, 22),
+             config={"max_pbo": 0.5}, returns_matrix=matrix, pbo_value=0.75)
+
+    assert v.pbo == 0.75
+    assert not v.alive
+    assert any("PBO 0.75" in reason for reason in v.reasons)
+
+
+def test_validate_rejects_pbo_value_without_matrix():
+    """Предвычисленный PBO без матрицы — ошибка вызывающего, а не тихий пропуск.
+
+    Иначе гейт spec 6.5 «pbo < 0.5» не проверился бы, а вердикт молчал бы об
+    этом: значение просто потерялось бы.
+    """
+    with pytest.raises(ValueError, match="pbo_value"):
+        _run(_case(seed=23, strength=0.8), _trades(300, 23), pbo_value=0.3)
 
 
 def test_pbo_above_threshold_kills_and_names_value(monkeypatch):

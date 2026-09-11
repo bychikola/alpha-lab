@@ -122,6 +122,20 @@ def test_load_manifest_rejects_missing_file(tmp_path):
         load_manifest(tmp_path / "nope.txt")
 
 
+def test_load_manifest_rejects_directory(tmp_path):
+    """Каталог — не манифест: ошибка конфига, а не IsADirectoryError наружу.
+
+    read_text на каталоге даёт ОС-зависимое исключение (IsADirectoryError на
+    POSIX, PermissionError на Windows). Оба — не FileNotFoundError, и CLI ловил
+    бы их трейсбеком вместо чистого EXIT_ERROR.
+    """
+    d = tmp_path / "manifest_dir"
+    d.mkdir()
+
+    with pytest.raises(ValueError, match="каталог"):
+        load_manifest(d)
+
+
 def test_load_manifest_rejects_empty_file(tmp_path):
     m = tmp_path / "empty.txt"
     m.write_text("# только комментарии\n\n", encoding="utf-8")

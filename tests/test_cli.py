@@ -486,6 +486,91 @@ def test_count_prior_trials_skips_malformed_lines(tmp_path):
     assert count_prior_trials(journal, other) == 1
 
 
+def test_count_prior_trials_expands_sweep_family(tmp_path):
+    """Семейная метка делает попытками свипа все его конфигурации.
+
+    Свип из трёх конфигураций — это три проверенные гипотезы. Запрос по любому
+    участнику обязан вернуть все три: иначе перезапущенный одиночно участник
+    получит n_trials = 2 вместо 4 и менее штрафованный DSR. Одиночная запись
+    того же ключа (без метки) — отдельная попытка и добавляется к семье.
+    """
+    journal = tmp_path / "trials.jsonl"
+    keys = [
+        {"strategy": "mean_reversion", "params": {"window": 20, "k": k},
+         "symbol": "BTCUSDT", "timeframe": "1h"}
+        for k in (1.5, 2.0, 2.5)
+    ]
+    family = sorted(json.dumps(key, sort_keys=True, ensure_ascii=False)
+                    for key in keys)
+    for i, key in enumerate(keys):
+        log_trial(journal, key, f"e{i}", {"sharpe": 1.0}, family=family)
+
+    assert count_prior_trials(journal, keys[0]) == 3
+    assert count_prior_trials(journal, keys[2]) == 3
+    # Чужая гипотеза семейной меткой не задевается.
+    stranger = {**keys[0], "params": {"window": 20, "k": 9.0}}
+    assert count_prior_trials(journal, stranger) == 0
+
+    log_trial(journal, keys[0], "e_solo", {"sharpe": 1.0})
+    assert count_prior_trials(journal, keys[0]) == 4
+
+
+def test_count_prior_trials_set_dedupes_whole_family(tmp_path):
+    """Повторный полный свип не должен умножать семью на число её ключей.
+
+    Сумма одиночных запросов по каждому участнику посчитала бы одно и то же
+    прошлое испытание семьи N раз (для N=3 вышло бы 9+3=12 попыток вместо
+    3+3=6). Набор ключей дедуплицирует записи журнала.
+    """
+    from alpha_lab.cli import count_prior_trials_for_keys
+
+    journal = tmp_path / "trials.jsonl"
+    keys = [
+        {"strategy": "mean_reversion", "params": {"window": 20, "k": k},
+         "symbol": "BTCUSDT", "timeframe": "1h"}
+        for k in (1.5, 2.0, 2.5)
+    ]
+    family = sorted(json.dumps(key, sort_keys=True, ensure_ascii=False)
+                    for key in keys)
+    for i, key in enumerate(keys):
+        log_trial(journal, key, f"e{i}", {"sharpe": 1.0}, family=family)
+
+    assert count_prior_trials_for_keys(journal, keys) == 3
+    # Сумма одиночных запросов завышала бы штраф втрое — именно поэтому CLI
+    # считает попытки набором ключей, а не суммой по ключам.
+    assert sum(count_prior_trials(journal, key) for key in keys) == 9
+
+
+def test_count_prior_trials_legacy_and_broken_family_fields(tmp_path):
+    """Журнал без family читается как раньше, битая метка не роняет счёт.
+
+    Записи до семейных меток обязаны считаться по прямому совпадению ключа;
+    family не-список или со не-строковыми элементами — это отсутствие
+    семейной информации, а не повреждение строки. Строка вместо списка
+    особенно опасна: проверка вхождения подстрокой посчитала бы чужую запись
+    попыткой этого ключа и завысила штраф случайным мусором.
+    """
+    journal = tmp_path / "trials.jsonl"
+    key = {"strategy": "mean_reversion", "params": {"window": 20, "k": 2.0},
+           "symbol": "BTCUSDT", "timeframe": "1h"}
+    other = {**key, "params": {"window": 20, "k": 2.5}}
+    stranger = {**key, "params": {"window": 20, "k": 7.0}}
+    lines = [
+        json.dumps({"key": key, "experiment_id": "legacy"}),
+        # Строка вместо списка: наивное `in` дало бы ложное совпадение.
+        json.dumps({"key": stranger, "experiment_id": "bad_str",
+                    "family": json.dumps(key, sort_keys=True,
+                                         ensure_ascii=False)}),
+        json.dumps({"key": other, "experiment_id": "bad_members",
+                    "family": [1, 2, 3]}),
+    ]
+    journal.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert count_prior_trials(journal, key) == 1
+    assert count_prior_trials(journal, stranger) == 1
+    assert count_prior_trials(journal, other) == 1
+
+
 def test_unreadable_journal_warns_and_counts_zero(tmp_path, capsys):
     """Нечитаемый журнал — не повод падать, но и не повод молчать.
 
@@ -1813,3 +1898,100 @@ def test_sweep_pbo_gate_kills_headline_and_names_value(tmp_path, monkeypatch,
     assert any("PBO 0.75" in reason and "0.5" in reason
                for reason in verdict["reasons"]), verdict["reasons"]
     assert "0.75" in capsys.readouterr().out
+
+
+def test_sweep_family_count_prevents_standalone_undercount(tmp_path):
+    """Участник свипа, перезапущенный одиночно, не должен «отмыться» от штрафа.
+
+    Каждая запись свипа несёт family-метку всего манифеста. Одиночный
+    перезапуск участника обязан учесть попытки всей семьи (4 конфигурации) плюс
+    собственную текущую попытку — тогда n_trials = 5. Без метки вышло бы
+    prior + 1 = 2, DSR вырос бы (измерено: 0.249 при N=1 против 0.042 при N=4),
+    и победитель свипа получил бы менее штрафованный вердикт — ошибка в
+    опасную сторону, ради которой DSR и существует.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, _ = _write_configs(tmp_path, root)
+    params4 = [*SWEEP_PARAMS, {"window": 20, "k": 3.0}]
+    manifest, paths = _write_sweep_configs(tmp_path, params4)
+    journal = tmp_path / "trials.jsonl"
+
+    assert _run_validate_configs(root, u, manifest, tmp_path / "sweep_out",
+                                 journal) == 0
+    sweep = json.loads((tmp_path / "sweep_out" / "report.json")
+                       .read_text(encoding="utf-8"))
+    assert sweep["verdict"]["n_configs_tried"] == 4
+
+    assert _run_validate(root, u, paths[1], tmp_path / "single_out",
+                         journal) == 0
+    single = json.loads((tmp_path / "single_out" / "report.json")
+                        .read_text(encoding="utf-8"))
+    assert single["verdict"]["n_configs_tried"] == 5
+    assert (single["verdict"]["n_configs_tried"]
+            >= sweep["verdict"]["n_configs_tried"])
+
+
+def test_sweep_computes_pbo_once_for_whole_manifest(tmp_path, monkeypatch):
+    """CSCV детерминирован: N конфигураций не должны считать его N раз.
+
+    PBO — свойство общей матрицы, а не отдельной колонки; вызов на каждую
+    конфигурацию давал один и тот же float за N-кратную плату.
+    """
+    import alpha_lab.validation.significance as significance
+
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, _ = _write_configs(tmp_path, root)
+    manifest, _ = _write_sweep_configs(tmp_path)
+
+    calls: list[tuple[int, ...]] = []
+    real = significance.pbo_cscv
+
+    def spy(matrix, n_blocks=10):
+        calls.append(np.asarray(matrix).shape)
+        return real(matrix, n_blocks=n_blocks)
+
+    monkeypatch.setattr(significance, "pbo_cscv", spy)
+
+    assert _run_validate_configs(root, u, manifest, tmp_path / "out",
+                                 tmp_path / "trials.jsonl") == 0
+    assert calls == [(500, 3)]
+
+
+def test_manifest_directory_is_clean_exit_error(tmp_path, capsys):
+    """Каталог вместо манифеста — ошибка конфига, а не трейсбек."""
+    manifest_dir = tmp_path / "manifest_is_a_dir"
+    manifest_dir.mkdir()
+    out = tmp_path / "out"
+
+    code = _run_validate_configs(tmp_path / "data", tmp_path / "u.yaml",
+                                 manifest_dir, out, tmp_path / "trials.jsonl")
+
+    assert code == cli.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "Ошибка" in err
+    assert "каталог" in err
+    assert not (out / "report.json").exists()
+
+
+def test_manifest_permission_error_is_clean_exit_error(tmp_path, monkeypatch,
+                                                       capsys):
+    """PermissionError при чтении манифеста — тоже EXIT_ERROR, не трейсбек.
+
+    Каталог — не единственный OSError на этом пути: файл без прав на чтение
+    (ACL Windows, POSIX) обязан давать ту же чистую ошибку конфига.
+    """
+    def deny(path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(cli, "load_manifest", deny)
+    out = tmp_path / "out"
+
+    code = _run_validate_configs(tmp_path / "data", tmp_path / "u.yaml",
+                                 tmp_path / "m.txt", out,
+                                 tmp_path / "trials.jsonl")
+
+    assert code == cli.EXIT_ERROR
+    assert "Ошибка" in capsys.readouterr().err
+    assert not (out / "report.json").exists()

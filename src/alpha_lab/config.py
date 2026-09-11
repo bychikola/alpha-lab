@@ -93,9 +93,15 @@ def load_manifest(path: str | Path) -> list[Path]:
       идентичных колонках вырожден, поэтому «свип» из копий бессмыслен.
 
     Существование самих конфигов здесь не проверяется — это делает
-    load_experiment с внятным сообщением.
+    load_experiment с внятным сообщением. Каталог вместо файла отвергается
+    явной ValueError: read_text на каталоге даёт ОС-зависимое исключение
+    (IsADirectoryError на POSIX, PermissionError на Windows), и наружу уходил
+    бы трейсбек вместо ошибки конфига.
     """
     path = Path(path)
+    if path.is_dir():
+        raise ValueError(
+            f"Манифест {path} — это каталог, а не файл со списком конфигураций")
     if not path.exists():
         raise FileNotFoundError(f"Манифест не найден: {path}")
     entries: list[Path] = []

@@ -67,16 +67,48 @@ def experiment_id(config: dict, dv: str, gh: str) -> str:
     return digest.hexdigest()[:16]
 
 
-def count_prior_trials(journal: Path, key: dict) -> int:
-    """Сколько раз эта же гипотеза уже прогонялась.
+def trial_fingerprint(key: dict) -> str:
+    """Каноническая подпись trial-ключа для журнала и семейных меток.
 
-    Число попыток нужно Deflated Sharpe: без него главная защита от оверфиттинга
-    отключается ровно там, где она нужна. Наивная «одна попытка» — самообман.
+    sort_keys/ensure_ascii убирают оформление (порядок ключей, экранирование),
+    чтобы одна гипотеза не выглядела двумя. Запись обязана быть JSON-точной:
+    default=str здесь не используется — молчаливое приведение типов склеило бы
+    разные гипотезы.
+    """
+    return json.dumps(key, sort_keys=True, ensure_ascii=False)
+
+
+def count_prior_trials_for_keys(journal: Path, keys: list[dict]) -> int:
+    """Сколько попыток текущего поиска уже лежит в журнале.
+
+    Попытка — одна запись журнала (один прогон одной конфигурации). ``keys`` —
+    trial-ключи текущего прогона (для свипа — все конфигурации манифеста).
+    Учитываются все различные записи, относящиеся к этому поиску:
+
+    * запись, ключ которой совпадает с одним из ``keys``, — прямое прошлое
+      испытание текущей гипотезы;
+    * запись с семейной меткой ``family`` (отсортированный список отпечатков
+      trial-ключей свипа), пересекающейся с ``keys``, — испытание, сделанное
+      внутри того же перебора. Свип из N конфигураций — это N попыток, поэтому
+      одиночный перезапуск его участника обязан нести штраф всей семьи, а не
+      одной своей строки: иначе победителя свипа можно «отмыть» одиночным
+      запуском и получить менее дефлированный DSR — ошибка в опасную сторону,
+      ровно та, против которой существует поправка.
+
+    Записи без поля ``family`` (журнал старых версий) учитываются только прямым
+    совпадением ключа — как до появления семейных меток. Метка не-список или со
+    не-строковыми элементами семейной информацией не считается: разбор журнала
+    обязан быть устойчивым к мусору и не наказывать за него лишними попытками.
+
+    Дедупликация по записям, а не сумма одиночных запросов по каждому ключу:
+    если текущий прогон сам покрывает всю семью (повторный свип того же
+    манифеста), каждая запись семьи обязана считаться один раз, иначе штраф
+    раздуло бы в N раз.
     """
     journal = Path(journal)
     if not journal.exists():
         return 0
-    fingerprint = json.dumps(key, sort_keys=True, ensure_ascii=False)
+    fingerprints = {trial_fingerprint(key) for key in keys}
     try:
         # errors="replace": один битый байт (обрыв записи при падении процесса)
         # не должен ронять весь прогон — испорченная строка просто пропустится.
@@ -99,8 +131,15 @@ def count_prior_trials(journal: Path, key: dict) -> int:
             if not isinstance(record, dict):
                 skipped += 1
                 continue
-            if json.dumps(record["key"], sort_keys=True,
-                          ensure_ascii=False) == fingerprint:
+            relevant = trial_fingerprint(record["key"]) in fingerprints
+            if not relevant:
+                family = record.get("family")
+                if isinstance(family, list):
+                    relevant = any(
+                        isinstance(member, str) and member in fingerprints
+                        for member in family
+                    )
+            if relevant:
                 count += 1
         except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
             # Валидный JSON не-объект (null/[]/123/"x"), обрыв объекта или
@@ -114,6 +153,17 @@ def count_prior_trials(journal: Path, key: dict) -> int:
               f"строк: {skipped}; n_trials занижен — DSR может быть завышен",
               file=sys.stderr)
     return count
+
+
+def count_prior_trials(journal: Path, key: dict) -> int:
+    """Сколько раз эта гипотеза уже прогонялась — с учётом её семьи.
+
+    Число попыток нужно Deflated Sharpe: без него главная защита от
+    оверфиттинга отключается ровно там, где она нужна. Наивная «одна попытка» —
+    самообман. Полная семантика семейных меток и устойчивости к мусору — в
+    count_prior_trials_for_keys; эта обёртка отвечает про одну гипотезу.
+    """
+    return count_prior_trials_for_keys(journal, [key])
 
 
 def journal_problem(journal: Path) -> str | None:
@@ -151,10 +201,21 @@ def journal_problem(journal: Path) -> str | None:
     return None
 
 
-def log_trial(journal: Path, key: dict, experiment: str, metrics: dict) -> None:
+def log_trial(journal: Path, key: dict, experiment: str, metrics: dict,
+              family: list[str] | None = None) -> None:
+    """Дозаписывает попытку в журнал.
+
+    family — отсортированный список отпечатков trial-ключей свипа, если прогон
+    был частью перебора (см. count_prior_trials_for_keys). Метка позволяет
+    последующему одиночному прогону участника увидеть попытки всей семьи.
+    Одиночный прогон family не пишет: он не перебор, и его запись обязана
+    читаться ровно как раньше.
+    """
     journal = Path(journal)
     journal.parent.mkdir(parents=True, exist_ok=True)
     record = {"key": key, "experiment_id": experiment, **metrics}
+    if family is not None:
+        record["family"] = list(family)
     with journal.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
@@ -432,7 +493,10 @@ def _cmd_validate(args) -> int:
         else:
             cfg_path = Path(args.config)
             configs = [(cfg_path, load_experiment(cfg_path))]
-    except (FileNotFoundError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
+        # OSError, а не только FileNotFoundError: каталог вместо манифеста
+        # (IsADirectoryError на POSIX, PermissionError на Windows) и файл без
+        # прав на чтение обязаны давать чистый EXIT_ERROR, а не трейсбек.
         print(f"Ошибка конфига: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
@@ -642,12 +706,14 @@ def _cmd_validate(args) -> int:
                   file=sys.stderr)
             return EXIT_ERROR
         # n_trials свипа — суммарное число попыток всей семьи: прошлые записи
-        # журнала по каждой конфигурации плюс текущий прогон каждой. Одна
+        # журнала, относящиеся к текущему поиску (включая семейные метки
+        # прошлых свипов), плюс текущий прогон каждой конфигурации. Одна
         # попытка на манифест занизила бы DSR ровно там, где штраф нужен:
         # каждая конфигурация — проверенная гипотеза, даже если отчёт
-        # показывает метрики одной (первой) из них.
-        n_trials = sum(count_prior_trials(journal, key) + 1
-                       for key in trial_keys)
+        # показывает метрики одной (первой) из них. Подсчёт идёт набором ключей
+        # с дедупликацией записей: сумма одиночных запросов раздула бы штраф,
+        # когда текущий свип сам покрывает всю семью.
+        n_trials = count_prior_trials_for_keys(journal, trial_keys) + len(configs)
 
     # ВАЖНО: load_bars заканчивается reset_index(drop=True), поэтому бары и
     # выходы движка проиндексированы RangeIndex (0..n-1). build_report делает
@@ -714,6 +780,7 @@ def _cmd_validate(args) -> int:
     # же барам, поэтому индекс общий; build_returns_matrix проверяет это и
     # падает громко при любом расхождении, а не выравнивает молча.
     matrix = None
+    pbo_value = None
     if sweep_mode:
         try:
             matrix = build_returns_matrix({
@@ -728,6 +795,11 @@ def _cmd_validate(args) -> int:
             print(f"Ошибка матрицы PBO: {exc} Отчёт не записан.",
                   file=sys.stderr)
             return EXIT_ERROR
+        # CSCV детерминирован, а матрица у всего свипа одна: один вызов даёт
+        # тот же float, что N вызовов, но без N-кратной платы. Импорт локальный
+        # (как и в validate): тесты подменяют significance.pbo_cscv.
+        from alpha_lab.validation.significance import pbo_cscv
+        pbo_value = pbo_cscv(matrix)
 
     # ВАЖНО: в валидатор уходят позиции ДВИЖКА (result.positions — удержанные,
     # held[t] = target[t-1]), а не сырые цели strategy.generate(). Сырые цели
@@ -749,7 +821,7 @@ def _cmd_validate(args) -> int:
             price_returns=run["result"].price_returns,
             positions=run["result"].positions,
             warnings=data_warnings, periods_per_year=ppy,
-            returns_matrix=matrix,
+            returns_matrix=matrix, pbo_value=pbo_value,
         ))
     run0 = runs[0]
     result0 = run0["result"]
@@ -824,12 +896,17 @@ def _cmd_validate(args) -> int:
     # следующего запуска (это молча усилило бы штраф DSR). При
     # --ignore-journal запись не ведётся вовсе — отказ от защиты явный.
     # Каждая конфигурация свипа пишется отдельной записью: следующая попытка
-    # любой из них увидит прошлые попытки и недодефлирует DSR.
+    # любой из них увидит прошлые попытки и недодефлирует DSR. Свип вдобавок
+    # помечает свои записи family-меткой всего манифеста, чтобы одиночный
+    # перезапуск участника унаследовал штраф всей семьи, а не одной строки.
+    # Одиночный прогон метку не пишет: его запись обязана читаться как раньше.
     if not args.ignore_journal:
+        family = (sorted(trial_fingerprint(key) for key in trial_keys)
+                  if sweep_mode else None)
         for i, key in enumerate(trial_keys):
             log_trial(journal, key, exp_ids[i],
                       {"sharpe": verdicts[i].sharpe, "dsr": verdicts[i].dsr,
-                       "alive": verdicts[i].alive})
+                       "alive": verdicts[i].alive}, family=family)
 
     status = "ЖИВА" if verdict.alive else "МЕРТВА"
     print(f"\n{'=' * 62}")

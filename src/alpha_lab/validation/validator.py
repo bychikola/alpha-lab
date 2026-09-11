@@ -61,8 +61,13 @@ def build_returns_matrix(columns: dict[str, pd.Series]) -> pd.DataFrame:
     доходности конфигураций друг относительно друга, и PBO посчитался бы по
     несогласованным рядам — правдоподобная тихая ложь, ровно тот класс ошибок,
     против которого существует полигон. Несовпадение длины или временного
-    индекса, нефинитные значения и идентичные колонки (одна гипотеза, а не
-    свип) — ValueError.
+    индекса, нефинитные значения и попарно идентичные колонки (одна гипотеза, а
+    не свип) — ValueError.
+
+    Идентичность проверяется для каждой пары колонок, а не только для пары с
+    опорной: матрица (A, B, B) вырождена так же, как (A, A, B), и PBO по ней
+    неотличим от честного перебора. Сравнение лишь с первой колонкой пропускало
+    дубликат среди неопорных и занижало штраф за перебор.
     """
     if len(columns) < 2:
         raise ValueError(
@@ -78,32 +83,35 @@ def build_returns_matrix(columns: dict[str, pd.Series]) -> pd.DataFrame:
             f"ряд '{ref_name}' содержит нефинитные доходности: PBO на таком "
             f"ряде неопределён"
         )
+    values: list[np.ndarray] = [ref_values]
     for name, series in items[1:]:
-        values = np.asarray(series, dtype="float64")
+        arr = np.asarray(series, dtype="float64")
         index = pd.Index(series.index)
-        if len(values) != len(ref_values) or not index.equals(ref_index):
+        if len(arr) != len(ref_values) or not index.equals(ref_index):
             left = index[0] if len(index) else "—"
             right = index[-1] if len(index) else "—"
             ref_left = ref_index[0] if len(ref_index) else "—"
             ref_right = ref_index[-1] if len(ref_index) else "—"
             raise ValueError(
                 f"конфигурация '{name}' не выровнена с '{ref_name}': длина "
-                f"{len(values)} против {len(ref_values)}, индекс {left}..{right} "
+                f"{len(arr)} против {len(ref_values)}, индекс {left}..{right} "
                 f"против {ref_left}..{ref_right}. Матрица PBO строится только "
                 f"из рядов на общем временном индексе; молча выравнивать нельзя."
             )
-        if not np.isfinite(values).all():
+        if not np.isfinite(arr).all():
             raise ValueError(
                 f"ряд '{name}' содержит нефинитные доходности: PBO на таком "
                 f"ряде неопределён"
             )
-    for name, series in items[1:]:
-        if np.array_equal(ref_values, np.asarray(series, dtype="float64")):
-            raise ValueError(
-                f"конфигурации '{ref_name}' и '{name}' дают идентичные ряды "
-                f"доходностей: это одна гипотеза, а не свип, и PBO на такой "
-                f"матрице вырожден."
-            )
+        values.append(arr)
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            if np.array_equal(values[i], values[j]):
+                raise ValueError(
+                    f"конфигурации [{i}] '{items[i][0]}' и [{j}] "
+                    f"'{items[j][0]}' дают идентичные ряды доходностей: это "
+                    f"одна гипотеза, а не свип, и PBO на такой матрице вырожден."
+                )
     return pd.DataFrame(
         {name: np.asarray(series, dtype="float64") for name, series in items},
         index=ref_index,
@@ -114,7 +122,8 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
              strategy_name: str, experiment_id: str,
              returns_matrix=None, price_returns=None, positions=None,
              warnings: tuple[str, ...] = (),
-             periods_per_year: int = DEFAULT_PERIODS) -> Verdict:
+             periods_per_year: int = DEFAULT_PERIODS,
+             pbo_value: float | None = None) -> Verdict:
     """Выносит вердикт. Все пороги — из config, значения по умолчанию в DEFAULT_THRESHOLDS.
 
     price_returns и positions обязательны для permutation-теста: он перемешивает
@@ -136,6 +145,13 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
     передать множитель таймфрейма эксперимента (data.quality.periods_per_year):
     дефолт — часовой (8760) и сохраняет поведение прямых вызовов без
     таймфрейма, а неверный множитель невидимо портит все метрики вердикта.
+
+    pbo_value — заранее посчитанный PBO переданной матрицы. CSCV детерминирован
+    и считается по общей матрице свипа, поэтому CLI вычисляет его один раз и
+    передаёт float, а не платит за тот же результат на каждой конфигурации.
+    None — посчитать здесь (поведение прямых вызовов не изменилось). Передать
+    pbo_value без матрицы нельзя: предвычисленному значению не к чему
+    относиться, и гейт spec 6.5 молча остался бы непроверенным.
     """
     if not np.isfinite(periods_per_year) or periods_per_year <= 0:
         raise ValueError(
@@ -167,8 +183,19 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
     pbo = float("nan")
     warn: list[str] = list(warnings)
     if returns_matrix is not None:
-        from alpha_lab.validation.significance import pbo_cscv
-        pbo = pbo_cscv(returns_matrix)
+        if pbo_value is None:
+            from alpha_lab.validation.significance import pbo_cscv
+            pbo = pbo_cscv(returns_matrix)
+        else:
+            pbo = float(pbo_value)
+    elif pbo_value is not None:
+        # Предвычисленный PBO без матрицы: либо вызывающий перепутал аргументы,
+        # либо рассчитывал на гейт, который молча не сработает. Fail closed.
+        raise ValueError(
+            "pbo_value передан без returns_matrix: предвычисленному PBO не к "
+            "чему относиться, и условие spec 6.5 «pbo < 0.5» осталось бы "
+            "непроверенным без единого следа в вердикте"
+        )
     else:
         # Одиночный прогон: PBO физически не вычислим (нужна матрица
         # T × N конфигураций). Это не причина смерти — но и не «пройдено»:
