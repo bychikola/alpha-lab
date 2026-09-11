@@ -414,18 +414,26 @@ def _cmd_validate(args) -> int:
     # непосредственно перед точкой разреза; утечка, целиком лежащая между
     # соседними точками (окно <= n // 200 баров), теоретически может остаться
     # незамеченной — это зафиксировано в docstring harness'а.
+    # Причинностная проверка оставляет след в отчёте по обоим путям: и когда
+    # она шла, и когда её отключили. Иначе готовый report.json, снятый с
+    # единственной защиты от look-ahead, неотличим от защищённого — тихая
+    # деградация, недопустимая по spec. Число точек важно и на защищённом
+    # пути: гарантия harness выборочная (шаг сетки n // TARGET_CUTS), и без
+    # счётчика покрытие выглядит полным.
+    causality_checked = not args.skip_causality
+    causality_cuts = 0
+    causality_warning = None
     if args.skip_causality:
-        print(
-            "Предупреждение: --skip-causality: причинностная проверка "
-            "ОТКЛЮЧЕНА. Подглядывание статистикой по результатам не ловится "
-            "(spec 8.1), поэтому подглядывающая стратегия может получить "
-            "«ЖИВА» с отличными метриками. Этот вердикт не защищён от "
-            "look-ahead; флаг — только для отладки.",
-            file=sys.stderr,
+        causality_warning = (
+            "Причинностная проверка ОТКЛЮЧЕНА (--skip-causality): вердикт не "
+            "защищён от look-ahead. Подглядывание статистикой по результатам "
+            "не ловится (spec 8.1), поэтому подглядывающая стратегия может "
+            "получить «ЖИВА» с отличными метриками. Флаг — только для отладки."
         )
+        print(f"Предупреждение: {causality_warning}", file=sys.stderr)
     else:
         try:
-            assert_strategy_is_causal(strategy, bars)
+            causality_cuts = assert_strategy_is_causal(strategy, bars)
         except (AssertionError, ValueError) as exc:
             print(
                 f"Ошибка: стратегия "
@@ -458,10 +466,13 @@ def _cmd_validate(args) -> int:
 
     tradable = clean & ~gap_excluded
 
-    # Предупреждения о данных уходят тем же каналом, что и неоценённый PBO:
-    # они не делают вердикт мёртвым (нет данных — не дефект стратегии), но
-    # обязаны попасть в отчёт и в блок вердикта.
-    data_warnings = tuple(w for w in (funding_warning, gap_warning) if w)
+    # Предупреждения о данных и отключённой проверке уходят тем же каналом,
+    # что и неоценённый PBO: они не делают вердикт мёртвым (нет данных — не
+    # дефект стратегии; отказ от проверки — осознанный флаг), но обязаны
+    # попасть в отчёт и в блок вердикта — иначе после закрытия терминала
+    # отключённая защита исчезает из артефакта.
+    data_warnings = tuple(
+        w for w in (funding_warning, gap_warning, causality_warning) if w)
 
     # Судьба вердикта решается до бэктеста: журнал нужен для n_trials, а
     # непригодный журнал занижает n_trials и тем завышает DSR. Недодефлиро-
@@ -541,6 +552,11 @@ def _cmd_validate(args) -> int:
                "gaps": gaps, "missing_bars": missing_bars,
                "gap_masked_bars": gap_masked,
                "history_bars": history, "periods_per_year": ppy,
+               # Провенанс причинности: checked=False — защита отключена
+               # флагом; cuts — сколько точек усечения реально оценено
+               # (выборочная гарантия harness, а не «все позиции»).
+               "causality_checked": causality_checked,
+               "causality_cuts": causality_cuts,
                "funding_available": funding_available,
                "funding_events": funding_events,
                "funding_matched": funding_matched,

@@ -81,7 +81,7 @@ def _check_output(series, expected_index, strategy, k: int | None) -> pd.Series:
     return series
 
 
-def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> None:
+def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> int:
     """Проверяет причинность стратегии: решение на баре t не зависит от баров > t.
 
     Для каждой точки k требует побитового равенства значений:
@@ -104,6 +104,11 @@ def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> 
 
     cut_points — дополнительные k; каждое обязано быть целым и 0 < k < len(bars).
     cut_points="all" — сплошное покрытие 2..n−1 независимо от длины ряда.
+
+    Возвращает число проверенных точек усечения. Гарантия выборочная: на длинном
+    ряде точки идут с шагом n // TARGET_CUTS, поэтому возвращённое число — это
+    мера покрытия, а не «все позиции». Вызывающий обязан записать его в отчёт:
+    без счётчика выборочная проверка неотличима от сплошной.
 
     Бросает AssertionError с русским сообщением: первое расхождение k и число
     разошедшихся позиций. ValueError — на некорректные аргументы.
@@ -160,3 +165,4 @@ def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> 
                 f"generate(bars).iloc[:{k}]: либо сигнал читает будущее, либо "
                 "результат зависит от длины ряда."
             )
+    return len(cuts)

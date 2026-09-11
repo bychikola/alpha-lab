@@ -1371,6 +1371,8 @@ def test_skip_causality_flag_bypasses_check_with_loud_warning(tmp_path,
 
     Флаг существует для отладки, но обязан громко объяснять цену: без harness
     подглядывающая стратегия получает вердикт, и он оптимистичен по построению.
+    Отказ обязан остаться следом в самом отчёте (extra + warnings), иначе
+    готовый report.json с отключённой защитой неотличим от защищённого.
     """
     root = tmp_path / "data"
     _write_fixture_data(root)
@@ -1385,7 +1387,41 @@ def test_skip_causality_flag_bypasses_check_with_loud_warning(tmp_path,
 
     assert code == cli.EXIT_OK
     assert (out / "report.json").exists()
-    err = capsys.readouterr().err
-    assert "skip-causality" in err
-    assert "ОТКЛЮЧЕНА" in err
-    assert "look-ahead" in err.lower()
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert payload["extra"]["causality_checked"] is False
+    assert payload["extra"]["causality_cuts"] == 0
+
+    warnings = payload["verdict"]["warnings"]
+    assert any("ОТКЛЮЧЕНА" in w and "look-ahead" in w for w in warnings), warnings
+
+    captured = capsys.readouterr()
+    assert "skip-causality" in captured.err
+    assert "ОТКЛЮЧЕНА" in captured.err
+    assert "look-ahead" in captured.err.lower()
+    # Дашборд читает verdict.warnings, а не stderr: предупреждение обязано быть
+    # в обоих каналах, иначе после закрытия терминала след теряется.
+    assert "Предупреждения" in captured.out
+    for warning in warnings:
+        assert warning in captured.out
+
+
+def test_causality_provenance_is_recorded_for_protected_run(tmp_path):
+    """Защищённый прогон обязан нести в отчёте число оценённых точек усечения.
+
+    Гарантия harness выборочная: 205 точек на 35 063 проверяемых позициях —
+    это 0.58% покрытия. Без счётчика в отчёте покрытие выглядит полным, а
+    утечка короче шага сетки (~175 баров) может остаться незамеченной.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    extra = payload["extra"]
+    assert extra["causality_checked"] is True
+    # 500-баровый ряд: политика n <= 600 — сплошное покрытие, k = 2..n-1.
+    assert extra["causality_cuts"] == 498
+    assert not any("ОТКЛЮЧЕНА" in w for w in payload["verdict"]["warnings"])
