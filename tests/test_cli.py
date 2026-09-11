@@ -170,6 +170,32 @@ def _run_validate(root: Path, u: Path, e: Path, out: Path,
                  "--journal", str(journal)])
 
 
+@pytest.fixture(autouse=True)
+def causality_stub(request, monkeypatch):
+    """Дешёвый шпион вместо причинностного harness в CLI-тестах не о нём.
+
+    Настоящий harness на 500-баровой фикстуре прогоняет 498 точек усечения
+    (~2 с на каждый validate). Это реальное покрытие дублируется выделенными
+    тестами с маркером real_causality, а в остальных трёх десятках тестов
+    является чистой платой за время. Шпион записывает факт вызова, поэтому
+    проводка CLI («harness вызван до бэктеста на полном ряду») остаётся
+    проверенной. Число точек шпион не эмулирует и возвращает 0: тест, которому
+    важен счётчик causality_cuts, обязан быть помечен real_causality.
+    """
+    if request.node.get_closest_marker("real_causality") is not None:
+        yield []
+        return
+    calls: list[dict] = []
+
+    def stub(strategy, bars, cut_points=None):
+        calls.append({"strategy": strategy, "n_bars": len(bars),
+                      "cut_points": cut_points})
+        return 0
+
+    monkeypatch.setattr(cli, "assert_strategy_is_causal", stub)
+    yield calls
+
+
 def test_experiment_id_is_deterministic():
     cfg = {"a": 1, "b": [1, 2]}
     assert experiment_id(cfg, "dv1", "g1") == experiment_id(cfg, "dv1", "g1")
@@ -215,7 +241,7 @@ def test_experiment_id_includes_validation(tmp_path, monkeypatch):
     assert real(seen[0], "d", "g") != real(seen[1], "d", "g")
 
 
-def test_validate_command_writes_report(tmp_path, capsys):
+def test_validate_command_writes_report(tmp_path, capsys, causality_stub):
     root = tmp_path / "data"
     _write_fixture_data(root)
     u, e = _write_configs(tmp_path, root)
@@ -239,6 +265,10 @@ def test_validate_command_writes_report(tmp_path, capsys):
     # Чистый ряд: ни одного разрыва и ни одного бара, исключённого маской дыр.
     assert payload["extra"]["gaps"] == 0
     assert payload["extra"]["gap_masked_bars"] == 0
+    # Проводка harness проверена и с дешёвым шпионом: CLI обязан позвать
+    # причинностную проверку на полном ряду (500 часовых баров фикстуры).
+    assert len(causality_stub) == 1
+    assert causality_stub[0]["n_bars"] == 500
 
     printed = capsys.readouterr().out
     assert "ВЕРДИКТ" in printed
@@ -1307,6 +1337,7 @@ def test_same_journal_state_gives_same_verdict(tmp_path):
         assert len(series) == len(second["series"][key]), key
 
 
+@pytest.mark.real_causality
 def test_non_causal_strategy_blocks_verdict_before_backtest(tmp_path,
                                                             monkeypatch, capsys):
     """Стратегия без причинности не получает вердикта, и бэктест не запускается.
@@ -1342,6 +1373,7 @@ def test_non_causal_strategy_blocks_verdict_before_backtest(tmp_path,
     assert "Отчёт не записан" in err
 
 
+@pytest.mark.real_causality
 def test_causal_strategy_proceeds_through_validation(tmp_path, monkeypatch,
                                                      capsys):
     """Причинная стратегия проходит проверку и получает обычный вердикт.
@@ -1364,6 +1396,7 @@ def test_causal_strategy_proceeds_through_validation(tmp_path, monkeypatch,
     assert "не причинн" not in capsys.readouterr().err
 
 
+@pytest.mark.real_causality
 def test_skip_causality_flag_bypasses_check_with_loud_warning(tmp_path,
                                                               monkeypatch,
                                                               capsys):
@@ -1405,6 +1438,7 @@ def test_skip_causality_flag_bypasses_check_with_loud_warning(tmp_path,
         assert warning in captured.out
 
 
+@pytest.mark.real_causality
 def test_causality_provenance_is_recorded_for_protected_run(tmp_path):
     """Защищённый прогон обязан нести в отчёте число оценённых точек усечения.
 

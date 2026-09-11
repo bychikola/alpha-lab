@@ -30,3 +30,6 @@ packages = ["src/alpha_lab"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "real_causality: тест обязан прогнать настоящий причинностный harness из alpha_lab.causality (без дешёвой подмены из autouse-фикстуры)",
+]
