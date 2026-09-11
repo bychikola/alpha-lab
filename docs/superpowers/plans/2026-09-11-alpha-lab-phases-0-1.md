@@ -2173,6 +2173,7 @@ class BacktestResult:
     total_return: float
     max_drawdown: float
     bars: int
+    price_returns: pd.Series      # доходности самой цены; нужны permutation-тесту
 
     @property
     def cost_totals(self) -> dict[str, float]:
@@ -2248,6 +2249,7 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
         total_return=float(equity.iloc[-1] / initial_equity - 1.0),
         max_drawdown=max_dd,
         bars=n,
+        price_returns=pd.Series(price_ret, index=bars.index, name="price_returns"),
     )
 
 
@@ -3191,15 +3193,20 @@ import numpy as np
 import pytest
 
 from alpha_lab.validation.significance import (
-    deflated_sharpe_ratio, pbo_cscv, permutation_pvalue,
+    _sharpe_raw, deflated_sharpe_ratio, pbo_cscv, permutation_pvalue,
 )
 
 
-def test_dsr_of_pure_noise_is_near_zero():
+def test_dsr_of_pure_noise_is_low_after_many_trials():
+    """Шум при поправке на 1000 попыток обязан получить низкий DSR.
+
+    Проверяем именно с n_trials > 1: при одной попытке DSR шума колеблется
+    вокруг 0.5, и любой жёсткий порог здесь — флейки-тест.
+    """
     rng = np.random.default_rng(1)
     r = rng.normal(0.0, 0.01, 5000)
 
-    assert deflated_sharpe_ratio(r, n_trials=1) < 0.5
+    assert deflated_sharpe_ratio(r, n_trials=1000) < 0.1
 
 
 def test_dsr_lower_for_more_trials():
@@ -3260,28 +3267,55 @@ def test_pbo_requires_enough_configs():
     assert np.isnan(pbo_cscv(matrix))
 
 
-def test_permutation_pvalue_uniform_under_null():
+def test_permutation_separates_signal_from_noise():
+    """Сигнал, связанный с доходностью, обязан получить p-value ниже случайного."""
     rng = np.random.default_rng(8)
-    r = rng.normal(0.0, 0.01, 1000)
+    n = 3000
+    price_ret = rng.normal(0.0, 0.01, n)
+    pos_signal = np.sign(price_ret)                          # идеальное предвидение
+    pos_noise = rng.choice([-1.0, 0.0, 1.0], size=n)         # сигнала нет
 
-    assert permutation_pvalue(r, n_permutations=500, seed=1) > 0.05
+    p_signal = permutation_pvalue(price_ret, pos_signal, n_permutations=500, seed=1)
+    p_noise = permutation_pvalue(price_ret, pos_noise, n_permutations=500, seed=1)
+
+    assert p_signal < 0.05
+    assert p_noise > p_signal
 
 
-def test_permutation_pvalue_small_for_strong_signal():
+def test_permutation_of_returns_alone_would_be_meaningless():
+    """Регрессия: Sharpe инвариантен к перестановке доходностей.
+
+    Этот тест фиксирует причину, по которой перемешиваются позиции, а не доходности.
+    """
     rng = np.random.default_rng(9)
-    r = rng.normal(0.004, 0.01, 3000)
+    r = rng.normal(0.001, 0.01, 1000)
 
-    assert permutation_pvalue(r, n_permutations=500, seed=1) < 0.05
+    shuffled = rng.permutation(r)
+
+    assert _sharpe_raw(r) == pytest.approx(_sharpe_raw(shuffled))
 
 
 def test_permutation_is_reproducible_with_seed():
     rng = np.random.default_rng(10)
-    r = rng.normal(0.0005, 0.01, 800)
+    price_ret = rng.normal(0.0, 0.01, 800)
+    pos = rng.choice([-1.0, 0.0, 1.0], size=800)
 
-    a = permutation_pvalue(r, n_permutations=300, seed=42)
-    b = permutation_pvalue(r, n_permutations=300, seed=42)
+    a = permutation_pvalue(price_ret, pos, n_permutations=300, seed=42)
+    b = permutation_pvalue(price_ret, pos, n_permutations=300, seed=42)
 
     assert a == b
+
+
+def test_permutation_rejects_flat_signal():
+    rng = np.random.default_rng(11)
+    price_ret = rng.normal(0.0, 0.01, 500)
+
+    assert permutation_pvalue(price_ret, np.zeros(500)) == 1.0
+
+
+def test_permutation_requires_matching_lengths():
+    with pytest.raises(ValueError, match="Длины"):
+        permutation_pvalue(np.zeros(100), np.zeros(50))
 ```
 
 - [ ] **Шаг 2: Запустить — убедиться, что падает**
@@ -3393,22 +3427,33 @@ def pbo_cscv(returns_matrix, n_blocks: int = 10) -> float:
     return float((logits < 0).mean())
 
 
-def permutation_pvalue(returns, n_permutations: int = 1000, seed: int = 0) -> float:
+def permutation_pvalue(price_returns, positions,
+                       n_permutations: int = 1000, seed: int = 0) -> float:
     """Доля перемешанных версий, чей Sharpe не хуже наблюдаемого.
 
-    Перемешивание разрушает временную структуру, сохраняя распределение.
-    Малый p-value означает, что порядок доходностей несёт информацию.
+    Нулевая гипотеза: сигнал не связан с доходностями.
+
+    ВАЖНО: перемешиваются ПОЗИЦИИ, а не доходности. Sharpe = mean/std инвариантен
+    к перестановке доходностей, поэтому перемешивание самого ряда дало бы
+    p-value ≡ 1.0 и тест не отклонял бы ничего. Смысл имеет только разрушение
+    соответствия «сигнал ↔ доходность».
     """
-    r = np.asarray(returns, dtype="float64")
-    r = r[np.isfinite(r)]
-    if len(r) < 10:
+    pr = np.asarray(price_returns, dtype="float64")
+    pos = np.asarray(positions, dtype="float64")
+    if len(pr) != len(pos):
+        raise ValueError(
+            f"Длины price_returns ({len(pr)}) и positions ({len(pos)}) не совпадают"
+        )
+    ok = np.isfinite(pr) & np.isfinite(pos)
+    pr, pos = pr[ok], pos[ok]
+    if len(pr) < 10 or not pos.any():
         return 1.0
 
-    observed = _sharpe_raw(r)
+    observed = _sharpe_raw(pr * pos)
     rng = np.random.default_rng(seed)
     better = 0
     for _ in range(n_permutations):
-        if _sharpe_raw(rng.permutation(r)) >= observed:
+        if _sharpe_raw(pr * rng.permutation(pos)) >= observed:
             better += 1
     return float((better + 1) / (n_permutations + 1))
 ```
@@ -3452,14 +3497,19 @@ import pytest
 from alpha_lab.validation.validator import Verdict, validate
 
 
-def _strong_returns(n=5000, seed=1):
-    rng = np.random.default_rng(seed)
-    return pd.Series(rng.normal(0.002, 0.01, n))
+def _case(n=5000, seed=1, strength=0.8, drift=0.0):
+    """Согласованный набор: доходности цены, позиции и доходность стратегии.
 
-
-def _noise_returns(n=5000, seed=2):
+    strength — доля баров, где позиция совпадает со знаком доходности.
+    strength=0.8 даёт настоящий edge, strength=0.0 — чистый шум.
+    """
     rng = np.random.default_rng(seed)
-    return pd.Series(rng.normal(0.0, 0.01, n))
+    price_ret = pd.Series(rng.normal(drift, 0.01, n))
+    sign = np.sign(price_ret.to_numpy())
+    random_side = rng.choice([-1.0, 1.0], size=n)
+    positions = pd.Series(np.where(rng.random(n) < strength, sign, random_side))
+    returns = positions * price_ret
+    return returns, price_ret, positions
 
 
 def _trades(n, seed):
@@ -3467,65 +3517,69 @@ def _trades(n, seed):
     return pd.Series(rng.normal(0.001, 0.01, n))
 
 
+def _run(case, trades, **overrides):
+    r, pr, pos = case
+    kwargs = {"config": {}, "n_trials": 1, "strategy_name": "s",
+              "experiment_id": "x", "price_returns": pr, "positions": pos}
+    kwargs.update(overrides)
+    return validate(r, trades, (1 + r).cumprod(), **kwargs)
+
+
 def test_strong_strategy_survives():
-    r = _strong_returns()
-    v = validate(r, _trades(300, 3), (1 + r).cumprod(),
-                 config={}, n_trials=1, strategy_name="s", experiment_id="x")
+    v = _run(_case(seed=1, strength=0.8), _trades(300, 3))
 
     assert isinstance(v, Verdict)
     assert v.alive
 
 
 def test_pure_noise_is_killed():
-    r = _noise_returns()
-    v = validate(r, _trades(300, 4), (1 + r).cumprod(),
-                 config={}, n_trials=1, strategy_name="s", experiment_id="x")
+    v = _run(_case(seed=2, strength=0.0), _trades(300, 4))
 
     assert not v.alive
-    assert any("p-value" in reason or "DSR" in reason for reason in v.reasons)
+    assert any("DSR" in reason or "p-value" in reason for reason in v.reasons)
 
 
 def test_too_few_trades_kills():
-    r = _strong_returns()
-    v = validate(r, _trades(20, 5), (1 + r).cumprod(),
-                 config={}, n_trials=1, strategy_name="s", experiment_id="x")
+    v = _run(_case(seed=1, strength=0.8), _trades(20, 5))
 
     assert not v.alive
     assert any("сделок" in reason for reason in v.reasons)
 
 
+def test_missing_permutation_inputs_gives_negative_verdict():
+    """Тихая деградация недопустима: нет данных для теста — нет вердикта «жива»."""
+    r, _, _ = _case(seed=1, strength=0.8)
+    v = validate(r, _trades(300, 11), (1 + r).cumprod(), config={}, n_trials=1,
+                 strategy_name="s", experiment_id="x")
+
+    assert not v.alive
+    assert any("permutation" in reason for reason in v.reasons)
+
+
 def test_many_trials_deflate_and_can_kill():
-    r = _strong_returns(seed=6)
-    v_few = validate(r, _trades(300, 6), (1 + r).cumprod(),
-                     config={}, n_trials=1, strategy_name="s", experiment_id="x")
-    v_many = validate(r, _trades(300, 6), (1 + r).cumprod(),
-                      config={}, n_trials=5000, strategy_name="s", experiment_id="x")
+    case = _case(seed=6, strength=0.8)
+    v_few = _run(case, _trades(300, 6), n_trials=1)
+    v_many = _run(case, _trades(300, 6), n_trials=5000)
 
     assert v_many.dsr < v_few.dsr
 
 
 def test_verdict_is_frozen():
-    r = _strong_returns()
-    v = validate(r, _trades(300, 7), (1 + r).cumprod(),
-                 config={}, n_trials=1, strategy_name="s", experiment_id="x")
+    v = _run(_case(seed=7, strength=0.8), _trades(300, 7))
 
     with pytest.raises(Exception):
         v.alive = False
 
 
 def test_thresholds_come_from_config():
-    r = _strong_returns(seed=8)
-    strict = validate(r, _trades(300, 8), (1 + r).cumprod(),
-                      config={"min_trades": 100000}, n_trials=1,
-                      strategy_name="s", experiment_id="x")
+    v = _run(_case(seed=8, strength=0.8), _trades(300, 8),
+             config={"min_trades": 100000})
 
-    assert not strict.alive
+    assert not v.alive
 
 
 def test_reasons_empty_when_alive():
-    r = _strong_returns(seed=9)
-    v = validate(r, _trades(300, 9), (1 + r).cumprod(),
-                 config={}, n_trials=1, strategy_name="s", experiment_id="x")
+    v = _run(_case(seed=9, strength=0.8), _trades(300, 9))
 
     assert v.reasons == ()
 ```
@@ -3590,8 +3644,13 @@ class Verdict:
 
 def validate(returns, trade_returns, equity, config: dict, n_trials: int,
              strategy_name: str, experiment_id: str,
-             returns_matrix=None) -> Verdict:
-    """Выносит вердикт. Все пороги — из config, значения по умолчанию в DEFAULT_THRESHOLDS."""
+             returns_matrix=None, price_returns=None, positions=None) -> Verdict:
+    """Выносит вердикт. Все пороги — из config, значения по умолчанию в DEFAULT_THRESHOLDS.
+
+    price_returns и positions обязательны для permutation-теста: он перемешивает
+    позиции относительно доходностей. Без них проверка невозможна, и вердикт
+    выносится отрицательный — тихая деградация недопустима.
+    """
     thresholds = {**DEFAULT_THRESHOLDS, **(config or {})}
 
     r = np.asarray(pd.Series(returns), dtype="float64")
@@ -3603,9 +3662,15 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
 
     n_trades = int(len(t))
     dsr = deflated_sharpe_ratio(r, n_trials=n_trials)
-    p_value = permutation_pvalue(
-        r, n_permutations=int(thresholds["n_permutations"]), seed=0
-    )
+
+    permutation_available = price_returns is not None and positions is not None
+    if permutation_available:
+        p_value = permutation_pvalue(
+            price_returns, positions,
+            n_permutations=int(thresholds["n_permutations"]), seed=0,
+        )
+    else:
+        p_value = 1.0
 
     pbo = float("nan")
     if returns_matrix is not None:
@@ -3613,6 +3678,10 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
         pbo = pbo_cscv(returns_matrix)
 
     reasons: list[str] = []
+    if not permutation_available:
+        reasons.append(
+            "permutation-тест не выполнен: не переданы price_returns и positions"
+        )
     if n_trades < thresholds["min_trades"]:
         reasons.append(
             f"недостаточно сделок: {n_trades} < {thresholds['min_trades']}"
@@ -4063,63 +4132,76 @@ def test_perfect_foresight_is_impossible_in_practice():
     assert (pos != 0).mean() > 0.9
 
 
-def test_noise_strategy_fails_validation():
-    rng = np.random.default_rng(23)
-    n = 4000
-    returns = pd.Series(rng.normal(0.0, 0.01, n))
-    equity = (1 + returns).cumprod()
-    trades = pd.Series(rng.normal(0.0, 0.01, 150))
+def _case(n, seed, strength):
+    """Согласованный набор: доходности цены, позиции, доходность стратегии."""
+    rng = np.random.default_rng(seed)
+    price_ret = pd.Series(rng.normal(0.0, 0.01, n))
+    sign = np.sign(price_ret.to_numpy())
+    random_side = rng.choice([-1.0, 1.0], size=n)
+    positions = pd.Series(np.where(rng.random(n) < strength, sign, random_side))
+    return positions * price_ret, price_ret, positions
 
-    v = validate(returns, trades, equity, config={}, n_trials=1,
-                 strategy_name="noise", experiment_id="t1")
+
+def test_noise_strategy_fails_validation():
+    returns, pr, pos = _case(n=4000, seed=23, strength=0.0)
+    trades = pd.Series(np.random.default_rng(23).normal(0.0, 0.01, 150))
+
+    v = validate(returns, trades, (1 + returns).cumprod(), config={}, n_trials=1,
+                 strategy_name="noise", experiment_id="t1",
+                 price_returns=pr, positions=pos)
 
     assert not v.alive
 
 
 def test_always_long_on_flat_series_fails():
     rng = np.random.default_rng(24)
-    n = 4000
-    returns = pd.Series(rng.normal(0.0, 0.01, n))
-    equity = (1 + returns).cumprod()
+    price_ret = pd.Series(rng.normal(0.0, 0.01, 4000))
+    positions = pd.Series(1.0, index=price_ret.index)
+    returns = positions * price_ret
     trades = pd.Series(rng.normal(0.0, 0.01, 200))
 
-    v = validate(returns, trades, equity, config={}, n_trials=1000,
-                 strategy_name="always_long", experiment_id="t2")
+    v = validate(returns, trades, (1 + returns).cumprod(), config={}, n_trials=1000,
+                 strategy_name="always_long", experiment_id="t2",
+                 price_returns=price_ret, positions=positions)
 
     assert not v.alive
 
 
 def test_strong_edge_survives_validation():
-    """Контрольный случай: настоящая альфа НЕ должна убиваться."""
-    rng = np.random.default_rng(25)
-    n = 20000
-    returns = pd.Series(rng.normal(0.0015, 0.01, n))
-    equity = (1 + returns).cumprod()
-    trades = pd.Series(rng.normal(0.002, 0.01, 400))
+    """Контрольный случай: настоящая альфа НЕ должна убиваться.
 
-    v = validate(returns, trades, equity, config={}, n_trials=1,
-                 strategy_name="real", experiment_id="t3")
+    Не менее важен, чем тест на убийство ловушек: валидатор, который режет всё
+    подряд, бесполезен ровно так же, как тот, что не режет ничего.
+    """
+    returns, pr, pos = _case(n=20000, seed=25, strength=0.8)
+    trades = pd.Series(np.random.default_rng(25).normal(0.002, 0.01, 400))
+
+    v = validate(returns, trades, (1 + returns).cumprod(), config={}, n_trials=1,
+                 strategy_name="real", experiment_id="t3",
+                 price_returns=pr, positions=pos)
 
     assert v.alive, f"Валидатор убил настоящий edge: {v.reasons}"
 
 
 def test_all_traps_are_killed_by_validator():
-    """Сводный тест: каждая ловушка обязана получить alive=False."""
-    rng = np.random.default_rng(26)
-    traps = {
-        "noise": (pd.Series(rng.normal(0.0, 0.01, 4000)),
-                  pd.Series(rng.normal(0.0, 0.01, 150))),
-        "tiny_sample": (pd.Series(rng.normal(0.01, 0.01, 4000)),
-                        pd.Series(rng.normal(0.01, 0.01, 5))),
-        "many_trials": (pd.Series(rng.normal(0.0008, 0.01, 4000)),
-                        pd.Series(rng.normal(0.0008, 0.01, 150))),
-    }
-    trials = {"noise": 1, "tiny_sample": 1, "many_trials": 10000}
+    """Сводный тест: каждая ловушка обязана получить alive=False.
 
-    for label, (returns, trades) in traps.items():
-        equity = (1 + returns).cumprod()
-        v = validate(returns, trades, equity, config={}, n_trials=trials[label],
-                     strategy_name=label, experiment_id=f"trap_{label}")
+    Если падает — это баг валидатора, а не теста. Чинить validator.py/significance.py.
+    """
+    cases = {
+        "noise":       dict(n=4000, seed=26, strength=0.0, trades=150, trials=1),
+        "tiny_sample": dict(n=4000, seed=27, strength=0.8, trades=5, trials=1),
+        "many_trials": dict(n=4000, seed=28, strength=0.0, trades=150, trials=10000),
+    }
+
+    for label, cfg in cases.items():
+        returns, pr, pos = _case(cfg["n"], cfg["seed"], cfg["strength"])
+        trades = pd.Series(
+            np.random.default_rng(cfg["seed"]).normal(0.001, 0.01, cfg["trades"])
+        )
+        v = validate(returns, trades, (1 + returns).cumprod(), config={},
+                     n_trials=cfg["trials"], strategy_name=label,
+                     experiment_id=f"trap_{label}", price_returns=pr, positions=pos)
         assert not v.alive, f"Ловушка '{label}' прошла валидацию — сломан валидатор"
 ```
 
@@ -4164,17 +4246,21 @@ from alpha_lab.data.schema import normalize_bars
 from alpha_lab.data.store import write_bars
 
 
-def _write_fixture_data(root: Path, n=4000, seed=1):
-    """Кладёт синтетические бары туда, откуда их читает load_bars."""
+def _write_fixture_data(root: Path, n=30000, seed=1):
+    """Кладёт минутные синтетические бары туда, откуда их читает load_bars.
+
+    Пишем именно 1m: CLI читает базовый таймфрейм 1m и ресэмплит в таймфрейм
+    эксперимента. 30000 минут ≈ 500 часовых баров после ресэмплинга.
+    """
     rng = np.random.default_rng(seed)
-    close = 100.0 + np.cumsum(rng.normal(0, 1, n))
-    ts = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
+    close = 100.0 + np.cumsum(rng.normal(0, 0.5, n))
+    ts = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
     df = normalize_bars(pd.DataFrame({
         "ts": ts, "open": close, "high": close + 0.5, "low": close - 0.5,
         "close": close, "volume": 1e5, "quote_volume": 1e8,
         "trades": 500, "taker_buy_volume": 5e4,
     }))
-    write_bars(df, root, "BTCUSDT", "1h")
+    write_bars(df, root, "BTCUSDT", "1m")
 
 
 def test_experiment_id_is_deterministic():
@@ -4249,7 +4335,7 @@ def test_dirty_bars_are_not_traded(tmp_path):
 
     root = tmp_path / "data"
     _write_fixture_data(root)
-    bars = load_bars(root, "BTCUSDT", "1h")
+    bars = load_bars(root, "BTCUSDT", "1m")
     mask = clean_mask(bars).to_numpy()
 
     assert mask.all(), "чистые данные обязаны проходить маску"
@@ -4447,6 +4533,7 @@ def _cmd_validate(args) -> int:
         returns=result.returns, trade_returns=trades, equity=result.equity,
         config=exp.validation, n_trials=n_trials, strategy_name=exp.name,
         experiment_id=exp_id,
+        price_returns=result.price_returns, positions=result.positions,
     )
 
     log_trial(journal, trial_key, exp_id,
