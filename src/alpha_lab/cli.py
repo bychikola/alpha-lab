@@ -225,6 +225,19 @@ def _gap_stats(bars: pd.DataFrame, timeframe: str) -> tuple[int, int]:
     return int(len(holes)), missing
 
 
+def _gap_starts(bars: pd.DataFrame, timeframe: str) -> np.ndarray:
+    """Индексы первых баров после разрывов — единственное определение разрыва.
+
+    Разрыв — интервал между соседними барами больше шага таймфрейма. Маска и
+    сегментация обязаны видеть одни и те же дыры, поэтому детектор один:
+    второй способ понимания разрыва неизбежно разъехался бы с первым.
+    """
+    if len(bars) < 2:
+        return np.empty(0, dtype=np.int64)
+    diffs = pd.to_datetime(bars["ts"], utc=True).diff()
+    return np.flatnonzero((diffs > FREQ_DELTA[timeframe]).to_numpy())
+
+
 def _gap_mask(bars: pd.DataFrame, timeframe: str,
               lookback: int = GAP_MASK_LOOKBACK_BARS,
               lookahead: int = DEFAULT_HISTORY_BARS) -> np.ndarray:
@@ -249,15 +262,45 @@ def _gap_mask(bars: pd.DataFrame, timeframe: str,
     """
     n = len(bars)
     mask = np.zeros(n, dtype=bool)
-    if n < 2:
-        return mask
-    diffs = pd.to_datetime(bars["ts"], utc=True).diff()
-    holes = np.flatnonzero((diffs > FREQ_DELTA[timeframe]).to_numpy())
-    for i in holes:                      # i — первый бар после разрыва
+    for i in _gap_starts(bars, timeframe):   # i — первый бар после разрыва
         lo = max(0, i - 1 - lookback)
         hi = min(n - 1, i - 1 + lookahead)
         mask[lo:hi + 1] = True
     return mask
+
+
+def _generate_segmented(strategy, bars: pd.DataFrame,
+                        timeframe: str) -> pd.Series:
+    """Позиции стратегии по непрерывным участкам ряда, разделённым разрывами.
+
+    Разрыв означает, что ряд неконтигуозен: что происходило в дыре — неизвестно.
+    Стратегия не имеет права видеть сквозь неё, поэтому generate вызывается на
+    каждом непрерывном участке отдельно, а результаты склеиваются позиционно.
+    Это перезапускает внутреннее состояние стратегии на каждой дыре по
+    построению — независимо от того, как стратегия написана, и без единого
+    протокольного шва, который можно забыть.
+
+    Обнуления целей на маскированных барах для этого НЕ достаточно: у MR
+    состояние живёт внутри simulate_bracket_exits (direction, entry_bar,
+    cur_sl, cur_tp), и сделка, открытая до дыры, на первом немаскированном
+    баре переизлучается с предразрывной ценой входа, стопом/тейком и часами
+    max_bars, не считавшими пропущенные бары. Маска гасит выход, но не память.
+
+    Участок короче прогрева стратегии — не ошибка: generate на коротком входе
+    не даёт сигналов, и это честный ответ для обрывка. Индекс исходного ряда
+    сохраняется: результат равен длине bars и выровнен по bars.index.
+    """
+    starts = _gap_starts(bars, timeframe)
+    if len(starts) == 0:
+        # Ряд без дыр — ровно прежнее поведение, без лишних срезов и склейки.
+        return strategy.generate(bars)
+    bounds = [0, *starts.tolist(), len(bars)]
+    parts = [
+        np.asarray(strategy.generate(bars.iloc[a:b]), dtype="float64")
+        for a, b in zip(bounds[:-1], bounds[1:])
+        if a < b
+    ]
+    return pd.Series(np.concatenate(parts), index=bars.index, name="position")
 
 
 def _cmd_validate(args) -> int:
@@ -366,7 +409,8 @@ def _cmd_validate(args) -> int:
             f"(таймфрейм {exp.timeframe}) — торговля приостановлена на "
             f"{gap_masked} барах вокруг них (lookback="
             f"{GAP_MASK_LOOKBACK_BARS}, lookahead={history} = "
-            f"history_bars стратегии '{exp.strategy}')"
+            f"history_bars стратегии '{exp.strategy}'); состояние стратегии "
+            f"перезапускается на каждом непрерывном участке"
         )
         print(f"Предупреждение: {gap_warning}", file=sys.stderr)
 
@@ -401,9 +445,20 @@ def _cmd_validate(args) -> int:
             return EXIT_ERROR
         n_trials = count_prior_trials(journal, trial_key) + 1
 
+    # Разрыв — не только «не торговать в окне»: ряд неконтигуозен, и стратегия
+    # не имеет права видеть сквозь дыру. generate вызывается на каждом
+    # непрерывном участке отдельно, поэтому внутреннее состояние стратегии
+    # (у MR — direction/entry_bar/cur_sl/cur_tp внутри simulate_bracket_exits)
+    # перезапускается на дыре по построению. Обнуление целей этого не лечит:
+    # сделка, открытая до дыры, всплыла бы на первом немаскированном баре с
+    # предразрывной ценой входа, стопом/тейком и часами max_bars, которые не
+    # считали пропущенные бары. Маска ниже по-прежнему гасит окно вокруг дыры
+    # (в том числе бар перед ней — позицию, удержанную через пропуск).
+    #
     # copy=True: to_numpy() в pandas 3 отдаёт read-only массив, а маска ниже
     # пишет в него на месте. Обнуляются цели и грязных баров, и окна разрывов.
-    targets = strategy.generate(bars).to_numpy(dtype="float64", copy=True)
+    targets = _generate_segmented(strategy, bars, exp.timeframe).to_numpy(
+        dtype="float64", copy=True)
     targets[~tradable] = 0.0
     targets = pd.Series(targets, index=bars.index)
 

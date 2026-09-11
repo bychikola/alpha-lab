@@ -10,12 +10,46 @@
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 
 from alpha_lab.engine.exits import atr_brackets, simulate_bracket_exits
 from alpha_lab.features.price import ou_params, zscore
 from alpha_lab.features.volatility import atr as atr_series
+
+# Допуск остаточного влияния старого TR на ATR: 1e-3 (0.1 % от значения ATR).
+# При типичном для 1h ATR/price ≈ 1 % это ≈0.1 bps цены — меньше минимального
+# проскальзывания (0.5 bps) и на полтора порядка меньше комиссии тейкера
+# (5 bps), то есть в масштабе исполнения решение уже не отличается от честного
+# пересчёта. Ужесточение до 1e-4/1e-6 не меняло бы решения, но удлиняло маску
+# разрыва (125/187 баров при atr_len=14).
+ATR_DECAY_TOLERANCE = 1e-3
+
+
+def atr_decay_bars(atr_len: int, tolerance: float = ATR_DECAY_TOLERANCE) -> int:
+    """Горизонт, на котором память ATR Уайлдера падает ниже допуска.
+
+    ATR — рекурсия RMA с одним seed:
+    ``rma[i] = (1 − 1/L)·rma[i−1] + (1/L)·tr[i]``. Вклад TR бара, отстоящего
+    на k шагов назад, равен ``(1 − 1/L)^k``: память бесконечна, а не L баров.
+    Поэтому объявлять историей ATR его длину нельзя — через L баров в ATR
+    остаётся ``(1 − 1/L)^L ≈ e^-1 = 37 %`` прежних данных (для L=14:
+    ``(13/14)^14 = 35.5 %``), а через 20 баров — ещё 22.7 %.
+
+    Граница k выбирается из ``(1 − 1/L)^k ≤ tolerance``:
+    ``k = ceil(ln(tolerance) / ln(1 − 1/L))``. Для L=14 и допуска 1e-3 это 94
+    бара (``(13/14)^94 = 9.4e-4``). L=1 — вырожденный случай: RMA совпадает
+    с TR, память ровно один бар, формула неприменима.
+
+    Значение выводится из параметра, а не подбирается: при росте atr_len
+    требование растёт вместе с памятью рекурсии.
+    """
+    if atr_len <= 1:
+        return 1
+    return int(math.ceil(math.log(tolerance) / math.log1p(-1.0 / atr_len)))
+
 
 DEFAULTS = {
     "window": 20,
@@ -52,13 +86,19 @@ class MeanReversionStrategy:
     def history_bars(self) -> int:
         """Сколько хвостовых баров (включая текущий) нужно решению.
 
-        Максимум из окон, которые решение реально использует: z-скор
-        (window баров, включая текущий), ATR (atr_len) и — только при
-        включённом фильтре — окно полужизни (hl_window: цикл _half_life_ok
-        берёт values[i-w:i], то есть w баров строго до бара i). Выключенный
-        фильтр в требование не входит.
+        Максимум из всего, от чего решение реально зависит:
+
+        * z-скор — window баров, включая текущий;
+        * ATR — atr_decay_bars(atr_len), а не atr_len: рекурсия Уайлдера с
+          одним seed помнит бесконечно, и остаточное влияние старого TR на
+          объявленном горизонте обязано быть ниже ATR_DECAY_TOLERANCE (для
+          atr_len=14 это 94 бара против прежних 20, где ещё сидело 22.7 %
+          предразрывной волатильности);
+        * окно полужизни — только при включённом фильтре (hl_window: цикл
+          _half_life_ok берёт values[i-w:i], то есть w баров строго до бара i);
+          выключенный фильтр в требование не входит.
         """
-        required = max(self.window, self.atr_len)
+        required = max(self.window, self.atr_len, atr_decay_bars(self.atr_len))
         if self.use_hl_filter:
             required = max(required, self.hl_window)
         return required

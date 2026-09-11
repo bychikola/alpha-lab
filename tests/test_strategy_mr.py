@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -10,7 +12,9 @@ from alpha_lab.strategies import mean_reversion as mr_module
 from alpha_lab.strategies.base import (
     DEFAULT_HISTORY_BARS, Strategy, build_strategy, history_bars_of,
 )
-from alpha_lab.strategies.mean_reversion import MeanReversionStrategy
+from alpha_lab.strategies.mean_reversion import (
+    ATR_DECAY_TOLERANCE, MeanReversionStrategy, atr_decay_bars,
+)
 
 
 def test_position_is_bounded():
@@ -278,16 +282,22 @@ def test_satisfies_strategy_protocol():
 
 
 def test_history_bars_reflects_used_windows():
-    """history_bars — требование истории, а не константа.
+    """history_bars — максимум всего, от чего зависит решение, а не константа.
 
-    Это максимум окон, реально используемых решением на баре t: z-скор
-    (window), ATR (atr_len) и — только при включённом фильтре — окно
-    полужизни (hl_window; цикл _half_life_ok берёт w баров до i). Выключенный
-    hl_window решению не нужен и в требование не входит.
+    Это z-скор (window), decay-горизонт ATR (НЕ atr_len: рекурсия Уайлдера с
+    одним seed помнит бесконечно, см. atr_decay_bars) и — только при
+    включённом фильтре — окно полужизни (hl_window; цикл _half_life_ok берёт
+    w баров до i). Выключенный hl_window решению не нужен и в требование не
+    входит.
     """
-    assert MeanReversionStrategy({"window": 20, "atr_len": 14}).history_bars == 20
-    assert MeanReversionStrategy({"window": 20, "atr_len": 50}).history_bars == 50
-    assert MeanReversionStrategy({"window": 40, "atr_len": 14}).history_bars == 40
+    assert MeanReversionStrategy({"window": 20, "atr_len": 14}).history_bars == 94
+    assert MeanReversionStrategy({"window": 500, "atr_len": 14}).history_bars == 500
+    # Окно z-скора больше decay-горизонта — требование задаёт окно.
+    assert MeanReversionStrategy({"window": 200, "atr_len": 14}).history_bars == 200
+
+    huge_atr = MeanReversionStrategy({"window": 20, "atr_len": 50}).history_bars
+    assert huge_atr == atr_decay_bars(50)
+    assert huge_atr > 50          # прежняя формула max(window, atr_len) занижала
 
     filtered = MeanReversionStrategy({
         "window": 20, "atr_len": 14, "use_hl_filter": True, "hl_window": 200})
@@ -295,7 +305,32 @@ def test_history_bars_reflects_used_windows():
 
     ignored = MeanReversionStrategy({
         "window": 20, "atr_len": 14, "use_hl_filter": False, "hl_window": 200})
-    assert ignored.history_bars == 20
+    assert ignored.history_bars == 94
+
+
+def test_history_bars_follows_atr_decay_formula():
+    """Граница истории выводится из рекурсии ATR, а не подбирается литералом.
+
+    RMA(length) — rma[i] = (1 − 1/L)·rma[i−1] + (1/L)·tr[i], поэтому вклад TR
+    бара k шагов назад равен (1 − 1/L)^k. Требование k таково, что этот вклад
+    уже ниже допуска ATR_DECAY_TOLERANCE; проверяем и саму формулу, и
+    монотонность по atr_len (больше длина — длиннее память).
+    """
+    tol = mr_module.ATR_DECAY_TOLERANCE
+    assert 0.0 < tol < 0.01          # допуск действительно малый, не «на глаз»
+
+    previous = 0
+    for atr_len in (2, 7, 14, 50, 200):
+        k = MeanReversionStrategy(
+            {"window": 1, "atr_len": atr_len}).history_bars
+        assert k == math.ceil(math.log(tol) / math.log1p(-1.0 / atr_len))
+        assert (1.0 - 1.0 / atr_len) ** k <= tol
+        assert k > previous          # монотонно растёт с atr_len
+        previous = k
+
+    # L=1: RMA совпадает с TR, память ровно один бар — формула не применима.
+    assert atr_decay_bars(1) == 1
+    assert MeanReversionStrategy({"window": 1, "atr_len": 1}).history_bars == 1
 
 
 def test_history_bars_default_for_undeclared_strategy_is_conservative():
