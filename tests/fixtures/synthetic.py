@@ -25,11 +25,15 @@ def ou_bars(n=5000, mu=100.0, theta=0.05, sigma=1.0, seed=42,
             start="2024-01-01", freq="1min") -> pd.DataFrame:
     close = ou_series(n, mu, theta, sigma, seed)
     ts = pd.date_range(start, periods=n, freq=freq, tz="UTC")
+    open_ = close.shift(1).fillna(close.iloc[0])
+    # high/low обязаны охватывать и open, и close, иначе бар физически
+    # невозможен (open вне [low, high]) и не пройдёт check_bars.
+    both = pd.concat([open_, close], axis=1)
     return pd.DataFrame({
         "ts": ts,
-        "open": close.shift(1).fillna(close.iloc[0]),
-        "high": close + sigma * 0.5,
-        "low": close - sigma * 0.5,
+        "open": open_,
+        "high": both.max(axis=1) + sigma * 0.5,
+        "low": both.min(axis=1) - sigma * 0.5,
         "close": close,
         "volume": 10.0,
         "quote_volume": close * 10.0,

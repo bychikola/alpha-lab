@@ -14,7 +14,10 @@ from statsmodels.tsa.stattools import adfuller
 
 @dataclass(frozen=True)
 class OUParams:
-    theta: float        # скорость возврата к среднему; nan, если возврата нет
+    # При отсутствии возврата theta <= 0 (theta = -b, b > 0), а nan только
+    # у half_life. Проверять возврат надо по theta > 0 или по finite
+    # half_life, а не через isnan(theta).
+    theta: float        # скорость возврата к среднему; <= 0, если возврата нет
     mu: float           # долгосрочное среднее
     sigma: float        # волатильность остатка
     half_life: float    # ln(2)/theta, бар
@@ -97,14 +100,22 @@ def hurst_exponent(series: pd.Series | np.ndarray, min_lag: int = 2,
     return float(slope)
 
 
-def zscore(series: pd.Series, window: int) -> pd.Series:
-    """z-скор относительно скользящего среднего и σ. σ≈0 → 0."""
-    s = pd.Series(series).astype("float64")
-    mean = s.rolling(window, min_periods=window).mean()
-    std = s.rolling(window, min_periods=window).std(ddof=0)
-    return ((s - mean) / std.where(std > 1e-12, np.nan)).fillna(0.0).rename("z")
-
-
 def rolling_sigma(series: pd.Series, window: int) -> pd.Series:
+    """Скользящее стандартное отклонение (ddof=0). Первые window-1 значений — NaN."""
     s = pd.Series(series).astype("float64")
     return s.rolling(window, min_periods=window).std(ddof=0).rename("sigma")
+
+
+def zscore(series: pd.Series, window: int) -> pd.Series:
+    """z-скор относительно скользящего среднего и σ. σ≈0 → 0.
+
+    Первые window-1 значений — 0.0 (прогрев), а не NaN: окно ещё не набрано.
+    0.0 означает «сигнала нет», а не «ряд ровно на среднем»; отличить прогрев
+    от истинного нуля по значению нельзя, поэтому использовать прогревочные
+    нули как непрерывный признак нельзя. Для пороговой стратегии
+    (z <= -k / z >= k) это безопасно: 0.0 порог не пересекает.
+    """
+    s = pd.Series(series).astype("float64")
+    mean = s.rolling(window, min_periods=window).mean()
+    std = rolling_sigma(s, window)
+    return ((s - mean) / std.where(std > 1e-12, np.nan)).fillna(0.0).rename("z")

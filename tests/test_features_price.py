@@ -1,10 +1,11 @@
 import numpy as np
 import pandas as pd
 import pytest
-from fixtures.synthetic import ou_series, random_walk
+from fixtures.synthetic import ou_bars, ou_series, random_walk
 
+from alpha_lab.data.quality import check_bars
 from alpha_lab.features.price import (
-    adf_pvalue, hurst_exponent, ou_params, zscore,
+    adf_pvalue, hurst_exponent, ou_params, rolling_sigma, zscore,
 )
 
 
@@ -89,3 +90,41 @@ def test_zscore_is_zero_on_constant_series():
     z = zscore(s, window=20)
 
     assert (z.fillna(0.0) == 0.0).all()
+
+
+def test_ou_bars_ohlc_invariants_and_quality_gate():
+    """Бар физически возможен и проходит собственный гейт качества.
+
+    Прежняя версия крепила high/low только к close, поэтому open выходил
+    за [low, high] на большинстве баров: эталон бэктеста противоречил
+    check_bars, который считает high < open аномалией.
+    """
+    bars = ou_bars(n=5000)
+
+    assert (bars["low"] <= bars["open"]).all(), "low > open"
+    assert (bars["open"] <= bars["high"]).all(), "open > high"
+    assert (bars["low"] <= bars["close"]).all(), "low > close"
+    assert (bars["close"] <= bars["high"]).all(), "close > high"
+    assert (bars["high"] >= bars["low"]).all(), "high < low"
+
+    report = check_bars(ou_bars(n=500), "1m")
+    assert report.is_clean, report.summary()
+
+
+def test_rolling_sigma_matches_hand_computed_series():
+    """ddof=0, min_periods=window: первые window-1 значений — NaN."""
+    s = pd.Series([2.0, 4.0, 4.0, 4.0, 5.0])
+
+    sigma = rolling_sigma(s, window=3)
+
+    expected = pd.Series([np.nan, np.nan, np.sqrt(8 / 9), 0.0, np.sqrt(2 / 9)])
+    pd.testing.assert_series_equal(sigma, expected, check_names=False)
+
+
+def test_rolling_sigma_is_zero_on_constant_series():
+    s = pd.Series([5.0] * 50)
+
+    sigma = rolling_sigma(s, window=10).dropna()
+
+    assert len(sigma) == 41
+    assert (sigma == 0.0).all()
