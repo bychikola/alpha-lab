@@ -1,0 +1,33 @@
+name: mr_base
+strategy: mean_reversion
+timeframe: 1h
+start: "2022-01-01"
+end: "2025-12-31"
+
+# Параметры перенесены из Pine Script (index.html, блок pine-strategy)
+params:
+  window: 20          # окно μ и σ, баров
+  k: 2.0              # порог входа, сигм
+  atr_len: 14
+  sl_atr: 2.0         # стоп = 2 × ATR
+  tp_atr: 6.0         # тейк = 6 × ATR
+  use_hl_filter: false
+  hl_min: 5.0
+  hl_max: 100.0
+
+# Издержки Binance USDT-M, VIP0
+costs:
+  taker_fee_bps: 5.0     # 0.05%
+  maker_fee_bps: 2.0     # 0.02%
+  maker_share: 0.0       # 0 = все исполнения тейкерские (консервативно)
+  impact_coef: 0.1
+  min_slippage_bps: 0.5
+
+validation:
+  n_splits: 6
+  purge: 50
+  embargo: 20
+  n_permutations: 1000
+  min_trades: 100
+  max_pbo: 0.5
+  max_p_value: 0.05

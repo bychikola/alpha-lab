@@ -1,0 +1,34 @@
+# Фокусированный юниверс USDT-перпетуалов Binance.
+# Список фиксирован на всё исследование: изменение состава меняет experiment_id.
+# ВАЖНО: делистингованные пары должны оставаться в списке — иначе возникает
+# ошибка выживаемости (тестируем только выживших, убытки умерших не учитываем).
+market: futures-um
+start: "2020-01-01"
+end: null            # null = по сегодняшний день
+include_delisted: true
+symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - BNBUSDT
+  - XRPUSDT
+  - ADAUSDT
+  - SOLUSDT
+  - DOGEUSDT
+  - DOTUSDT
+  - LINKUSDT
+  - LTCUSDT
+  - BCHUSDT
+  - ETCUSDT
+  - XLMUSDT
+  - TRXUSDT
+  - EOSUSDT
+  - ATOMUSDT
+  - NEOUSDT
+  - DASHUSDT
+  - ZECUSDT
+  - ONTUSDT
+  - QTUMUSDT
+  - IOTAUSDT
+  - XTZUSDT
+  - ALGOUSDT
+  - THETAUSDT
