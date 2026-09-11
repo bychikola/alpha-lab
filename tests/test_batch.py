@@ -385,6 +385,31 @@ def test_cli_sweep_command_runs_and_resumes(tmp_path, capsys):
     assert "выполнено 0" in second and "пропущено 2" in second
 
 
+def test_cli_sweep_without_journal_uses_default(tmp_path, monkeypatch, capsys):
+    """Документированная команда без --journal обязана работать.
+
+    `sweep --grid ... --out ...` — ровно та строка, что записана в плане
+    фазы 2. Журнал при этом берётся по умолчанию, как в одиночном validate:
+    Path(None) до run_sweep не доходит.
+    """
+    root = tmp_path / "data"
+    _write_minute_bars(root, "BTCUSDT")
+    u = _write_universe(tmp_path)
+    grid_path = _write_grid(tmp_path)
+    store_dir = tmp_path / "results"
+    journal = tmp_path / "default_journal.jsonl"
+    monkeypatch.setattr(cli, "DEFAULT_JOURNAL", journal)
+
+    argv = ["sweep", "--grid", str(grid_path), "--out", str(store_dir),
+            "--universe", str(u), "--data-root", str(root)]
+    assert cli.main(argv) == 0
+    out = capsys.readouterr().out
+    assert "выполнено 2" in out and "пропущено 0" in out
+    # Журнал по умолчанию реально ведётся: обе попытки записаны.
+    assert journal.exists()
+    assert len(journal.read_text(encoding="utf-8").splitlines()) == 2
+
+
 def test_cli_sweep_force_reruns_everything(tmp_path, capsys):
     root = tmp_path / "data"
     _write_minute_bars(root, "BTCUSDT")

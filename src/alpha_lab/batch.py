@@ -541,10 +541,14 @@ def cmd_sweep(args) -> int:
         print(warning, file=sys.stderr)
 
     try:
+        # journal не оборачивается в Path здесь: у команды без --journal он
+        # None, и run_sweep сам подставляет DEFAULT_JOURNAL. Path(None) падал
+        # бы TypeError до run_sweep — документированная строка плана
+        # `sweep --grid ... --out ...` обязана работать без --journal.
         summary = run_sweep(
             grid, store_path=Path(args.out), data_root=Path(args.data_root),
             universe=universe, force=args.force,
-            skip_causality=args.skip_causality, journal=Path(args.journal),
+            skip_causality=args.skip_causality, journal=args.journal,
             ignore_journal=args.ignore_journal)
     except (SweepError, OSError, ValueError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
@@ -573,9 +577,12 @@ def add_sweep_subparser(sub) -> None:
     p_sweep.add_argument("--universe", default="configs/universe.yaml",
                          help="Юниверс: все символы сетки обязаны в него "
                               "входить")
+    from alpha_lab.cli import DEFAULT_JOURNAL
+
     p_sweep.add_argument("--journal", default=None,
                          help="Журнал экспериментов: из него берётся число "
-                              "попыток для DSR")
+                              f"попыток для DSR (по умолчанию "
+                              f"{DEFAULT_JOURNAL})")
     p_sweep.add_argument("--ignore-journal", action="store_true",
                          help="Сознательно не читать и не писать журнал: "
                               "n_trials = размер сетки, защита от "
