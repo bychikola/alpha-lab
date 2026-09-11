@@ -515,6 +515,59 @@ CAUSALITY_DISABLED_WARNING = (
     "получить «ЖИВА» с отличными метриками. Флаг — только для отладки."
 )
 
+# Слепые зоны вердикта для дельта-нейтральной книги (spec 8.2). Вердикт — это
+# статистика по ценовому ряду и ряду ставок funding; всё перечисленное в них не
+# представлено и не может быть ни измерено, ни оштрафовано. Для плечевой
+# дельта-нейтральной книги часть этих рисков доминирует, поэтому предупреждение
+# обязано ехать вместе с вердиктом (канал warnings, его рисует дашборд), а не
+# жить только в документации. Текст — часть контракта: тесты и дашборд читают
+# его дословно.
+DELTA_NEUTRAL_BLIND_SPOTS = (
+    "Слепые зоны дельта-нейтральной книги (вердикт их НЕ видит и не "
+    "учитывает): ликвидация ноги перпа на скачке цены против хеджа (net ≡ 0 "
+    "не защищает от маржин-колла при неидеальном хедже и плече); риск "
+    "биржи-контрагента (заморозка вывода, банкротство, ADL); депег "
+    "стейблкоина, в котором номинированы обе ноги; доступность займа и "
+    "маржи; базис спот-перп на входе и выходе (невыгодный базис выхода "
+    "может съесть накопленный funding). Эти риски нет ни в ценовом ряду, "
+    "ни в ряде ставок, поэтому вердикт не может их увидеть."
+)
+
+
+def is_delta_neutral_book(result) -> bool:
+    """Книга без ценовой экспозиции, которая реально торговалась.
+
+    Признак — по данным прогона, без знания стратегии: удержанный net нулевой
+    на всех барах, а оборот ненулевой (книга открывалась/закрывалась). Именно
+    такая книга получает вердикт, который не видит структурных рисков
+    (DELTA_NEUTRAL_BLIND_SPOTS), и именно у неё гейты направленных сделок
+    неприменимы. Ни стратегия, ни её имя в проверке не участвуют.
+    """
+    positions = np.asarray(pd.Series(result.positions), dtype="float64")
+    positions = positions[np.isfinite(positions)]
+    if positions.size and np.any(positions != 0.0):
+        return False
+    turnover = np.asarray(pd.Series(result.turnover), dtype="float64")
+    return float(np.nansum(turnover)) > 0.0
+
+
+def verdict_status(verdict) -> str:
+    """Статус вердикта для терминала.
+
+    Неприменимость — не смерть, но и не сертификат: при непустом
+    ``inapplicable`` и отсутствии настоящих провалов вердикт НЕ ВЫНЕСЕН.
+    Если провалы есть, статус МЕРТВА (судьба решена), а ограничение печатается
+    отдельным блоком. Черновой кандидат не имеет права «повысить» структурную
+    неприменимость: полный прогон её не устранит.
+    """
+    if verdict.alive:
+        return "ЖИВА"
+    if getattr(verdict, "inapplicable", ()) and not verdict.reasons:
+        return "НЕ ВЫНЕСЕН (неприменимые гейты)"
+    if verdict.screening and not verdict.reasons:
+        return "КАНДИДАТ (черновой вердикт)"
+    return "МЕРТВА"
+
 
 @dataclass(frozen=True)
 class LoadedData:
@@ -787,8 +840,16 @@ def validate_config(outcome: RunOutcome, data: LoadedData, *,
 
     screening=True — черновой вердикт P5: меньше перестановок, alive не
     выносится, грейд едет в отчёт и строку хранилища.
+
+    Дельта-нейтральной книге (net ≡ 0, оборот ненулевой) добавляется
+    предупреждение о слепых зонах вердикта (spec 8.2): ликвидация ноги,
+    биржа-контрагент, депег, займ, базис на входе/выходе. Признак — по данным
+    прогона, не по имени стратегии; канал warnings не влияет на alive.
     """
     exp = outcome.experiment
+    warn = tuple(data.data_warnings if warnings is None else warnings)
+    if is_delta_neutral_book(outcome.result):
+        warn = (*warn, DELTA_NEUTRAL_BLIND_SPOTS)
     return validate(
         returns=outcome.result.returns, trade_returns=outcome.trades,
         equity=outcome.result.equity, config=exp.validation,
@@ -796,7 +857,7 @@ def validate_config(outcome: RunOutcome, data: LoadedData, *,
         experiment_id=experiment_id,
         price_returns=outcome.result.price_returns,
         positions=outcome.result.positions,
-        warnings=data.data_warnings if warnings is None else warnings,
+        warnings=warn,
         periods_per_year=data.ppy,
         returns_matrix=returns_matrix, pbo_value=pbo_value,
         screening=screening,
@@ -1138,13 +1199,9 @@ def _cmd_validate(args) -> int:
 
     # Три исхода, а не два: черновое прохождение — кандидатура, а не «жива» и
     # не «мертва». Слить кандидата с МЕРТВА значило бы выдать непроверенное за
-    # отвергнутое, а с ЖИВА — выдать черновое за результат.
-    if verdict.alive:
-        status = "ЖИВА"
-    elif verdict.screening and not verdict.reasons:
-        status = "КАНДИДАТ (черновой вердикт)"
-    else:
-        status = "МЕРТВА"
+    # отвергнутое, а с ЖИВА — выдать черновое за результат. Четвёртый исход —
+    # «не вынесен»: гейт неприменим к книге, и вердикта по нему нет (spec 6.6).
+    status = verdict_status(verdict)
     print(f"\n{'=' * 62}")
     print(f"  ВЕРДИКТ: {status}")
     if verdict.screening:
@@ -1191,6 +1248,14 @@ def _cmd_validate(args) -> int:
         # от look-ahead защищает причинностная проверка выше (alpha_lab.causality).
         print("  !!! ПРЕДУПРЕЖДЕНИЕ: заявки превышают лимит участия в объёме")
         print("      бара — прогон оптимистичен, ёмкость не доказана.")
+    if verdict.inapplicable:
+        # Неприменимость печатается до предупреждений и причин: читатель не
+        # имеет права принять «гейт не проверялся» за «гейт пройден» или за
+        # «стратегия умерла». Статус НЕ ВЫНЕСЕН стоит в шапке, здесь — почему.
+        print("\n  Неприменимые гейты (не пройдены и не провалены — "
+              "вердикт по ним невозможен):")
+        for text in verdict.inapplicable:
+            print(f"    ~ {text}")
     if verdict.warnings:
         # Отдельный от «Причин» канал: эти пункты не убили вердикт, но и не
         # пройдены. Печатаются до причин, чтобы читатель не остановился на

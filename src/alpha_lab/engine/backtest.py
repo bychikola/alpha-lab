@@ -27,6 +27,11 @@ class BacktestResult:
     # Удержанный net (held[t] = net[t-1]) — ценовая экспозиция. По нему же
     # trade_returns сегментирует направленные сделки.
     positions: pd.Series
+    # Удержанная магнитуда торгуемого ноционала: |net| у одноногой книги,
+    # gross у двухногой. Определяет эпизоды удержания (position_episodes):
+    # у дельта-нейтральной книги net ≡ 0, и направленных сделок нет — её
+    # единица наблюдения это непрерывный отрезок открытой книги.
+    gross_positions: pd.Series
     # Оборот по базе издержек: у одноногой книги |Δnet|, у двухногой |Δgross|
     # (торгуемый ноционал обеих ног). Совпадает с базой комиссии и
     # проскальзывания, а не с изменением цены P&L.
@@ -233,6 +238,10 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
         returns=pd.Series(net_returns, index=bars.index, name="returns"),
         gross_returns=pd.Series(pnl, index=bars.index, name="gross_returns"),
         positions=pd.Series(held, index=bars.index, name="held"),
+        # Магнитуда того же базиса, что и издержки: у двухногой книги — gross,
+        # у одноногой — |net|. Знак здесь не несёт смысла.
+        gross_positions=pd.Series(np.abs(cost_basis), index=bars.index,
+                                  name="gross_held"),
         turnover=pd.Series(turnover, index=bars.index, name="turnover"),
         costs=costs,
         total_return=float(equity.iloc[-1] / initial_equity - 1.0),
@@ -316,3 +325,105 @@ def trade_returns(result: BacktestResult) -> pd.Series:
     # dtype="float64" обязателен и для пустого результата: object-пустышка
     # ломает типы у потребителей (win-rate/profit factor в Task 12).
     return pd.Series(totals, dtype="float64", name="trade_return")
+
+
+EPISODE_COLUMNS = (
+    "episode", "start", "end", "bars", "price_pnl", "funding_income",
+    "fee", "slippage", "net_return",
+)
+
+
+def position_episodes(result: BacktestResult) -> pd.DataFrame:
+    """Эпизоды удержания книги — единица наблюдения для carry-класса.
+
+    Эпизод — максимальный непрерывный отрезок баров, где торгуемый ноционал
+    (`gross_positions`) ненулевой, ПЛЮС бар возврата в ноль: движок удерживает
+    позицию на баре t (held[t] = target[t−1]) и заряжает закрытие на баре t,
+    поэтому без бара выхода издержка закрытия не попала бы ни в один эпизод и
+    доходности эпизодов были бы систематически завышены. Плоские бары вне
+    эпизодов не приписываются никому: их доходность нулевая (нет ни позиции,
+    ни оборота), и сохранение суммы от этого не страдает.
+
+    Зачем. У дельта-нейтральной книги `net ≡ 0`, поэтому `trade_returns` пуст
+    (нет направленных сделок), а P&L живёт funding-доходом и издержками двух
+    ног. Эпизод отвечает на вопросы «сколько было удержаний, как долго, что
+    каждое принесло и каков худший эпизод» — это распределение и есть
+    наблюдаемая единица для структурной премии.
+
+    Чего эпизод НЕ делает и не измеряет:
+
+    * **не является гейтом.** Ни `min_trades`, ни любой другой порог по
+      эпизодам не считается, `alive` от них не зависит. Подставить число
+      эпизодов в min_trades значило бы выдумать единицу ради прохода порога;
+    * **не измеряет независимость.** Режимы funding автокоррелированы, удержания
+      не являются независимыми ставками, и разброс доходностей эпизодов нельзя
+      читать как выборочное распределение i.i.d.-наблюдений;
+    * **не видит структурных хвостов** (ликвидация ноги на скачке, депег
+      стейбла, биржа-контрагент, базис спот-перп на входе/выходе): их нет ни в
+      ценовом ряду, ни в ряде ставок, поэтому в распределении эпизодов их нет
+      по построению;
+    * **разворот одноногой книги — один эпизод**, а не две сделки: эпизод
+      считает периоды ОТКРЫТОЙ книги, тогда как `trade_returns` режет по знаку
+      net. Контракт закреплён тестом.
+
+    Возвращает DataFrame со строкой на эпизод: `episode` (номер по порядку),
+    `start`/`end` (метки первого и последнего бара эпизода из индекса equity;
+    в рабочем пути бары переиндексированы в RangeIndex, поэтому это позиции
+    баров 0..n−1, а время живёт колонкой `ts`), `bars` (число баров, включая
+    бар выхода), `price_pnl` (сумма ценового P&L),
+    `funding_income` (минус сумма funding: доход положителен), `fee`,
+    `slippage` и `net_return` (сумма полных доходностей бара). Инвариант:
+    сумма `net_return` по эпизодам равна сумме `result.returns` — ни один бар
+    доходности не потерян и не посчитан дважды.
+    """
+    gross = np.abs(result.gross_positions.to_numpy(dtype="float64"))
+    n = len(gross)
+    active = gross > 0.0
+    if n == 0 or not active.any():
+        return _empty_episodes()
+
+    prev_active = np.concatenate(([False], active[:-1]))
+    starts = active & ~prev_active
+    ids = np.cumsum(starts) - 1
+    episode = np.where(active, ids, -1)
+    # Бар, на котором книга вернулась в ноль после удержания, — бар выхода:
+    # его издержки принадлежат закрываемому эпизоду.
+    exit_bar = ~active & prev_active
+    episode[exit_bar] = episode[np.flatnonzero(exit_bar) - 1]
+
+    r = result.returns.to_numpy(dtype="float64")
+    gp = result.gross_returns.to_numpy(dtype="float64")
+    fee = result.costs["fee"].to_numpy(dtype="float64")
+    slip = result.costs["slippage"].to_numpy(dtype="float64")
+    fund = result.costs["funding"].to_numpy(dtype="float64")
+    index = result.equity.index
+    n_episodes = int(episode.max()) + 1
+    rows = []
+    for k in range(n_episodes):
+        pos = np.flatnonzero(episode == k)
+        rows.append({
+            "episode": k,
+            "start": index[pos[0]],
+            "end": index[pos[-1]],
+            "bars": int(len(pos)),
+            "price_pnl": float(gp[pos].sum()),
+            "funding_income": float(-fund[pos].sum()),
+            "fee": float(fee[pos].sum()),
+            "slippage": float(slip[pos].sum()),
+            "net_return": float(r[pos].sum()),
+        })
+    return pd.DataFrame(rows, columns=list(EPISODE_COLUMNS))
+
+
+def _empty_episodes() -> pd.DataFrame:
+    """Пустая таблица эпизодов с контрактными колонками и типами."""
+    frame = pd.DataFrame({
+        "episode": pd.Series(dtype="int64"),
+        "start": pd.Series(dtype="object"),
+        "end": pd.Series(dtype="object"),
+        "bars": pd.Series(dtype="int64"),
+    })
+    for column in ("price_pnl", "funding_income", "fee", "slippage",
+                   "net_return"):
+        frame[column] = pd.Series(dtype="float64")
+    return frame[list(EPISODE_COLUMNS)]

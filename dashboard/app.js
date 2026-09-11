@@ -209,6 +209,21 @@ function renderVerdict(report) {
        </div>`
     : '';
 
+  /* Неприменимые гейты (spec 6.6) — третий канал вердикта: не проход и не
+   * провал, а невозможность проверки для этой книги (нет направленной
+   * экспозиции — min_trades и permutation нечего мерить). Отдельная info-панель
+   * и отдельный статус, чтобы читатель не принял «не проверялось» ни за
+   * «пройдено», ни за «умерла». */
+  const inapplicable = Array.isArray(v.inapplicable)
+    ? v.inapplicable.filter(w => typeof w === 'string' && w.length > 0)
+    : [];
+  const inapplicableHtml = inapplicable.length
+    ? `<div class="alert info">
+         <h3>Неприменимые гейты — вердикт по ним не вынесен (не проход и не провал)</h3>
+         ${inapplicable.map(w => `<p>${esc(w)}</p>`).join('')}
+       </div>`
+    : '';
+
   const metrics = (v.metrics && typeof v.metrics === 'object') ? v.metrics : {};
   const metricsHtml = Object.keys(metrics)
     .filter(k => !CORE_METRICS[k] && metrics[k] !== null && metrics[k] !== undefined)
@@ -238,16 +253,23 @@ function renderVerdict(report) {
 
   // «Жива» с непроверенными гейтами — не то же самое, что «жива» после всех
   // проверок; подпись обязана это различать. Черновое прохождение — кандидат,
-  // а не результат: alive по screening не выносится.
-  const candidate = rough && !alive && reasons.length === 0;
+  // а не результат: alive по screening не выносится. Неприменимый гейт —
+  // четвёртый исход: вердикт не вынесен, и это не смерть стратегии.
+  const candidate = rough && !alive && reasons.length === 0
+                    && inapplicable.length === 0;
+  const notRendered = !alive && !candidate && reasons.length === 0
+                      && inapplicable.length > 0;
   const statusNote = alive
     ? (warnings.length
         ? 'прошла проверку с оговорками — часть гейтов не проверена, см. предупреждения'
         : 'прошла проверку на значимость и переобучение')
-    : candidate
-      ? 'черновой вердикт (screening): гейты пройдены, но alive не вынесен — нужен полный прогон'
-      : 'не прошла проверку — причины ниже';
-  const statusText = alive ? 'ЖИВА' : (candidate ? 'КАНДИДАТ' : 'МЕРТВА');
+    : notRendered
+      ? 'вердикт не вынесен: часть гейтов неприменима к этой книге — это не провал и не прохождение, см. ниже'
+      : candidate
+        ? 'черновой вердикт (screening): гейты пройдены, но alive не вынесен — нужен полный прогон'
+        : 'не прошла проверку — причины ниже';
+  const statusText = alive ? 'ЖИВА'
+    : (candidate ? 'КАНДИДАТ' : (notRendered ? 'НЕ ВЫНЕСЕН' : 'МЕРТВА'));
 
   document.getElementById('verdict-box').innerHTML =
     `<div class="verdict ${alive ? 'alive' : 'dead'}">
@@ -262,6 +284,7 @@ function renderVerdict(report) {
          </div>
          <div class="verdict-meta">${chips.join('')}</div>
        </div>
+       ${inapplicableHtml}
        ${warningsHtml}
        <div class="kpis">${kpis}</div>
        ${reasonsHtml}

@@ -51,6 +51,36 @@ SCREENING_WARNING = (
     f"(без --screening, при необходимости --force)."
 )
 
+# --- Применимость гейтов (spec 6.6) -----------------------------------------
+# У книги без ценовой экспозиции (positions нулевые на всех барах) два гейта
+# теряют объект измерения. Это НЕ провал и НЕ проход: гейт, который нечего
+# проверять, не имеет права ни убивать вердикт, ни пропускать его. Тексты —
+# часть контракта вердикта: CLI и дашборд печатают их дословно.
+#
+# permutation: тест перемешивает позиции относительно доходностей цены; нулевой
+# ряд инвариантен к перестановке, p-value ≡ 1.0 по построению и не зависит от
+# дохода стратегии вообще. Выдавать его за «неотличимо от случая» — категориальная
+# ошибка: тест не видит carry/funding-доход, которым живёт книга.
+PERMUTATION_INAPPLICABLE = (
+    "Гейт permutation-теста неприменим: ценовая экспозиция (positions) нулевая "
+    "на всех барах. Тест перемешивает позиции относительно доходностей цены; "
+    "нулевой ряд инвариантен к перестановке, поэтому p-value вырожден (≡ 1.0) "
+    "и не является свидетельством ни за, ни против — он не измеряет доход, "
+    "который книга получает не от движения цены. Гейт не пройден и не провален: "
+    "вердикт по нему невозможен, и alive не выносится (spec 6.4/6.6)."
+)
+# min_trades: у книги нет направленных сделок, но P&L ненулевой — доход
+# приносят не сделки по цене. Единицы «направленная сделка» не существует,
+# поэтому 0 сделок — свойство конструкции, а не отсутствие свидетельств.
+MIN_TRADES_INAPPLICABLE = (
+    "Гейт min_trades неприменим: у книги нет направленных сделок (positions "
+    "нулевые на всех барах), но P&L ненулевой — доход приносят не сделки по "
+    "цене. Единица «направленная сделка» у такой книги не существует, поэтому "
+    "0 сделок — свойство конструкции, а не недостаток свидетельств. Гейт не "
+    "пройден и не провален: вердикт по нему невозможен, и alive не выносится "
+    "(spec 6.5/6.6)."
+)
+
 
 @dataclass(frozen=True)
 class Verdict:
@@ -73,6 +103,13 @@ class Verdict:
     # стратегии. Но молчать нельзя: иначе отчёт с пустым reasons читается
     # как «все гейты пройдены», хотя часть из них не запускалась.
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    # Гейты, НЕПРИМЕНИМЫЕ к этой книге по построению (не провал и не проход):
+    # у книги нет направленных сделок/ценовой экспозиции, и мерить гейт нечем.
+    # Они не попадают в reasons (это не дефект стратегии), но и не дают alive:
+    # сертифицировать книгу, часть проверок которой невозможна, нельзя. Список
+    # непустой — вердикт не вынесен; читатель обязан видеть ограничение, а не
+    # молчаливый пропуск гейта.
+    inapplicable: tuple[str, ...] = field(default_factory=tuple)
     # P5: грейд вердикта. screening=True — черновой прогон: число перестановок
     # уменьшено, alive не выносится (может только отсеять). Поле обязано ехать
     # в отчёт/хранилище/воронку: смешать черновое с полным молча нельзя.
@@ -172,6 +209,16 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
     к ним добавляется предупреждение о неоценённом PBO. Предупреждения — plain
     strings, не зависят от NaN и не участвуют в alive.
 
+    inapplicable — гейты, НЕПРИМЕНИМЫЕ к книге по построению (spec 6.6). Если
+    ценовая экспозиция нулевая на всех барах, permutation-тест вырожден (нулевой
+    ряд инвариантен к перестановке), а при ненулевом P&L и min_trades мерит
+    несуществующую единицу «направленная сделка». Это не дефект стратегии (не
+    reasons) и не свойство прогона (не warnings), а предел применимости
+    инструмента к книге: гейт не пройден и не провален. alive при непустом
+    inapplicable не выносится — иначе «не проверялось» стало бы «пройдено».
+    Классификация читается только из positions/returns и не зависит от имени
+    или класса стратегии: валидатор остаётся слепым слоем.
+
     periods_per_year — годовой множитель Sharpe/Sortino/Calmar. CLI обязан
     передать множитель таймфрейма эксперимента (data.quality.periods_per_year):
     дефолт — часовой (8760) и сохраняет поведение прямых вызовов без
@@ -207,6 +254,21 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
 
     n_trades = int(len(t))
     dsr = deflated_sharpe_ratio(r, n_trials=n_trials)
+
+    # Применимость гейтов — только по данным, без знания стратегии (spec 3/6.6).
+    # Книга без ценовой экспозиции: направленных сделок не существует, и
+    # permutation-тесту нечего перемешивать. Если при этом P&L ненулевой, доход
+    # приносят не сделки по цене — min_trades мерит не тот объект. Оба гейта
+    # записываются в inapplicable (не провал и не проход); reasons остаются
+    # только за настоящими провалами, alive с неприменимым гейтом не выносится.
+    positions_finite = None
+    if positions is not None:
+        pos_arr = np.asarray(pd.Series(positions), dtype="float64")
+        positions_finite = pos_arr[np.isfinite(pos_arr)]
+    no_price_exposure = (positions_finite is not None
+                         and not np.any(positions_finite != 0.0))
+    non_directional_book = bool(no_price_exposure and np.any(r != 0.0))
+    inapplicable: list[str] = []
 
     # Черновой режим переопределяет число перестановок конфига: его смысл —
     # «дешевле», и конфиг с n_permutations=1000 не должен его отменять.
@@ -251,12 +313,17 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
             "— её строит свип по манифесту (--configs)."
         )
 
+    if permutation_available and no_price_exposure:
+        inapplicable.append(PERMUTATION_INAPPLICABLE)
+    if non_directional_book:
+        inapplicable.append(MIN_TRADES_INAPPLICABLE)
+
     reasons: list[str] = []
     if not permutation_available:
         reasons.append(
             "permutation-тест не выполнен: не переданы price_returns и positions"
         )
-    if n_trades < thresholds["min_trades"]:
+    if n_trades < thresholds["min_trades"] and not non_directional_book:
         reasons.append(
             f"недостаточно сделок: {n_trades} < {thresholds['min_trades']}"
         )
@@ -264,7 +331,11 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
         reasons.append(
             f"DSR {dsr:.3f} ≤ {thresholds['min_dsr']} (с поправкой на {n_trials} попыток)"
         )
-    if not np.isfinite(p_value) or p_value >= thresholds["max_p_value"]:
+    # Вырожденный permutation-тест при нулевой экспозиции — не «неотличимо от
+    # случая»: свидетельство отсутствует, а не отрицательно (см. inapplicable).
+    if permutation_available and no_price_exposure:
+        pass
+    elif not np.isfinite(p_value) or p_value >= thresholds["max_p_value"]:
         reasons.append(
             f"p-value {p_value:.3f} ≥ {thresholds['max_p_value']} — неотличимо от случая"
         )
@@ -291,12 +362,15 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
         trades=n_trades,
         n_configs_tried=n_trials,
         # Черновой вердикт не имеет права утверждать alive: прохождение
-        # черновых гейтов — кандидатура, а не результат.
-        alive=len(reasons) == 0 and not screening,
+        # черновых гейтов — кандидатура, а не результат. Неприменимый гейт —
+        # тоже: сертифицировать книгу, часть проверок которой невозможна,
+        # нельзя, иначе «не проверялось» станет «пройдено» (spec 6.6).
+        alive=len(reasons) == 0 and not screening and not inapplicable,
         reasons=tuple(reasons),
         metrics=stats,
         pbo=pbo,
         warnings=tuple(warn),
+        inapplicable=tuple(inapplicable),
         screening=bool(screening),
         n_permutations=n_permutations,
     )

@@ -255,7 +255,12 @@ def _row(cell: GridCell, data_version: str, *, experiment_id: str,
             "n_permutations": int(getattr(verdict, "n_permutations", 0)),
             "alive": bool(verdict.alive),
             "reasons": " | ".join(verdict.reasons),
-            "warnings": " | ".join(verdict.warnings),
+            # Неприменимые гейты (spec 6.6) едут в warnings строки: это не
+            # причина смерти (reasons остаются только провалами), но и не
+            # должно теряться при сериализации в хранилище — иначе строка
+            # funding-книги выглядела бы мёртвой без единого объяснения.
+            "warnings": " | ".join(
+                (*getattr(verdict, "inapplicable", ()), *verdict.warnings)),
         })
     return row
 
