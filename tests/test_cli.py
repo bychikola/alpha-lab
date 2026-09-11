@@ -18,7 +18,7 @@ import alpha_lab.cli as cli
 from alpha_lab.cli import count_prior_trials, experiment_id, log_trial, main
 from alpha_lab.data.query import load_bars
 from alpha_lab.data.schema import normalize_bars
-from alpha_lab.data.store import write_bars
+from alpha_lab.data.store import write_bars, write_funding
 from alpha_lab.strategies.base import build_strategy
 from alpha_lab.validation.significance import permutation_pvalue
 from alpha_lab.validation.validator import Verdict
@@ -108,6 +108,18 @@ def _dirty_hours(root: Path, hours) -> None:
     wanted = {pd.Timestamp(h).floor("1h") for h in hours}
     bars.loc[ts.dt.floor("1h").isin(wanted), "volume"] = 0.0
     write_bars(bars, root, "BTCUSDT", "1m")
+
+
+def _remove_hours(root: Path, hours) -> None:
+    """Вырезает из минутного хранилища все бары перечисленных часов.
+
+    Дыра в минутных данных даёт разрыв уже на часовом таймфрейме: check_bars
+    считает такие разрывы, но вердикт о них раньше молчал.
+    """
+    bars = load_bars(root, "BTCUSDT", "1m")
+    ts = pd.to_datetime(bars["ts"], utc=True)
+    wanted = {pd.Timestamp(h).floor("1h") for h in hours}
+    write_bars(bars.loc[~ts.dt.floor("1h").isin(wanted)], root, "BTCUSDT", "1m")
 
 
 def _run_validate(root: Path, u: Path, e: Path, out: Path,
@@ -766,3 +778,115 @@ def test_main_configures_stdio(tmp_path, monkeypatch):
     assert main(["ingest", "--config", str(tmp_path / "nope.yaml"),
                  "--data-root", str(tmp_path)]) == 2
     assert calls == [{"encoding": "utf-8"}, {"encoding": "utf-8"}]
+
+
+def test_missing_funding_is_disclosed_as_unavailable(tmp_path, capsys):
+    """Нет файла funding — это не «funding = 0», а отсутствие данных.
+
+    Иначе панель издержек не отличает «ставок не было» от «ставки не
+    применялись», а вердикт выглядит лучше правды на величину съеденного
+    финансирования. Предупреждение обязано быть и в stderr, и в вердикте.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    extra = payload["extra"]
+    assert extra["funding_available"] is False
+    assert extra["funding_events"] == 0
+    assert extra["funding_matched"] == 0
+
+    warnings = payload["verdict"]["warnings"]
+    assert any("Funding" in w and "занижен" in w for w in warnings), warnings
+
+    captured = capsys.readouterr()
+    assert "Funding" in captured.err and "занижен" in captured.err
+    # Предупреждение обязано быть видно и в самом блоке вердикта, а статус
+    # funding — читаться отдельной строкой, а не только суммой издержек.
+    assert "Предупреждения" in captured.out
+    for warning in warnings:
+        assert warning in captured.out
+    assert "НЕДОСТУПЕН" in captured.out
+
+
+def test_empty_funding_file_is_also_unavailable(tmp_path, capsys):
+    """Существующий, но пустой parquet — та же недоступность, что и отсутствие.
+
+    load_funding отдаёт по нему пустую рамку, align молча заливает нули;
+    без явной проверки пустоты отчёт показывал бы «funding = 0» как факт.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+    fund_dir = root / "funding" / "BTCUSDT"
+    fund_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"ts": pd.DatetimeIndex([], tz="UTC"), "rate": [],
+                  "interval_hours": []}).to_parquet(
+        fund_dir / "BTCUSDT-funding.parquet", index=False)
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert payload["extra"]["funding_available"] is False
+    assert payload["extra"]["funding_events"] == 0
+    assert any("Funding" in w for w in payload["verdict"]["warnings"])
+    assert "Funding" in capsys.readouterr().err
+
+
+def test_funding_events_are_counted_and_matched(tmp_path, capsys):
+    """Есть ставки — в отчёт идут и число событий, и число привязанных к барам."""
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    bars = _hourly_bars(root)
+    ts = bars["ts"].iloc[::8].reset_index(drop=True)
+    write_funding(pd.DataFrame({"ts": ts, "rate": 1e-4,
+                                "interval_hours": 8.0}), root, "BTCUSDT")
+    out = tmp_path / "out"
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    extra = payload["extra"]
+    assert extra["funding_available"] is True
+    assert extra["funding_events"] == len(ts)
+    assert extra["funding_matched"] == len(ts)
+    assert not any("Funding" in w for w in payload["verdict"]["warnings"])
+    captured = capsys.readouterr()
+    assert "Funding" not in captured.err
+    assert f"Funding        доступен (событий {len(ts)}, " \
+           f"привязано к барам {len(ts)})" in captured.out
+
+
+def test_data_gaps_are_surfaced_and_warned(tmp_path, capsys):
+    """Разрыв в данных обязан быть виден: стратегия торгует через него.
+
+    spec раздел 8 требует «пропуск → не торговать», но маскирование разрывов —
+    решение владельца; минимум этой волны — честно показать счётчики и
+    предупредить, что вердикт через дыру оптимистичен.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    bars = _hourly_bars(root)
+    _remove_hours(root, [bars["ts"].iloc[10]])
+    out = tmp_path / "out"
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert payload["extra"]["gaps"] == 1
+    assert payload["extra"]["missing_bars"] == 1
+
+    warnings = payload["verdict"]["warnings"]
+    assert any("разрыв" in w and "оптимистич" in w for w in warnings), warnings
+
+    captured = capsys.readouterr()
+    assert "разрыв" in captured.err
+    for warning in warnings:
+        assert warning in captured.out

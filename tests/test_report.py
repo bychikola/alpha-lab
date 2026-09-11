@@ -306,3 +306,32 @@ def test_is_compatible_checks_major_version():
     assert not is_compatible("2.0")
     assert not is_compatible("мусор")
     assert not is_compatible(None)
+
+
+def test_verdict_warnings_are_serialized(tmp_path):
+    """Предупреждения — такой же элемент контракта, как reasons: если writer
+    их потеряет, дашборд и report.json будут утверждать, что гейты пройдены."""
+    verdict = replace(_verdict(),
+                      warnings=("PBO не оценён: матрица не передана",
+                                "Funding недоступен: издержки занижены"))
+    payload = _payload(5, verdict=verdict)
+
+    assert payload["verdict"]["warnings"] == [
+        "PBO не оценён: матрица не передана",
+        "Funding недоступен: издержки занижены",
+    ]
+
+    json_path, js_path = write_report(payload, tmp_path)
+    saved = json.loads(json_path.read_text(encoding="utf-8"))
+    from_js = json.loads(
+        js_path.read_text(encoding="utf-8").split("=", 1)[1].strip().rstrip(";")
+    )
+    assert saved["verdict"]["warnings"] == payload["verdict"]["warnings"]
+    assert from_js == saved
+
+
+def test_verdict_without_warnings_serializes_empty_list():
+    """Пустой список, а не null: дашборд рисует панель по длине массива."""
+    payload = _payload(5)
+
+    assert payload["verdict"]["warnings"] == []

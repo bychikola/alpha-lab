@@ -174,7 +174,8 @@ function renderVerdict(report) {
     { label: 'p-value', value: fmtNum(p, 4), hint: 'порог < 0,05',
       pass: isNum(p) ? p < 0.05 : null, fill: isNum(p) ? p / 0.05 : null },
     { label: 'PBO', value: isNum(pbo) ? fmtNum(pbo, 2) : '—',
-      hint: isNum(pbo) ? 'порог < 0,50' : 'недоступно (нужен K-fold)',
+      hint: isNum(pbo) ? 'порог < 0,50'
+        : 'недоступно (нужна матрица доходностей конфигураций)',
       pass: isNum(pbo) ? pbo < 0.5 : null, fill: isNum(pbo) ? pbo / 0.5 : null },
     { label: 'Сделок', value: fmtInt(trades), hint: 'минимум 100',
       pass: isNum(trades) ? trades >= 100 : null, fill: isNum(trades) ? trades / 100 : null },
@@ -188,6 +189,20 @@ function renderVerdict(report) {
   const reasonsHtml = reasons.length
     ? `<ul class="reasons ${alive ? 'ok' : ''}">` +
       reasons.map(r => `<li>${esc(r)}</li>`).join('') + '</ul>'
+    : '';
+
+  /* Предупреждения —amber-панель, НЕ красный список причин: гейт не пройден
+   * не потому, что стратегия плоха, а потому, что входных данных для проверки
+   * нет (одиночная конфигурация, нет funding, разрывы). Смешать их с reasons
+   * значило бы или ложно убить стратегию, или спрятать пробел в проверке. */
+  const warnings = Array.isArray(v.warnings)
+    ? v.warnings.filter(w => typeof w === 'string' && w.length > 0)
+    : [];
+  const warningsHtml = warnings.length
+    ? `<div class="alert warn">
+         <h3>Предупреждения — эти гейты не проверены</h3>
+         ${warnings.map(w => `<p>${esc(w)}</p>`).join('')}
+       </div>`
     : '';
 
   const metrics = (v.metrics && typeof v.metrics === 'object') ? v.metrics : {};
@@ -214,14 +229,20 @@ function renderVerdict(report) {
     chips.push(`<span class="chip green" title="Заявки не превышали долю объёма бара.">ёмкость: ok (макс. ${fmtPct(cap.max_participation_observed, 4)} при лимите ${fmtPct(cap.max_participation_limit, 2)})</span>`);
   }
 
+  // «Жива» с непроверенными гейтами — не то же самое, что «жива» после всех
+  // проверок; подпись обязана это различать.
+  const statusNote = alive
+    ? (warnings.length
+        ? 'прошла проверку с оговорками — часть гейтов не проверена, см. предупреждения'
+        : 'прошла проверку на значимость и переобучение')
+    : 'не прошла проверку — причины ниже';
+
   document.getElementById('verdict-box').innerHTML =
     `<div class="verdict ${alive ? 'alive' : 'dead'}">
        <div class="verdict-top">
          <div>
            <h1>${alive ? 'ЖИВА' : 'МЕРТВА'}</h1>
-           <div class="status-note">${alive
-             ? 'прошла проверку на значимость и переобучение'
-             : 'не прошла проверку — причины ниже'}</div>
+           <div class="status-note">${statusNote}</div>
            <div class="sub">
              <span class="mono">${esc(v.strategy_name)}</span> ·
              experiment <span class="mono">${esc(v.experiment_id)}</span>
@@ -229,6 +250,7 @@ function renderVerdict(report) {
          </div>
          <div class="verdict-meta">${chips.join('')}</div>
        </div>
+       ${warningsHtml}
        <div class="kpis">${kpis}</div>
        ${reasonsHtml}
        ${metricsHtml ? `<div class="metrics-strip">${metricsHtml}</div>` : ''}
@@ -536,7 +558,11 @@ function drawPriceChart(canvas, s, n, tsMs, hover) {
 /* ── издержки ───────────────────────────────────────────────── */
 
 function renderCosts(report) {
-  const totals = (report.extra && report.extra.costs_total) || {};
+  const extra = report.extra || {};
+  const totals = extra.costs_total || {};
+  // Только явный false означает «данных о funding нет»; отсутствие поля —
+  // старый отчёт, где считаем поведение прежним (нулевой funding как факт).
+  const fundingAvailable = extra.funding_available !== false;
   const eq0 = (() => {
     const eq = report.series.equity;
     for (let i = 0; i < eq.length; i++) if (isNum(eq[i])) return eq[i];
@@ -544,15 +570,25 @@ function renderCosts(report) {
   })();
   const denom = Math.abs(eq0) > 1e-12 ? eq0 : 1;
 
+  // null в значении Funding рендерится как «н/д», а не как 0: иначе панель
+  // утверждала бы, что финансирование не стоило ничего, тогда как данных о нём
+  // просто нет, и издержки занижены.
   const rows = [
     ['Комиссии', isNum(totals.fee) ? Number(totals.fee) : 0],
     ['Проскальзывание', isNum(totals.slippage) ? Number(totals.slippage) : 0],
-    ['Funding', isNum(totals.funding) ? Number(totals.funding) : 0]
+    ['Funding', fundingAvailable
+      ? (isNum(totals.funding) ? Number(totals.funding) : 0) : null]
   ];
-  const sum = rows.reduce((a, r) => a + r[1], 0);
-  const absSum = rows.reduce((a, r) => a + Math.abs(r[1]), 0) || 1;
+  const sum = rows.reduce((a, r) => a + (r[1] === null ? 0 : r[1]), 0);
+  const absSum = rows.reduce((a, r) => a + Math.abs(r[1] === null ? 0 : r[1]), 0) || 1;
 
   const body = rows.map(([label, val]) => {
+    if (val === null) {
+      const events = isNum(extra.funding_events) ? fmtInt(extra.funding_events) : '—';
+      return `<tr title="Funding недоступен: файл отсутствует или пуст. Ставки не применены, издержки занижены, вердикт оптимистичен."><td>${label}</td>
+        <td class="num mono">н/д</td>
+        <td class="share"><span class="costs-note">событий: ${events}</span></td></tr>`;
+    }
     const share = (Math.abs(val) / absSum) * 100;
     const cls = val < 0 ? 'income' : '';
     const sign = val < 0 ? ' title="отрицательный funding — доход от финансирования"' : '';
@@ -568,9 +604,17 @@ function renderCosts(report) {
 
   const note = document.getElementById('costs-note');
   if (note) {
-    note.textContent = 'Накопленные издержки за прогон, в долях начального капитала ' +
+    let text = 'Накопленные издержки за прогон, в долях начального капитала ' +
       '(equity₀ = ' + fmtNum(denom, 2) + '). Funding отрицательный — значит, ' +
       'финансирование приносило доход. Итог — чистая стоимость издержек.';
+    if (!fundingAvailable) {
+      text += ' Funding недоступен (файл отсутствует или пуст): ставки не ' +
+        'применены, издержки занижены, вердикт оптимистичен.';
+    } else if (isNum(extra.funding_events)) {
+      text += ' Funding: событий ' + fmtInt(extra.funding_events) +
+        ', привязано к барам ' + fmtInt(extra.funding_matched) + '.';
+    }
+    note.textContent = text;
   }
 }
 

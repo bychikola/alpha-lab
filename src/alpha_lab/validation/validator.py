@@ -43,16 +43,27 @@ class Verdict:
     reasons: tuple[str, ...] = field(default_factory=tuple)
     metrics: dict[str, float] = field(default_factory=dict)
     pbo: float = float("nan")
+    # Гейты, которые в этом прогоне НЕ проверялись (нет входных данных для
+    # проверки). Это не причины смерти и не влияют на alive: отсутствие
+    # матрицы конфигураций — свойство одиночного прогона, а не дефект
+    # стратегии. Но молчать нельзя: иначе отчёт с пустым reasons читается
+    # как «все гейты пройдены», хотя часть из них не запускалась.
+    warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
 def validate(returns, trade_returns, equity, config: dict, n_trials: int,
              strategy_name: str, experiment_id: str,
-             returns_matrix=None, price_returns=None, positions=None) -> Verdict:
+             returns_matrix=None, price_returns=None, positions=None,
+             warnings: tuple[str, ...] = ()) -> Verdict:
     """Выносит вердикт. Все пороги — из config, значения по умолчанию в DEFAULT_THRESHOLDS.
 
     price_returns и positions обязательны для permutation-теста: он перемешивает
     позиции относительно доходностей. Без них проверка невозможна, и вердикт
     выносится отрицательный — тихая деградация недопустима.
+
+    warnings — внешние (собранные CLI) предупреждения о непроверенных гейтах;
+    к ним добавляется предупреждение о неоценённом PBO. Предупреждения — plain
+    strings, не зависят от NaN и не участвуют в alive.
     """
     thresholds = {**DEFAULT_THRESHOLDS, **(config or {})}
 
@@ -76,9 +87,20 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
         p_value = 1.0
 
     pbo = float("nan")
+    warn: list[str] = list(warnings)
     if returns_matrix is not None:
         from alpha_lab.validation.significance import pbo_cscv
         pbo = pbo_cscv(returns_matrix)
+    else:
+        # Одиночный прогон: PBO физически не вычислим (нужна матрица
+        # T × N конфигураций). Это не причина смерти — но и не «пройдено»:
+        # условие spec 6.5 «pbo < 0.5» остаётся непроверенным, и вердикт
+        # обязан сказать об этом явно, отдельным каналом warnings.
+        warn.append(
+            "PBO не оценён: матрица доходностей конфигураций не передана. "
+            "Условие spec 6.5 «pbo < 0.5» для этого прогона не проверено; "
+            "PBO требует многоконфигурационную матрицу (возможность фазы 2)."
+        )
 
     reasons: list[str] = []
     if not permutation_available:
@@ -123,4 +145,5 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
         reasons=tuple(reasons),
         metrics=stats,
         pbo=pbo,
+        warnings=tuple(warn),
     )

@@ -109,6 +109,11 @@ def build_report(verdict: Verdict, equity: pd.Series, close: pd.Series,
         "trades": int(verdict.trades),
         "n_configs_tried": int(verdict.n_configs_tried),
         "reasons": list(verdict.reasons),
+        # Предупреждения — отдельный от reasons канал: непроверенный гейт не
+        # делает стратегию мёртвой, но и не должен теряться при сериализации.
+        # Пустой список (не null): дашборд отличает «предупреждений нет» от
+        # «поле не передано» без дополнительных догадок.
+        "warnings": list(verdict.warnings or ()),
         "metrics": {k: _num(v) for k, v in (verdict.metrics or {}).items()},
     }
 

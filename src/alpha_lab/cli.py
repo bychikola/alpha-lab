@@ -16,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 
 from alpha_lab.config import load_experiment, load_universe
-from alpha_lab.data.quality import clean_mask
+from alpha_lab.data.quality import FREQ_DELTA, clean_mask
 from alpha_lab.data.query import (
     align_funding_to_bars, data_version, load_bars, load_funding,
 )
@@ -178,6 +178,24 @@ def _cmd_ingest(args) -> int:
     return EXIT_OK if not bad else EXIT_FAILED
 
 
+def _gap_stats(bars: pd.DataFrame, timeframe: str) -> tuple[int, int]:
+    """Число разрывов и суммарное число пропущенных баров на таймфрейме.
+
+    Разрыв — интервал между соседними барами больше шага таймфрейма. Шаг
+    берётся из FREQ_DELTA (тот же источник, что у check_bars), а масштаб
+    пропуска — (интервал / шаг − 1): одна дыра в час и дыра в сутки не должны
+    выглядеть одинаково. check_bars разрывы считает, но вердикт о них молчит,
+    а стратегия торгует через них как через обычный бар.
+    """
+    delta = FREQ_DELTA[timeframe]
+    diffs = pd.to_datetime(bars["ts"], utc=True).diff().dropna()
+    holes = diffs[diffs > delta]
+    if holes.empty:
+        return 0, 0
+    missing = int(round(float(((holes - delta) / delta).sum())))
+    return int(len(holes)), missing
+
+
 def _cmd_validate(args) -> int:
     try:
         exp = load_experiment(args.config)
@@ -210,12 +228,48 @@ def _cmd_validate(args) -> int:
         print(f"Данных нет: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
+    # Funding: недоступность — это не «ставка 0». Различаем отсутствие файла и
+    # пустой файл и считаем, сколько событий реально легло на бары: панель
+    # издержек обязана отличать «данных нет» от «funding был нулевым», иначе
+    # вердикт «жива» может стоять на заниженных издержках.
+    funding_available = False
+    funding_events = 0
+    funding_matched = 0
     funding_rate = None
+    funding_warning = None
     try:
-        funding_rate = align_funding_to_bars(bars, load_funding(root, symbol))
+        funding = load_funding(root, symbol)
     except FileNotFoundError:
-        print("Предупреждение: funding недоступен, издержки занижены",
-              file=sys.stderr)
+        funding = None
+        funding_warning = (
+            "Funding недоступен (файл не найден): ставки не применены, "
+            "издержки занижены, вердикт оптимистичен"
+        )
+    if funding is not None:
+        funding_events = int(len(funding))
+        if funding_events == 0:
+            # load_funding отдаёт все нули на пустой parquet без предупреждения,
+            # а align_funding_to_bars заливает нули и в несовпавшие бары.
+            funding_warning = (
+                "Funding недоступен (файл пуст): ставки не применены, "
+                "издержки занижены, вердикт оптимистичен"
+            )
+        else:
+            funding_available = True
+            funding_rate = align_funding_to_bars(bars, funding)
+            funding_matched = int(
+                pd.to_datetime(funding["ts"], utc=True).isin(
+                    pd.to_datetime(bars["ts"], utc=True)
+                ).sum()
+            )
+            if funding_matched == 0:
+                funding_warning = (
+                    f"Funding не привязан ни к одному бару "
+                    f"({funding_events} событий): издержки занижены, "
+                    f"вердикт оптимистичен"
+                )
+    if funding_warning:
+        print(f"Предупреждение: {funding_warning}", file=sys.stderr)
 
     # Грязные бары: стратегия на них не торгует. Не чиним и не интерполируем —
     # иначе тихо неверный бэктест выглядел бы как честный.
@@ -224,6 +278,23 @@ def _cmd_validate(args) -> int:
     if dirty:
         print(f"Предупреждение: {dirty} грязных баров исключено из торговли",
               file=sys.stderr)
+
+    # Разрывы: маскировать их в этой волне не решено (это выбор владельца), но
+    # молчать нельзя — стратегия торгует через дыру как через обычный бар.
+    gaps, missing_bars = _gap_stats(bars, exp.timeframe)
+    gap_warning = None
+    if gaps:
+        gap_warning = (
+            f"В данных разрывов: {gaps}, пропущено баров: {missing_bars} "
+            f"(таймфрейм {exp.timeframe}) — стратегия торгует через них, "
+            f"вердикт оптимистичен"
+        )
+        print(f"Предупреждение: {gap_warning}", file=sys.stderr)
+
+    # Предупреждения о данных уходят тем же каналом, что и неоценённый PBO:
+    # они не делают вердикт мёртвым (нет данных — не дефект стратегии), но
+    # обязаны попасть в отчёт и в блок вердикта.
+    data_warnings = tuple(w for w in (funding_warning, gap_warning) if w)
 
     # Судьба вердикта решается до бэктеста: журнал нужен для n_trials, а
     # непригодный журнал занижает n_trials и тем завышает DSR. Недодефлиро-
@@ -271,6 +342,7 @@ def _cmd_validate(args) -> int:
         config=exp.validation, n_trials=n_trials, strategy_name=exp.name,
         experiment_id=exp_id,
         price_returns=result.price_returns, positions=result.positions,
+        warnings=data_warnings,
     )
 
     # ВАЖНО: load_bars заканчивается reset_index(drop=True), поэтому бары и
@@ -287,6 +359,10 @@ def _cmd_validate(args) -> int:
         costs=result.costs.set_axis(ts_index), price_bars=bars.set_axis(ts_index),
         extra={"symbol": symbol, "timeframe": exp.timeframe,
                "data_version": dv, "dirty_bars": dirty,
+               "gaps": gaps, "missing_bars": missing_bars,
+               "funding_available": funding_available,
+               "funding_events": funding_events,
+               "funding_matched": funding_matched,
                "costs_total": result.cost_totals,
                "capacity": {
                    "cap_hits": result.cap_hits,
@@ -322,6 +398,13 @@ def _cmd_validate(args) -> int:
     print(f"  Max DD         {verdict.max_dd:.1%}")
     print(f"  Доходность     {verdict.total_return:+.2%}")
     print(f"  Издержки       {result.cost_totals}")
+    # Статус funding печатается всегда: «нет данных» и «ставка была нулевой» —
+    # разные вещи, и по одной сумме издержек их не различить.
+    funding_state = "доступен" if funding_available else "НЕДОСТУПЕН"
+    print(f"  Funding        {funding_state} (событий {funding_events}, "
+          f"привязано к барам {funding_matched})")
+    if not funding_available:
+        print("                 издержки занижены, вердикт оптимистичен")
     print(f"  Ёмкость        cap_hits={result.cap_hits}, "
           f"over_capacity={'ДА' if result.over_capacity else 'нет'}, "
           f"max_participation={result.max_participation_observed:.4%}  "
@@ -332,6 +415,13 @@ def _cmd_validate(args) -> int:
         # от look-ahead защищает причинностный harness (тесты).
         print("  !!! ПРЕДУПРЕЖДЕНИЕ: заявки превышают лимит участия в объёме")
         print("      бара — прогон оптимистичен, ёмкость не доказана.")
+    if verdict.warnings:
+        # Отдельный от «Причин» канал: эти пункты не убили вердикт, но и не
+        # пройдены. Печатаются до причин, чтобы читатель не остановился на
+        # «reasons пуст — значит всё проверено».
+        print("\n  Предупреждения (на статус не влияют, но гейт не проверен):")
+        for warning in verdict.warnings:
+            print(f"    ! {warning}")
     if verdict.reasons:
         print("\n  Причины:")
         for reason in verdict.reasons:

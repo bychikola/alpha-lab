@@ -176,3 +176,56 @@ def test_validation_block_from_experiment_config_is_tolerated():
                      "max_pbo": 0.5, "max_p_value": 0.05})
 
     assert v.alive
+
+
+def test_none_matrix_warns_that_pbo_was_not_evaluated():
+    """Одиночный прогон: PBO не определён, но это НЕ причина смерти.
+
+    Отсутствие матрицы — не дефект стратегии, а непроверенный гейт spec 6.5.
+    Вердикт обязан остаться alive (если остальное чисто) и явно сказать, что
+    условие pbo < 0.5 не проверялось; иначе читатель считает, что все гейты
+    пройдены. Предупреждение живёт в отдельном канале и на alive не влияет.
+    """
+    v = _run(_case(seed=17, strength=0.8), _trades(300, 17))
+
+    assert v.alive
+    assert v.reasons == ()
+    assert any("PBO" in w and "не провер" in w for w in v.warnings), v.warnings
+    assert any("6.5" in w for w in v.warnings), v.warnings
+
+
+def test_unusable_matrix_reason_is_not_duplicated_as_warning():
+    """Непригодная матрица — это смерть с причиной, а не предупреждение.
+
+    Причина уже объясняет пропуск гейта; дублировать её в warnings нельзя —
+    иначе один дефект выглядел бы как два независимых сигнала.
+    """
+    rng = np.random.default_rng(18)
+    matrix = rng.normal(0.0, 0.01, size=(200, 1))
+    v = _run(_case(seed=18, strength=0.8), _trades(300, 18),
+             returns_matrix=matrix)
+
+    assert not v.alive
+    assert any("PBO не вычислен" in reason for reason in v.reasons)
+    assert not any("PBO" in w for w in v.warnings), v.warnings
+
+
+def test_usable_matrix_has_no_pbo_warning():
+    rng = np.random.default_rng(19)
+    matrix = rng.normal(0.0, 0.01, size=(200, 5))
+    v = _run(_case(seed=19, strength=0.8), _trades(300, 19),
+             returns_matrix=matrix)
+
+    assert np.isfinite(v.pbo)
+    assert not any("PBO" in w for w in v.warnings), v.warnings
+
+
+def test_external_warnings_are_preserved_and_do_not_kill():
+    """Канал предупреждений принимает строки извне (funding, разрывы) и не
+    участвует в вердикте: иначе disclosure-канал стал бы новым гейтом."""
+    v = _run(_case(seed=20, strength=0.8), _trades(300, 20),
+             warnings=("внешнее предупреждение о данных",))
+
+    assert v.alive
+    assert "внешнее предупреждение о данных" in v.warnings
+    assert v.reasons == ()
