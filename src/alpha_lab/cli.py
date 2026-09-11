@@ -29,7 +29,9 @@ from alpha_lab.data.store import DEFAULT_ROOT
 from alpha_lab.engine.backtest import run_backtest, trade_returns
 from alpha_lab.engine.costs import RealisticCost
 from alpha_lab.report.writer import build_report, write_report
-from alpha_lab.strategies.base import build_strategy, history_bars_of
+from alpha_lab.strategies.base import (
+    PositionLegs, build_strategy, history_bars_of, legs_generator,
+)
 from alpha_lab.validation.validator import (
     SCREENING_WARNING, build_returns_matrix, validate,
 )
@@ -368,6 +370,46 @@ def _generate_segmented(strategy, bars: pd.DataFrame,
     return pd.Series(np.concatenate(parts), index=bars.index, name="position")
 
 
+def _generate_legs_segmented(strategy, bars: pd.DataFrame,
+                             timeframe: str) -> PositionLegs:
+    """generate_legs по непрерывным участкам — как _generate_segmented для одноногих.
+
+    Смысл тот же: ряд неконтигуозен, и стратегия не имеет права видеть сквозь
+    дыру, поэтому решение вызывается на каждом непрерывном участке отдельно.
+    Разница в том, что склеиваются три базы: net, gross и carry обязаны
+    перезапускаться на разрыве вместе — дельта-нейтральная книга закрывается на
+    границе участка целиком, а не только её ценовая экспозиция. Индекс исходного
+    ряда сохраняется.
+    """
+    legs_fn = legs_generator(strategy)
+    if legs_fn is None:
+        raise ValueError(
+            f"Стратегия '{getattr(strategy, 'name', type(strategy).__name__)}' "
+            f"не объявила generate_legs — двухногий путь недоступен"
+        )
+    starts = _gap_starts(bars, timeframe)
+    if len(starts) == 0:
+        # Ряд без дыр — ровно решение стратегии, без лишних срезов и склейки.
+        return legs_fn(bars)
+    bounds = [0, *starts.tolist(), len(bars)]
+    parts = [
+        legs_fn(bars.iloc[a:b])
+        for a, b in zip(bounds[:-1], bounds[1:])
+        if a < b
+    ]
+
+    def glue(field: str) -> pd.Series:
+        return pd.Series(
+            np.concatenate([
+                np.asarray(getattr(part, field), dtype="float64")
+                for part in parts
+            ]),
+            index=bars.index, name=field,
+        )
+
+    return PositionLegs(net=glue("net"), gross=glue("gross"), carry=glue("carry"))
+
+
 def _universe_payload(universe) -> dict:
     """Состав юниверса для experiment_id.
 
@@ -637,6 +679,12 @@ def run_config(data: LoadedData, exp: Experiment, *,
     ловится (spec 8.1), поэтому единственная работающая защита — запрос к
     функции решения. Провал harness — CausalityError: CLI печатает «прогон
     остановлен», свип записывает отказ конфигурации и идёт дальше.
+
+    Двухногая стратегия (объявившая generate_legs) идёт тем же путём:
+    harness проверяет все три базы, решение сегментируется по разрывам,
+    маска «торговать нельзя» обнуляет net/gross/carry целиком, и движок
+    получает gross_position/carry_position. Одноногие конфигурации не
+    меняются ни на одном байте.
     """
     strategy = build_strategy(exp.strategy, exp.params)
     causality_cuts = 0
@@ -661,16 +709,37 @@ def run_config(data: LoadedData, exp: Experiment, *,
     # copy=True: to_numpy() в pandas 3 отдаёт read-only массив, а маска
     # ниже пишет в него на месте. Обнуляются цели и грязных баров, и бара
     # перед каждым разрывом.
-    targets = _generate_segmented(strategy, data.bars,
-                                  exp.timeframe).to_numpy(
-        dtype="float64", copy=True)
-    targets[~data.tradable] = 0.0
-    targets = pd.Series(targets, index=data.bars.index)
-
     cost_model = RealisticCost.from_config(exp.costs)
-    result = run_backtest(data.bars, targets, cost_model,
-                          funding_rate=data.funding_rate,
-                          max_participation=MAX_PARTICIPATION)
+    if legs_generator(strategy) is not None:
+        # Двухногий путь: решение — generate_legs, и маска «здесь торговать
+        # нельзя» обязана обнулить ВСЕ три базы. Обнулить только net значило бы
+        # оставить carry-ногу открытой на грязном баре и начислить на неё
+        # funding — тихая торговля там, где её быть не должно.
+        legs = _generate_legs_segmented(strategy, data.bars, exp.timeframe)
+        arrays = {
+            name: pd.Series(getattr(legs, name)).astype(
+                "float64").to_numpy(copy=True)
+            for name in ("net", "gross", "carry")
+        }
+        for arr in arrays.values():
+            arr[~data.tradable] = 0.0
+        idx = data.bars.index
+        result = run_backtest(
+            data.bars, pd.Series(arrays["net"], index=idx), cost_model,
+            funding_rate=data.funding_rate,
+            max_participation=MAX_PARTICIPATION,
+            gross_position=pd.Series(arrays["gross"], index=idx),
+            carry_position=pd.Series(arrays["carry"], index=idx),
+        )
+    else:
+        targets = _generate_segmented(strategy, data.bars,
+                                      exp.timeframe).to_numpy(
+            dtype="float64", copy=True)
+        targets[~data.tradable] = 0.0
+        targets = pd.Series(targets, index=data.bars.index)
+        result = run_backtest(data.bars, targets, cost_model,
+                              funding_rate=data.funding_rate,
+                              max_participation=MAX_PARTICIPATION)
     return RunOutcome(
         experiment=exp, result=result, trades=trade_returns(result),
         history=history_bars_of(strategy), causality_cuts=causality_cuts,

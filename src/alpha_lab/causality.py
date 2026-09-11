@@ -17,6 +17,11 @@
     выравниванием по меткам: молчаливый reset_index/переиндексация скрыли бы
     расхождение, которое harness обязан поймать.
 
+Двухногая стратегия объявляет решение через generate_legs (PositionLegs:
+net/gross/carry). Тогда проверяются все три базы, каждая — по той же индексной
+конвенции и тому же усечению; generate (производный, ровно net) не вызывается
+повторно. Одноногие стратегии generate_legs не имеют и проверяются как раньше.
+
 Не покрыто harness'ом: утечка внутри признака (окно нормализации, читающее
 t+1) и стратегия, причинная только под усечением.
 """
@@ -24,6 +29,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+
+from alpha_lab.strategies.base import PositionLegs, legs_generator
 
 
 def _name(strategy) -> str:
@@ -63,9 +70,8 @@ def _diff_mask(actual: np.ndarray, expected: np.ndarray) -> np.ndarray:
     return ~((actual == expected) | (np.isnan(actual) & np.isnan(expected)))
 
 
-def _check_output(series, expected_index, strategy, k: int | None) -> pd.Series:
-    """Результат generate обязан быть Series с ожидаемым индексом баров."""
-    where = "generate(bars)" if k is None else f"generate(bars.iloc[:{k}])"
+def _check_output(series, expected_index, strategy, where: str) -> pd.Series:
+    """Ряд решения (generate или колонка generate_legs) с индексом баров."""
     if not isinstance(series, pd.Series):
         raise AssertionError(
             f"Стратегия '{_name(strategy)}': {where} обязан вернуть pd.Series, "
@@ -79,6 +85,50 @@ def _check_output(series, expected_index, strategy, k: int | None) -> pd.Series:
             "выравнивает ряды молча. Приведите индекс результата к bars.index."
         )
     return series
+
+
+def _check_legs(legs, expected_index, strategy, where: str) -> PositionLegs:
+    """Двухногий результат обязан быть PositionLegs с индексом баров в каждой базе.
+
+    Проверяются все три базы, а не только net: непроверенная carry-база могла бы
+    читать будущее, оставаясь невидимой для harness'а, — а вердикт по
+    дельта-нейтральной книге считается именно по ней.
+    """
+    if not isinstance(legs, PositionLegs):
+        raise AssertionError(
+            f"Стратегия '{_name(strategy)}': {where} обязан вернуть PositionLegs "
+            f"(net/gross/carry), получено {type(legs).__name__}"
+        )
+    for field in ("net", "gross", "carry"):
+        _check_output(getattr(legs, field), expected_index, strategy,
+                      f"{where}.{field}")
+    return legs
+
+
+def _assert_causal(actual, expected, strategy, k: int, full: str,
+                   trunc: str) -> None:
+    """Побитовое сравнение усечённого и полного ряда; первое расхождение — в текст.
+
+    NaN считается равным NaN (усечение не обязано совпадать с полным рядом по
+    «пустоте»), значения сравниваются поэлементно, без выравнивания по меткам.
+    """
+    actual_v = np.asarray(actual, dtype="float64")
+    expected_v = np.asarray(expected, dtype="float64")
+    if actual_v.shape != expected_v.shape:
+        raise AssertionError(
+            f"Стратегия '{_name(strategy)}' не причинна: при усечении до k={k} "
+            f"длина {full} — {actual_v.shape} вместо {expected_v.shape}"
+        )
+    diff = _diff_mask(actual_v, expected_v)
+    if diff.any():
+        first = int(np.flatnonzero(diff)[0])
+        raise AssertionError(
+            f"Стратегия '{_name(strategy)}' не причинна: первое расхождение "
+            f"при k={k} — позиций {int(diff.sum())} из {k}, первая из них на "
+            f"баре {expected.index[first]} (позиция {first}). "
+            f"{trunc} обязан совпадать с {full}.iloc[:{k}]: либо сигнал "
+            "читает будущее, либо результат зависит от длины ряда."
+        )
 
 
 def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> int:
@@ -95,6 +145,13 @@ def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> 
     выше этого порога сетка плотная, но не сплошная, и утечка, целиком лежащая
     между её точками, теоретически может остаться незамеченной. Для полной
     гарантии на длинном ряде передайте cut_points="all".
+
+    **Двухногая стратегия.** Если у стратегии есть generate_legs, решением
+    считается он, и проверяются ВСЕ три базы (net/gross/carry) — CLI ведёт
+    вердикт по generate_legs, поэтому harness обязан судить ровно ту функцию,
+    которая строит вердикт. Производный generate для двухногой стратегии не
+    вызывается: он по контракту равен legs.net, а двойной вызов решения удвоил
+    бы цену проверки, ничего не добавив.
 
     **Чего не проверяется** (зафиксировано в spec 8.1): утечка на уровне
     признаков — если стратегия получает уже посчитанные признаки, harness судит
@@ -117,7 +174,13 @@ def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> 
     if n < 2:
         raise ValueError(f"Нужно минимум 2 бара для проверки причинности, получено {n}")
 
-    full = _check_output(strategy.generate(bars), bars.index, strategy, None)
+    legs_fn = legs_generator(strategy)
+    if legs_fn is not None:
+        full_legs = _check_legs(legs_fn(bars), bars.index, strategy,
+                                "generate_legs(bars)")
+    else:
+        full = _check_output(strategy.generate(bars), bars.index, strategy,
+                             "generate(bars)")
 
     if isinstance(cut_points, str):
         if cut_points != "all":
@@ -141,28 +204,26 @@ def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> 
 
     for k in sorted(cuts):
         truncated_bars = bars.iloc[:k]
-        truncated = _check_output(
-            strategy.generate(truncated_bars), truncated_bars.index, strategy, k
-        )
-        expected = full.iloc[:k]
-
-        actual_v = np.asarray(truncated, dtype="float64")
-        expected_v = np.asarray(expected, dtype="float64")
-        if actual_v.shape != expected_v.shape:
-            raise AssertionError(
-                f"Стратегия '{_name(strategy)}' не причинна: при усечении до k={k} "
-                f"длина позиций {actual_v.shape} вместо {expected_v.shape}"
+        if legs_fn is not None:
+            where_trunc = f"generate_legs(bars.iloc[:{k}])"
+            truncated_legs = _check_legs(legs_fn(truncated_bars),
+                                         truncated_bars.index, strategy,
+                                         where_trunc)
+            for field in ("net", "gross", "carry"):
+                _assert_causal(
+                    getattr(truncated_legs, field),
+                    getattr(full_legs, field).iloc[:k],
+                    strategy, k,
+                    full=f"generate_legs(bars).{field}",
+                    trunc=f"{where_trunc}.{field}",
+                )
+        else:
+            truncated = _check_output(
+                strategy.generate(truncated_bars), truncated_bars.index,
+                strategy, f"generate(bars.iloc[:{k}])",
             )
-
-        diff = _diff_mask(actual_v, expected_v)
-        if diff.any():
-            first = int(np.flatnonzero(diff)[0])
-            raise AssertionError(
-                f"Стратегия '{_name(strategy)}' не причинна: первое расхождение "
-                f"при k={k} — позиций {int(diff.sum())} из {k}, первая из них на "
-                f"баре {expected.index[first]} (позиция {first}). "
-                f"generate(bars.iloc[:{k}]) обязан совпадать с "
-                f"generate(bars).iloc[:{k}]: либо сигнал читает будущее, либо "
-                "результат зависит от длины ряда."
+            _assert_causal(
+                truncated, full.iloc[:k], strategy, k,
+                full="generate(bars)", trunc=f"generate(bars.iloc[:{k}])",
             )
     return len(cuts)

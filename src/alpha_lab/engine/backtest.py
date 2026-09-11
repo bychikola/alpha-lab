@@ -24,7 +24,12 @@ class BacktestResult:
     equity: pd.Series
     returns: pd.Series
     gross_returns: pd.Series
+    # Удержанный net (held[t] = net[t-1]) — ценовая экспозиция. По нему же
+    # trade_returns сегментирует направленные сделки.
     positions: pd.Series
+    # Оборот по базе издержек: у одноногой книги |Δnet|, у двухногой |Δgross|
+    # (торгуемый ноционал обеих ног). Совпадает с базой комиссии и
+    # проскальзывания, а не с изменением цены P&L.
     turnover: pd.Series
     costs: pd.DataFrame          # колонки fee, slippage, funding
     total_return: float
@@ -59,11 +64,66 @@ class BacktestResult:
         return self.cap_hits > 0
 
 
+def _shift_to_held(arr: np.ndarray) -> np.ndarray:
+    """Позиция, удерживаемая в баре t: held[t] = arr[t-1], held[0] = 0.
+
+    Единственное место сдвига для всех трёх баз: цена P&L, издержки и funding
+    обязаны видеть одну и ту же временную границу, иначе бар исполнения
+    разъедется между ними.
+    """
+    held = np.empty(len(arr), dtype="float64")
+    held[0] = 0.0
+    held[1:] = arr[:-1]
+    return held
+
+
+def _checked_basis_array(values, n: int, name: str) -> np.ndarray:
+    """Ряд базы (gross/carry): длина как у баров и только конечные значения.
+
+    NaN в carry отравил бы funding-арифметику, а NaN/inf в gross — издержки и
+    диагностику ёмкости; оба отказа обязаны быть громкими и называть аргумент,
+    а не превращаться в тихо неверный прогон. Для positions такого запрета нет:
+    там NaN исторически означает «вне позиции» (fillna(0)).
+    """
+    arr = pd.Series(values).astype("float64").to_numpy()
+    if len(arr) != n:
+        raise ValueError(
+            f"Длина {name} ({len(arr)}) не совпадает с длиной баров ({n})"
+        )
+    if not np.isfinite(arr).all():
+        first_bad = float(arr[~np.isfinite(arr)][0])
+        raise ValueError(
+            f"{name} содержит нефинитные значения (NaN/inf, первое — "
+            f"{first_bad!r}): такая база молча испортила бы издержки или "
+            f"funding"
+        )
+    return arr
+
+
 def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel,
                  initial_equity: float = 1.0, capital: float = 10_000.0,
                  funding_rate: pd.Series | None = None,
-                 max_participation: float = 0.01) -> BacktestResult:
+                 max_participation: float = 0.01,
+                 gross_position: pd.Series | None = None,
+                 carry_position: pd.Series | None = None) -> BacktestResult:
     """Прогоняет позиции по барам с учётом издержек.
+
+    positions — net (спот + перп): ценовая экспозиция. Ценовой P&L и
+    trade_returns считаются только по нему.
+
+    gross_position — |спот| + |перп|, база комиссий и проскальзывания. None —
+    одноногая книга: единственная торгуемая нога это net, и оборот равен
+    |Δnet|. Через |Δ|net|| его выразить нельзя: разворот +1 -> −1 торгует две
+    единицы, а изменение модуля даёт ноль, то есть занижает издержки ровно на
+    самом дорогом баре. Поэтому дефолт считает оборот от знакового net и
+    побитово повторяет прежний движок. Явно переданный gross — magnitude-база
+    двухногой книги; изменение именно этой величины и есть заявка (вход
+    дельта-нейтральной книги 0 -> 2 стоит две ноги, хотя net не меняется).
+
+    carry_position — знаковый ноционал ноги перпа, база funding. None —
+    одноногая книга: carry = net (прежнее поведение). Funding начисляется на
+    удерживаемый carry, а не на net: у дельта-нейтральной книги доход живёт
+    целиком здесь.
 
     capital — размер счёта; вместе с объёмом бара определяет проскальзывание,
     поэтому результат зависит от капитала (это намеренно).
@@ -79,6 +139,10 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
         raise ValueError(
             f"Длина positions ({len(positions)}) не совпадает с длиной баров ({n})"
         )
+    gross_arr = None if gross_position is None else _checked_basis_array(
+        gross_position, n, "gross_position")
+    carry_arr = None if carry_position is None else _checked_basis_array(
+        carry_position, n, "carry_position")
     if n < 2:
         raise ValueError("Нужно минимум 2 бара")
     # NaN делает любое сравнение False (cap_hits == 0 при любой заявке), а <= 0
@@ -95,20 +159,22 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
     pos = positions.astype("float64").fillna(0.0).to_numpy()
 
     # Позиция, удерживаемая в баре t, решена на баре t-1
-    held = np.empty(n, dtype="float64")
-    held[0] = 0.0
-    held[1:] = pos[:-1]
+    held = _shift_to_held(pos)
 
     # Доходность цены бар-к-бару
     price_ret = np.zeros(n, dtype="float64")
     price_ret[1:] = close[1:] / close[:-1] - 1.0
     price_ret[~np.isfinite(price_ret)] = 0.0
 
-    gross = held * price_ret
+    pnl = held * price_ret
 
-    # Оборот: изменение удерживаемой позиции
+    # Оборот: изменение удерживаемой базы издержек. Дефолт (gross=None) — это
+    # знаковый held: одноногая книга торгует ровно net. Явный gross — его
+    # изменение: magnitude-база двухногой книги, где заявка — это то, что
+    # реально попадает на рынок (обе ноги), даже когда net не меняется.
+    cost_basis = held if gross_arr is None else _shift_to_held(gross_arr)
     turnover = np.zeros(n, dtype="float64")
-    turnover[1:] = np.abs(held[1:] - held[:-1])
+    turnover[1:] = np.abs(cost_basis[1:] - cost_basis[:-1])
 
     # База проскальзывания — размер ИСПОЛНЯЕМОЙ заявки (turnover * capital),
     # а не удерживаемой позиции: издержка исполнения возникает на сделке, а
@@ -124,16 +190,23 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
     fee = turnover * cost_model.fee_bps() * BPS
     slip = turnover * slippage_bps * BPS
 
+    # Funding — на удерживаемый carry (ногу перпа), а не на net: у
+    # дельта-нейтральной книги net ≡ 0, и вся доходность живёт здесь.
+    carry_held = held if carry_arr is None else _shift_to_held(carry_arr)
     if funding_rate is not None:
         rate = pd.Series(funding_rate).astype("float64").fillna(0.0).to_numpy()
-        fund = np.array([cost_model.funding_cost(held[i], rate[i]) for i in range(n)])
+        fund = np.array([
+            cost_model.funding_cost(carry_held[i], rate[i]) for i in range(n)
+        ])
     else:
         fund = np.zeros(n, dtype="float64")
 
-    # Ёмкость: заявка на баре t — это изменение удерживаемой позиции (тот же
+    # Ёмкость: заявка на баре t — это изменение торгуемого ноционала (тот же
     # trade_notional, что и база проскальзывания: диагностика и модель издержек
-    # должны одинаково понимать, что такое «заявка»). Порог не влияет на
-    # исполнение (движок не режет заявки), только на диагностику.
+    # должны одинаково понимать, что такое «заявка»). Для двухногой книги это
+    # изменение gross — именно оно попадает на рынок, даже когда net стоит.
+    # Порог не влияет на исполнение (движок не режет заявки), только на
+    # диагностику.
     cap_hits = int(np.count_nonzero(trade_notional > max_participation * quote_volume))
 
     # Наблюдённое участие — насколько близко заявки подошли к лимиту заполнения.
@@ -148,17 +221,17 @@ def run_backtest(bars: pd.DataFrame, positions: pd.Series, cost_model: CostModel
     costs = pd.DataFrame(
         {"fee": fee, "slippage": slip, "funding": fund}, index=bars.index
     )
-    net = gross - fee - slip - fund
+    net_returns = pnl - fee - slip - fund
 
-    equity = pd.Series(initial_equity * np.cumprod(1.0 + net), index=bars.index,
-                       name="equity")
+    equity = pd.Series(initial_equity * np.cumprod(1.0 + net_returns),
+                       index=bars.index, name="equity")
     peak = equity.cummax()
     max_dd = float((equity / peak - 1.0).min())
 
     return BacktestResult(
         equity=equity,
-        returns=pd.Series(net, index=bars.index, name="returns"),
-        gross_returns=pd.Series(gross, index=bars.index, name="gross_returns"),
+        returns=pd.Series(net_returns, index=bars.index, name="returns"),
+        gross_returns=pd.Series(pnl, index=bars.index, name="gross_returns"),
         positions=pd.Series(held, index=bars.index, name="held"),
         turnover=pd.Series(turnover, index=bars.index, name="turnover"),
         costs=costs,
@@ -188,6 +261,16 @@ def trade_returns(result: BacktestResult) -> pd.Series:
     Инвариант: trade_returns(result).sum() == result.returns.sum() с точностью
     до ошибки сложения float64. Без него win-rate и profit factor (Task 12)
     видели бы только издержку входа и систематически завышали бы качество.
+
+    **net ≡ 0 (дельта-нейтральная книга).** Направленных сделок нет, и
+    результат — пустой float64-ряд: это честный ответ, а не потеря данных.
+    Издержки и funding двухногой книги тогда не атрибутируются ни одной
+    направленной сделке, и инвариант суммы сознательно не выполняется (пустой
+    ряд против ненулевой доходности). Следствие для вердикта: min_trades
+    провалит такую стратегию, и это консервативно правильно — число
+    независимых ставок в carry-режиме не равно числу баров, а подменять его
+    выдуманными «сделками» значило бы сдать гейт подгонкой. Собственная
+    единица сделки для carry-класса — предмет S4, а не этого модуля.
     """
     held = np.nan_to_num(result.positions.to_numpy(dtype="float64"), nan=0.0)
     gross = result.gross_returns.to_numpy(dtype="float64")
@@ -203,6 +286,11 @@ def trade_returns(result: BacktestResult) -> pd.Series:
     trade_id = np.cumsum(starts) - 1
     trade_id[sign == 0.0] = -1
     n_trades = int(trade_id.max()) + 1 if len(trade_id) else 0
+    if n_trades == 0:
+        # Ни одной направленной сделки (в том числе net ≡ 0 у двухногой
+        # книги): издержкам и funding не к чьей сделке приписаться. Пустой
+        # ряд — честный ответ; цикл ниже упал бы на trade_id = -1 при size 0.
+        return pd.Series(dtype="float64", name="trade_return")
     totals = np.zeros(n_trades, dtype="float64")
 
     for i in range(len(held)):

@@ -1,6 +1,12 @@
-"""Протокол стратегии. Одна функция — намеренно узкий интерфейс."""
+"""Протокол стратегии. Одна функция — намеренно узкий интерфейс.
+
+Двухногая книга объявляется ОТДЕЛЬНЫМ необязательным методом generate_legs
+(см. PositionLegs/TwoLegStrategy): одноногие стратегии его не имеют и их путь
+не меняется, а причинностный harness проверяет все три базы двухногой явно.
+"""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from numbers import Integral
 from typing import Protocol, runtime_checkable
 
@@ -47,6 +53,65 @@ class Strategy(Protocol):
         generate(bars).iloc[:k]. Новая стратегия обязана проходить его.
         """
         ...
+
+
+@dataclass(frozen=True)
+class PositionLegs:
+    """Двухногая позиция: три базы одного решения, а не один скаляр.
+
+    Одноногий движок держал net и применял к нему три вещи: ценовой P&L,
+    издержки оборота и funding. Для дельта-нейтральной книги это неверно:
+    net ≡ 0, но торгуются две ноги (издержки не ноль) и funding начисляется на
+    ногу перпа (это и есть доход). Поэтому базы разделены:
+
+      * net   — спот + перп: ценовая экспозиция; ценовой P&L, trade_returns и
+                вся статистика вердикта;
+      * gross — |спот| + |перп|: база комиссий и проскальзывания;
+      * carry — ноционал ноги перпа (знаковый): база funding.
+
+    Все три ряда обязаны иметь индекс, равный bars.index, — та же индексная
+    конвенция, что и у generate; её проверяет причинностный harness. Длины и
+    конечность значений проверяет движок (run_backtest).
+    """
+    net: pd.Series
+    gross: pd.Series
+    carry: pd.Series
+
+
+class TwoLegStrategy:
+    """Базовая реализация двухногой стратегии: решение — generate_legs.
+
+    Наследник объявляет name, history_bars, PARAM_NAMES и generate_legs.
+    generate выводится из решения (ровно legs.net) и существует для
+    потребителей одноногого интерфейса: два разных ответа на один вопрос
+    недопустимы. history_bars означает ровно то же, что и раньше, — сколько
+    хвостовых баров (включая текущий) требует решение по всем трём базам.
+
+    Причинностный harness для такой стратегии проверяет generate_legs
+    (все три базы), а CLI ведёт вердикт по legs.net — той же функции решения,
+    а не по производной от неё.
+    """
+
+    def generate_legs(self, bars: pd.DataFrame) -> PositionLegs:
+        raise NotImplementedError(
+            f"Стратегия '{getattr(self, 'name', type(self).__name__)}' не "
+            f"реализовала generate_legs: двухногий протокол требует решения по "
+            f"всем трём базам (net/gross/carry)"
+        )
+
+    def generate(self, bars: pd.DataFrame) -> pd.Series:
+        return self.generate_legs(bars).net
+
+
+def legs_generator(strategy):
+    """generate_legs стратегии, если она двухногая, иначе None.
+
+    Необязательный метод — точка расширения, не ломающая одноногие классы:
+    у них generate_legs отсутствует, и прежний путь (generate) не меняется
+    ни на одном байте.
+    """
+    fn = getattr(strategy, "generate_legs", None)
+    return fn if callable(fn) else None
 
 
 def history_bars_of(strategy) -> int:
