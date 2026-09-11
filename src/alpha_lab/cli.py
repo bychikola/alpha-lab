@@ -119,6 +119,13 @@ def journal_problem(journal: Path) -> str | None:
             # Дозапись в существующий журнал проверяется напрямую.
             with journal.open("a", encoding="utf-8"):
                 pass
+            # Чтение — вторая операция CLI над журналом, и проверять только
+            # запись мало: файл бывает доступен на дозапись, но не на чтение
+            # (POSIX 0200, ACL Windows). Тогда count_prior_trials поймает
+            # OSError, вернёт 0, и отчёт запишется с n_trials = 1 — заниженный
+            # штраф DSR, то есть оптимистичный вердикт на диске.
+            with journal.open("r", encoding="utf-8"):
+                pass
         else:
             # Журнала ещё нет: проверяем, что каталог вообще доступен на
             # запись. Пробник удаляется сразу, чтобы проверка не оставляла
@@ -266,9 +273,18 @@ def _cmd_validate(args) -> int:
         price_returns=result.price_returns, positions=result.positions,
     )
 
+    # ВАЖНО: load_bars заканчивается reset_index(drop=True), поэтому бары и
+    # выходы движка проиндексированы RangeIndex (0..n-1). build_report делает
+    # из индекса series.ts через pd.Timestamp(t), а это наносекунды от эпохи
+    # 1970 года — ось времени всех графиков дашборда становится бессмысленной.
+    # Переиндексируем позиционные ряды реальными временами баров; set_axis не
+    # меняет длину, поэтому проверка выравнивания в writer проходит.
+    ts_index = pd.Index(bars["ts"].to_numpy(), name="ts")
     payload = build_report(
-        verdict, equity=result.equity, close=bars["close"],
-        positions=result.positions, costs=result.costs, price_bars=bars,
+        verdict, equity=result.equity.set_axis(ts_index),
+        close=bars["close"].set_axis(ts_index),
+        positions=result.positions.set_axis(ts_index),
+        costs=result.costs.set_axis(ts_index), price_bars=bars.set_axis(ts_index),
         extra={"symbol": symbol, "timeframe": exp.timeframe,
                "data_version": dv, "dirty_bars": dirty,
                "costs_total": result.cost_totals,

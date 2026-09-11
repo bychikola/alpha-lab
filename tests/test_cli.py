@@ -192,6 +192,57 @@ def test_validate_command_writes_report(tmp_path, capsys):
         assert reason in printed
 
 
+def test_report_series_ts_matches_bar_timestamps(tmp_path):
+    """series.ts обязан содержать реальные времена баров, а не номера позиций.
+
+    Движок индексирует ряды bars.index, а load_bars заканчивается
+    reset_index(drop=True) — это RangeIndex 0..n-1. Если отдать его в
+    build_report, pd.Timestamp(0/1/...) превратит ось времени в наносекунды
+    от эпохи 1970 года: графики дашборда станут бессмысленными, при этом
+    значения выглядят правдоподобно и ничто не кричит об ошибке.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    # format="ISO8601": у эпохи 1970 дробная часть разной длины, и строгий
+    # разбор падал бы ValueError ещё до сравнения — тест обязан показывать
+    # именно несовпадение времён.
+    ts = pd.to_datetime(payload["series"]["ts"], utc=True, format="ISO8601")
+    bars = _hourly_bars(root)
+
+    assert len(ts) == len(bars)
+    # Именно сверка с фактической колонкой ts фикстуры, а не «год не 1970»:
+    # проверка на год пропустила бы любой сдвиг внутри правильного года.
+    assert ts[0] == pd.Timestamp(bars["ts"].iloc[0])
+    assert ts[-1] == pd.Timestamp(bars["ts"].iloc[-1])
+    assert ts.equals(pd.DatetimeIndex(bars["ts"]))
+
+
+def test_report_series_ts_is_monotonic_and_unique(tmp_path):
+    """Ось времени отчёта обязана строго возрастать и не иметь дублей.
+
+    Фикстура чистая (ни одного грязного бара), поэтому любые повторы или
+    перестановки ts означали бы, что ряды переиндексированы неверно.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    ts = pd.to_datetime(payload["series"]["ts"], utc=True, format="ISO8601")
+
+    assert ts.is_monotonic_increasing
+    assert ts.is_unique
+
+
 def test_validate_receives_engine_held_positions(tmp_path, monkeypatch):
     """Валидатору обязаны уходить позиции движка (held), а не сырые цели.
 
@@ -414,6 +465,49 @@ def test_unusable_journal_fails_closed_without_report(tmp_path, capsys):
         assert "Ошибка" in err
         assert "журнал" in err
         assert str(journal) in err
+
+
+def test_unreadable_but_writable_journal_fails_closed(tmp_path, monkeypatch,
+                                                      capsys):
+    """Журнал, который пишется, но не читается, обязан останавливать прогон.
+
+    Проверять только дозапись мало: файл может открываться на запись и не
+    открываться на чтение (POSIX 0200, ACL Windows). Тогда count_prior_trials
+    ловит OSError, возвращает 0, и отчёт записывается с n_trials = 1 —
+    недодефлированный вердикт выглядит ЛУЧШЕ правды.
+
+    На Windows «запись разрешена, чтение запрещено» через chmod не собрать,
+    поэтому нечитаемость имитируется: Path.open падает с OSError на режиме
+    чтения ровно для файла журнала, а пробник дозаписи проходит.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    journal = tmp_path / "trials.jsonl"
+    key = {"strategy": "mean_reversion", "params": PARAMS,
+           "symbol": "BTCUSDT", "timeframe": "1h"}
+    log_trial(journal, key, "old", {"sharpe": 1.0})
+
+    real_open = Path.open
+
+    def fake_open(self, mode="r", *args, **kwargs):
+        if self == journal and "r" in mode:
+            raise OSError(13, "Permission denied (read)")
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fake_open)
+
+    # Функция обязана увидеть проблему чтения, хотя дозапись доступна.
+    assert cli.journal_problem(journal) is not None
+
+    out = tmp_path / "out"
+    assert _run_validate(root, u, e, out, journal) == cli.EXIT_ERROR
+    assert not (out / "report.json").exists()
+
+    err = capsys.readouterr().err
+    assert "Ошибка" in err
+    assert "журнал" in err
+    assert str(journal) in err
 
 
 def test_ignore_journal_skips_read_and_write(tmp_path, capsys):
