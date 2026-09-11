@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import subprocess
@@ -303,11 +304,51 @@ def _generate_segmented(strategy, bars: pd.DataFrame,
     return pd.Series(np.concatenate(parts), index=bars.index, name="position")
 
 
+def _universe_payload(universe) -> dict:
+    """Состав юниверса для experiment_id.
+
+    Порядок символов в файле — оформление, а не гипотеза: состав сравнивается
+    как множество, поэтому список сортируется. Иначе перестановка строк в
+    universe.yaml меняла бы experiment_id, хотя исследование то же.
+    """
+    return {
+        "symbols": sorted(universe.symbols),
+        "market": universe.market,
+        "start": universe.start,
+        "end": universe.end,
+        "include_delisted": universe.include_delisted,
+    }
+
+
 def _cmd_validate(args) -> int:
     try:
         exp = load_experiment(args.config)
     except (FileNotFoundError, ValueError) as exc:
         print(f"Ошибка конфига: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    # Юниверс — входной контракт прогона, а не справка: прогон символа вне
+    # зафиксированного состава исследовал бы не ту гипотезу, а состав обязан
+    # менять experiment_id (spec 5). Поэтому отсутствующий или битый файл —
+    # ошибка запуска. Молчаливое «проверять нечего» было бы тихой деградацией:
+    # отчёт выглядел бы легитимным, не неся ни проверки членства, ни состава.
+    try:
+        universe = load_universe(args.universe)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Ошибка юниверса: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.symbol not in universe.symbols:
+        hints = difflib.get_close_matches(args.symbol, universe.symbols, n=3)
+        hint = f" Ближайшее совпадение: {', '.join(hints)}." if hints else ""
+        print(
+            f"Ошибка: символ '{args.symbol}' не входит в юниверс "
+            f"{args.universe} (символов: {len(universe.symbols)}).{hint} "
+            f"Доступные символы: {', '.join(universe.symbols)}. "
+            f"Отчёт не записан. Добавьте символ в юниверс или выберите "
+            f"другой --universe.",
+            file=sys.stderr,
+        )
         return EXIT_ERROR
 
     root = Path(args.data_root)
@@ -324,6 +365,10 @@ def _cmd_validate(args) -> int:
         # без него прогоны того же конфига по разным символам делят id, и
         # второй молча затирает reports/<exp_id> первого.
         "symbol": args.symbol,
+        # Состав юниверса — часть гипотезы (spec 5): смена состава обязана
+        # менять id. Символ прогона уже входит отдельно; здесь именно состав,
+        # поэтому два прогона одного символа в разных юниверсах различаются.
+        "universe": _universe_payload(universe),
     }
     exp_id = experiment_id(cfg_payload, dv, git_hash())
 
@@ -645,7 +690,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_val = sub.add_parser("validate", help="Прогнать стратегию и вынести вердикт")
     p_val.add_argument("--config", required=True, help="Путь к эксперименту")
-    p_val.add_argument("--universe", default="configs/universe.yaml")
+    p_val.add_argument("--universe", default="configs/universe.yaml",
+                       help="Юниверс исследования: --symbol обязан входить в "
+                            "его состав, а состав входит в experiment_id "
+                            "(spec 5). Отсутствующий или битый файл — ошибка")
     p_val.add_argument("--data-root", default=str(DEFAULT_ROOT))
     p_val.add_argument("--symbol", default="BTCUSDT")
     p_val.add_argument("--out", default=None)

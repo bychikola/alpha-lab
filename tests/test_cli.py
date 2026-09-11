@@ -660,6 +660,131 @@ def test_experiment_id_includes_symbol(tmp_path, monkeypatch):
     assert reports[1].parent.name == ids[1]
 
 
+def _universe_file(tmp_path, name: str, symbols,
+                   market: str = "futures-um",
+                   start: str = "2024-01-01", end: str = "2024-06-30",
+                   include_delisted: bool = True) -> Path:
+    """Пишет universe.yaml с заданным составом — для проверок членства и id."""
+    p = tmp_path / name
+    p.write_text(
+        f"market: {market}\nstart: '{start}'\nend: '{end}'\n"
+        f"include_delisted: {str(include_delisted).lower()}\n"
+        f"symbols: {list(symbols)}\n", encoding="utf-8")
+    return p
+
+
+def _run_validate_universe(root: Path, u: Path, e: Path, out: Path,
+                           journal: Path, symbol: str = "BTCUSDT") -> int:
+    return main(["validate", "--config", str(e), "--universe", str(u),
+                 "--data-root", str(root), "--symbol", symbol,
+                 "--out", str(out), "--journal", str(journal)])
+
+
+def test_symbol_outside_universe_fails_without_report(tmp_path, capsys):
+    """Символ вне юниверса — ошибка запуска, а не «прогон не той гипотезы».
+
+    --universe принимался и игнорировался: можно было прогнать символ, которого
+    в зафиксированном юниверсе нет, и отчёт выглядел бы легитимным. Сообщение
+    обязано перечислять доступные символы, иначе ошибку не исправить.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root, symbols=("ETHUSDT", "SOLUSDT"))
+    out = tmp_path / "out"
+
+    code = _run_validate(root, u, e, out, tmp_path / "trials.jsonl")
+
+    assert code == cli.EXIT_ERROR
+    assert not (out / "report.json").exists(), "отчёт не должен быть записан"
+    err = capsys.readouterr().err
+    assert "BTCUSDT" in err
+    assert "юниверс" in err.lower()
+    assert "ETHUSDT" in err and "SOLUSDT" in err
+    assert "Traceback" not in err
+
+
+def test_symbol_inside_universe_proceeds(tmp_path):
+    """Символ из состава юниверса проходит: проверка не блокирует всё подряд."""
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root, symbols=("BTCUSDT", "ETHUSDT"))
+    out = tmp_path / "out"
+
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+    assert (out / "report.json").exists()
+
+
+def test_missing_universe_file_is_error_without_traceback(tmp_path, capsys):
+    """Отсутствующий файл юниверса — EXIT_ERROR, а не трейсбек.
+
+    Проглотить и продолжить нельзя: тогда прогон молча шёл бы без проверки
+    членства и без состава юниверса в experiment_id — тихая деградация.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    _, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+    missing = tmp_path / "no_such_universe.yaml"
+
+    code = _run_validate_universe(root, missing, e, out,
+                                  tmp_path / "trials.jsonl")
+
+    assert code == cli.EXIT_ERROR
+    assert not (out / "report.json").exists()
+    err = capsys.readouterr().err
+    assert "юниверс" in err.lower()
+    assert "не найден" in err
+    assert "Traceback" not in err
+
+
+def test_malformed_universe_file_is_error_without_traceback(tmp_path, capsys):
+    """Битый YAML юниверса — та же ошибка запуска, а не стек.
+
+    Список вместо словаря ловит load_universe; CLI обязан превратить это в
+    русское сообщение и код 2.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    _, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+    bad = tmp_path / "bad_universe.yaml"
+    bad.write_text("- BTCUSDT\n- ETHUSDT\n", encoding="utf-8")
+
+    code = _run_validate_universe(root, bad, e, out, tmp_path / "trials.jsonl")
+
+    assert code == cli.EXIT_ERROR
+    assert not (out / "report.json").exists()
+    err = capsys.readouterr().err
+    assert "юниверс" in err.lower()
+    assert "словар" in err
+    assert "Traceback" not in err
+
+
+def test_experiment_id_changes_with_universe_composition(tmp_path):
+    """Смена состава юниверса обязана менять experiment_id (spec 5).
+
+    Символ прогона уже входит в payload, но именно состав юниверса отличает
+    прогоны одного символа в разных исследованиях. Порядок строк в файле —
+    оформление, а не гипотеза: тот же состав в другом порядке даёт тот же id.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    _, e = _write_configs(tmp_path, root)
+
+    ids = []
+    for i, symbols in enumerate((("BTCUSDT", "ETHUSDT"),
+                                 ("BTCUSDT", "ETHUSDT", "SOLUSDT"),
+                                 ("SOLUSDT", "ETHUSDT", "BTCUSDT"))):
+        u = _universe_file(tmp_path, f"u{i}.yaml", symbols)
+        out = tmp_path / f"out{i}"
+        assert _run_validate(root, u, e, out, tmp_path / f"j{i}.jsonl") == 0
+        ids.append(json.loads((out / "report.json").read_text(
+            encoding="utf-8"))["verdict"]["experiment_id"])
+
+    assert ids[0] != ids[1], "состав юниверса не вошёл в experiment_id"
+    assert ids[1] == ids[2], "порядок символов — не состав: id обязан совпасть"
+
+
 def test_dirty_bar_targets_are_forced_flat(tmp_path, capsys):
     """Бар с нулевым объёмом не торгуется (spec раздел 8).
 
