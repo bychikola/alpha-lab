@@ -65,7 +65,11 @@ from alpha_lab.data.query import data_version
 from alpha_lab.grid import Grid, GridCell
 from alpha_lab.results import completed_ids as _completed_ids
 from alpha_lab.results import write_runs as _write_runs
-from alpha_lab.validation.validator import build_returns_matrix
+from alpha_lab.validation.validator import (
+    DEFAULT_THRESHOLDS as VALIDATOR_DEFAULT_THRESHOLDS,
+    GATE_THRESHOLD_KEYS,
+    build_returns_matrix,
+)
 
 # Строк на батч записи в хранилище: обрыв свипа теряет не больше этого числа
 # уже посчитанных конфигураций, а хранилище не переписывается на каждую строку.
@@ -198,7 +202,15 @@ def _row(cell: GridCell, data_version: str, *, experiment_id: str,
     costs — разбивка издержек движка (cost_totals): сумма и JSON попадают в
     хранилище, чтобы воронка показывала, сколько съели комиссии/funding/
     проскальзывание у выживших, а не только сухие Sharpe и DSR.
+
+    thresholds_json — пороги гейтов, по которым судилась ячейка
+    (DEFAULT_THRESHOLDS, перекрытые validation-блоком сетки). Воронка обязана
+    судить строку ими, а не текущими дефолтами: сетка вправе задать другие
+    min_trades/min_dsr/max_p_value/max_pbo, и они часть гипотезы (входят в
+    config_id). Пишутся и строкам-ошибкам: набор порогов — свойство ячейки.
     """
+    effective = {**VALIDATOR_DEFAULT_THRESHOLDS,
+                 **(cell.experiment.validation or {})}
     row: dict[str, Any] = {
         "config_id": cell.config_id,
         "experiment_id": experiment_id,
@@ -212,6 +224,9 @@ def _row(cell: GridCell, data_version: str, *, experiment_id: str,
         "error": error,
         "data_version": data_version,
         "duration_s": float(duration_s),
+        "thresholds_json": json.dumps(
+            {key: effective[key] for key in GATE_THRESHOLD_KEYS},
+            sort_keys=True, ensure_ascii=False),
         "cost_total": (float(sum(float(v) for v in costs.values()))
                        if costs else float("nan")),
         "costs_json": (json.dumps(costs, sort_keys=True, ensure_ascii=False)

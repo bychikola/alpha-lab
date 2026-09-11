@@ -13,15 +13,19 @@ import pytest
 
 import alpha_lab.cli as cli
 from alpha_lab.funnel import (
-    FUNNEL_SCHEMA_VERSION, build_funnel, format_funnel, write_funnel,
+    DEFAULT_THRESHOLDS, FUNNEL_SCHEMA_VERSION, build_funnel, format_funnel,
+    write_funnel,
 )
-from alpha_lab.results import write_runs
+from alpha_lab.results import read_runs, write_runs
+
+_DEFAULT_THRESHOLDS_JSON = json.dumps(DEFAULT_THRESHOLDS, sort_keys=True)
 
 
 def _row(config_id: str, *, symbol="BTCUSDT", timeframe="1h", trades=200,
          dsr=0.99, p_value=0.01, pbo=0.2, alive=False, screening=False,
          error="", sharpe=1.0, max_dd=-0.2, total_return=0.3,
-         cost_total=0.02, data_version="dv1", n_permutations=1000) -> dict:
+         cost_total=0.02, data_version="dv1", n_permutations=1000,
+         thresholds=None) -> dict:
     return {
         "config_id": config_id, "experiment_id": f"exp-{config_id}",
         "index": 0, "symbol": symbol, "timeframe": timeframe,
@@ -32,7 +36,9 @@ def _row(config_id: str, *, symbol="BTCUSDT", timeframe="1h", trades=200,
         "total_return": total_return, "trades": trades, "n_trials": 12,
         "n_permutations": n_permutations, "screening": screening, "alive": alive,
         "reasons": "" if alive else "DSR ниже порога",
-        "warnings": "", "cost_total": cost_total,
+        "warnings": "", "thresholds_json": _DEFAULT_THRESHOLDS_JSON
+        if thresholds is None else json.dumps(thresholds, sort_keys=True),
+        "cost_total": cost_total,
         "costs_json": '{"fee": 0.01}',
     }
 
@@ -116,6 +122,124 @@ def test_zero_survivors_is_reported_honestly():
     assert "9.90" not in text
 
 
+def test_alive_without_gate_intersection_is_not_a_survivor():
+    """Хранимый alive вне пересечения гейтов не делает строку выжившей.
+
+    Воспроизведение ревью: сетка, чья единственная ось — symbols, даёт по одной
+    конфигурации на группу (символ, таймфрейм). Матрицы доходностей нет, PBO
+    остаётся NaN, а валидатор честно пишет alive=True с предупреждением, что
+    гейт PBO не проверялся. Воронка обязана показать ноль выживших и честный
+    ноль, а не «Топ выживших» из строк, не прошедших пересечение гейтов.
+    """
+    rows = [
+        _row("ghost-pbo-1", alive=True, pbo=float("nan")),
+        _row("ghost-pbo-2", alive=True, pbo=float("nan"), symbol="ETHUSDT"),
+        _row("ghost-dsr", alive=True, dsr=float("nan"), symbol="SOLUSDT"),
+    ]
+    report = build_funnel(_frame(rows))
+
+    # alive-флаг есть у всех трёх, но пересечение гейтов пусто.
+    assert report["funnel"]["alive"]["n"] == 0
+    assert report["funnel"]["alive_without_pbo"] == 3
+    assert report["survivors"]["n"] == 0
+    assert report["survivors"]["top"] == []
+
+    text = format_funnel(report)
+    assert "Выживших нет" in text
+    assert "Топ выживших" not in text
+    for ghost in ("ghost-pbo-1", "ghost-pbo-2", "ghost-dsr"):
+        assert ghost not in text
+
+
+def test_survivors_are_exactly_the_alive_gate_intersection():
+    """Список выживших — ровно то множество, по которому посчитан alive.
+
+    Инвариант по построению: непустой список невозможен при нулевом счётчике
+    alive, а мёртвая строка с лучшими метриками в список не попадает.
+    """
+    rows = _mixed_rows() + [
+        _row("ghost", alive=True, pbo=float("nan")),
+        _row("dead-best", alive=False, dsr=0.999, sharpe=9.9, pbo=0.01),
+    ]
+    report = build_funnel(_frame(rows))
+
+    alive = report["funnel"]["alive"]["n"]
+    assert alive == 2
+    assert report["survivors"]["n"] == alive
+    assert {s["config_id"] for s in report["survivors"]["top"]} == {"v11", "v12"}
+    # Непустой список выживших подразумевает ненулевой alive — и наоборот.
+    assert (report["survivors"]["n"] > 0) == (alive > 0)
+    for entry in report["survivors"]["top"]:
+        assert entry["dsr"] is not None and entry["pbo"] is not None
+        assert entry["dsr"] > DEFAULT_THRESHOLDS["min_dsr"]
+        assert entry["pbo"] < DEFAULT_THRESHOLDS["max_pbo"]
+
+
+def test_funnel_judges_rows_by_thresholds_recorded_in_store(tmp_path):
+    """Строка судится порогами, записанными сеткой, а не текущими дефолтами.
+
+    Строка проходит все четыре гейта только при порогах сетки (min_trades=1,
+    min_dsr=0.5, max_p_value=0.5, max_pbo=0.9). Записанная свипом строка несёт
+    их в thresholds_json; воронка же, считающая по дефолтам (100 / 0.95 / 0.05 /
+    0.5), показала бы ноль на всех шагах и потеряла бы выжившего.
+    """
+    from alpha_lab.batch import _row as sweep_row
+    from alpha_lab.validation.validator import Verdict
+
+    validation = {"min_trades": 1, "min_dsr": 0.5, "max_p_value": 0.5,
+                  "max_pbo": 0.9}
+    verdict = Verdict(
+        strategy_name="mean_reversion", experiment_id="e1", sharpe=1.5,
+        dsr=0.6, p_value=0.2, max_dd=-0.1, total_return=0.2, trades=5,
+        n_configs_tried=1, alive=True, pbo=0.7,
+    )
+    row = sweep_row(_grid_cell(validation=validation), "dv1",
+                    experiment_id="e1", n_trials=1, verdict=verdict)
+    store = tmp_path / "results"
+    write_runs(store, [row])
+
+    report = build_funnel(read_runs(store))
+
+    assert [step["n"] for step in report["funnel"]["steps"]] == [1, 1, 1, 1]
+    assert report["funnel"]["alive"]["n"] == 1
+    assert report["survivors"]["n"] == 1
+    assert report["survivors"]["top"][0]["config_id"] == "c1"
+    assert report["thresholds"]["min_trades"] == 1
+    assert report["thresholds"]["min_dsr"] == pytest.approx(0.5)
+    assert report["thresholds"]["max_p_value"] == pytest.approx(0.5)
+    assert report["thresholds"]["max_pbo"] == pytest.approx(0.9)
+    assert "сделок ≥ 1" in format_funnel(report)
+
+
+def test_missing_thresholds_warn_and_fall_back_to_defaults():
+    """Нет записанных порогов — громкое предупреждение, а не тихий дефолт.
+
+    Схема 2.0 пишет пороги каждой строки; строка без них (собрана в обход
+    свипа) судится порогами по умолчанию, но читатель обязан видеть, что
+    сравнение неоднородно.
+    """
+    frame = _frame(_mixed_rows())
+    frame["thresholds_json"] = ""
+    report = build_funnel(frame)
+
+    assert any("пороги" in w.lower() for w in report["warnings"])
+    assert [step["n"] for step in report["funnel"]["steps"]] == [11, 9, 6, 2]
+
+
+def _grid_cell(*, validation=None, config_id="c1", symbol="BTCUSDT"):
+    """Ячейка сетки для проверки записи порогов свипом (batch._row)."""
+    from alpha_lab.config import Experiment
+    from alpha_lab.grid import GridCell
+
+    return GridCell(
+        index=0, config_id=config_id, symbol=symbol,
+        experiment=Experiment(
+            name="custom", strategy="mean_reversion",
+            params={"window": 20, "k": 2.0}, timeframe="1h",
+            start="2022-01-01", end="2025-12-31", costs={},
+            validation=dict(validation or {})))
+
+
 def test_screening_rows_are_candidates_not_alive():
     rows = _mixed_rows() + [
         _row("s1", screening=True, alive=False, n_permutations=200),
@@ -130,6 +254,11 @@ def test_screening_rows_are_candidates_not_alive():
     assert report["grade"] == "mixed"
     assert report["survivors"]["n"] == 2
     assert {s["config_id"] for s in report["survivors"]["top"]} == {"v11", "v12"}
+    # N выбора — только полные вердикты: черновая строка не может быть
+    # выжившей, поэтому в знаменатель отбора она не входит, но видна отдельно.
+    assert report["survivors"]["selected_from"]["n_verdicts"] == 12
+    assert report["survivors"]["selected_from"]["n_screening"] == 2
+    assert "черновых screening: 2" in report["survivors"]["note"]
 
     text = format_funnel(report)
     assert "чернов" in text.lower()

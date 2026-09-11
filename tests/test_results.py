@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pyarrow as pa
@@ -47,6 +48,9 @@ def _row(config_id: str, **overrides) -> dict:
         "alive": True,
         "reasons": "",
         "warnings": "",
+        "thresholds_json": json.dumps(
+            {"min_trades": 100, "min_dsr": 0.95, "max_p_value": 0.05,
+             "max_pbo": 0.5}, sort_keys=True),
         "cost_total": 0.02,
         "costs_json": '{"fee": 0.01}',
     }
@@ -74,6 +78,9 @@ def test_round_trip_write_read(tmp_path):
     assert bool(eth["alive"]) is False
     assert eth["dsr"] == 0.5
     assert eth["data_version"] == "dv1"
+    # Пороги гейтов едут в строке: воронка обязана судить строку ими, а не
+    # текущими дефолтами, которые сетка могла переопределить.
+    assert json.loads(eth["thresholds_json"])["min_trades"] == 100
 
     # Пустой/отсутствующий store читается как пустая таблица контракта.
     empty = read_runs(tmp_path / "nowhere")
@@ -97,10 +104,12 @@ def test_write_is_idempotent_by_config_id(tmp_path):
 
 
 def test_incompatible_schema_version_is_rejected_loudly(tmp_path):
+    """Схема 1.0 отвергается: без порогов по строкам воронка судила бы её
+    текущими дефолтами, а сетка могла задавать другие пороги."""
     path = _store(tmp_path)
     path.mkdir(parents=True)
     table = pa.table({"config_id": ["x"], "data_version": ["dv"], "error": [""]})
-    table = table.replace_schema_metadata({b"alpha_lab_schema_version": b"2.0"})
+    table = table.replace_schema_metadata({b"alpha_lab_schema_version": b"3.0"})
     pq.write_table(table, path / "runs.parquet")
 
     with pytest.raises(ValueError) as exc:
@@ -108,7 +117,7 @@ def test_incompatible_schema_version_is_rejected_loudly(tmp_path):
 
     message = str(exc.value)
     assert "несовместим" in message.lower()
-    assert "2.0" in message and "1" in message
+    assert "3.0" in message and "2" in message
 
 
 def test_store_without_schema_version_is_rejected(tmp_path):
@@ -217,7 +226,9 @@ def test_unknown_column_is_rejected(tmp_path):
 
 
 def test_schema_version_constant(tmp_path):
-    assert RESULTS_SCHEMA_VERSION == "1.0"
+    # Мажор 2: в строке появились пороги гейтов (thresholds_json), и старые
+    # хранилища 1.0 обязаны отвергаться, а не читаться без порогов.
+    assert RESULTS_SCHEMA_VERSION == "2.0"
     path = _store(tmp_path)
     write_runs(path, [_row("a")])
     meta = pq.read_metadata(path / "runs.parquet").metadata

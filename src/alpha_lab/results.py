@@ -27,6 +27,14 @@
 выглядеть как подтверждённый результат. Фильтровать их обязательно явно —
 ``error_rows(frame)`` / ``verdict_rows(frame)`` / ``is_error(frame)``; по
 умолчанию ``query_runs`` отдаёт только вердикты, а ``group_counts`` тоже.
+
+**Пороги едут со строкой** (``thresholds_json``, схема 2.0). Сетка могла
+переопределить ``min_trades``/``min_dsr``/``max_p_value``/``max_pbo``, а
+``experiment_id`` (и ``config_id``) входят в YAML-validation: пересчитанная с
+другими порогами конфигурация — другая строка. Воронка обязана судить каждую
+строку порогами, при которых она получена, а не текущими дефолтами; хранилище
+без порогов (схема 1.0) по этой причине отвергается громко, а не читается как
+совместимое с правдоподобно неверным отбором.
 """
 from __future__ import annotations
 
@@ -40,7 +48,9 @@ import pyarrow.parquet as pq
 
 # Версия схемы хранилища. Мажор меняется при несовместимом изменении набора
 # или смысла колонок; минор — при совместимом добавлении.
-RESULTS_SCHEMA_VERSION = "1.0"
+# 2.0: добавлен thresholds_json (пороги гейтов, при которых получена строка).
+# Без него воронка судила бы строку текущими дефолтами, поэтому 1.0 отвергается.
+RESULTS_SCHEMA_VERSION = "2.0"
 RESULTS_MAJOR_VERSION = int(RESULTS_SCHEMA_VERSION.split(".")[0])
 
 # Ключ метаданных Parquet, по которому читается версия. Метаданные едут внутри
@@ -57,13 +67,13 @@ COLUMNS = (
     "params_json", "start", "end", "error", "data_version", "duration_s",
     "sharpe", "dsr", "p_value", "pbo", "max_dd", "total_return", "trades",
     "n_trials", "n_permutations", "screening", "alive", "reasons", "warnings",
-    "cost_total", "costs_json",
+    "thresholds_json", "cost_total", "costs_json",
 )
 
 _STRING_COLUMNS = (
     "config_id", "experiment_id", "symbol", "timeframe", "strategy",
     "params_json", "start", "end", "error", "data_version", "reasons",
-    "warnings", "costs_json",
+    "warnings", "thresholds_json", "costs_json",
 )
 _INT_COLUMNS = ("index", "trades", "n_trials", "n_permutations")
 _FLOAT_COLUMNS = ("duration_s", "sharpe", "dsr", "p_value", "pbo", "max_dd",
