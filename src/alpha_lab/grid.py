@@ -273,6 +273,23 @@ def load_grid(path: str | Path) -> Grid:
                 f"'{timeframe}'. Допустимые: {', '.join(VALID_TIMEFRAMES)}"
             )
 
+    # Пространство параметров спрашивается один раз и проверяет оба входа:
+    # params базового эксперимента и params осей. Без проверки базы опечатка
+    # (`windwo`) принималась бы молча, стратегия игнорировала бы ключ и брала
+    # дефолт — сетка считала бы не ту конфигурацию, которую описал автор, а
+    # валидация осей создавала бы впечатление проверенности.
+    accepted = strategy_param_names(base.strategy)
+    unknown_base = sorted(set(base.params) - accepted)
+    if unknown_base:
+        raise ValueError(
+            f"Сетка {path}: базовый эксперимент содержит параметры, которых "
+            f"стратегия '{base.strategy}' не принимает: "
+            f"{', '.join(unknown_base)}. Стратегия молча игнорирует "
+            f"неизвестные ключи и берёт значения по умолчанию — прогон был бы "
+            f"не той конфигурацией, которую описал автор. Допустимые "
+            f"параметры: {', '.join(sorted(accepted))}"
+        )
+
     param_axes: list[tuple[str, tuple[Any, ...]]] = []
     if "params" in axes_raw:
         params_raw = axes_raw["params"]
@@ -281,7 +298,6 @@ def load_grid(path: str | Path) -> Grid:
                 f"Сетка {path}: ось params должна быть непустым словарём "
                 f"«имя параметра → список значений»"
             )
-        accepted = strategy_param_names(base.strategy)
         for name in sorted(params_raw):
             if name not in accepted:
                 raise ValueError(

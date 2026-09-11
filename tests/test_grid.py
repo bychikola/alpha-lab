@@ -156,6 +156,21 @@ def test_grid_rejects_unknown_parameter(tmp_path):
     assert "k" in str(exc.value) and "window" in str(exc.value)
 
 
+def test_grid_rejects_unknown_base_parameter(tmp_path):
+    """Опечатка в params базового эксперимента — ошибка, а не тихий игнор.
+
+    Стратегия молча игнорирует неизвестный ключ и берёт дефолт: свип ушёл бы
+    считать конфигурацию, которую автор не писал, а валидация осей создавала
+    бы впечатление проверенной сетки целиком.
+    """
+    text = GRID_YAML.replace("    window: 20\n", "    windwo: 50\n")
+    with pytest.raises(ValueError, match="windwo") as exc:
+        load_grid(_write_grid(tmp_path, text))
+    # Сообщение обязано перечислять принятые имена — без них опечатка не чинится.
+    message = str(exc.value)
+    assert "window" in message and "k" in message
+
+
 def test_grid_rejects_empty_axis(tmp_path):
     for broken in ("symbols: []", "timeframes: []", "k: []"):
         text = GRID_YAML.replace(
