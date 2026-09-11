@@ -14,7 +14,9 @@ import numpy as np
 import pandas as pd
 
 from alpha_lab.report.schema import SCHEMA_VERSION
-from alpha_lab.validation.validator import Verdict
+from alpha_lab.validation.validator import DEFAULT_THRESHOLDS, Verdict
+
+DEFAULT_N_PERMUTATIONS = DEFAULT_THRESHOLDS["n_permutations"]
 
 
 def _round(values, digits: int = 6) -> list:
@@ -114,6 +116,12 @@ def build_report(verdict: Verdict, equity: pd.Series, close: pd.Series,
         # Пустой список (не null): дашборд отличает «предупреждений нет» от
         # «поле не передано» без дополнительных догадок.
         "warnings": list(verdict.warnings or ()),
+        # P5: грейд вердикта — элемент контракта, а не деталь. Отчёт, снятый
+        # черновым прогоном, обязан нести это в payload: иначе precise и
+        # rough вердикты неотличимы после закрытия терминала.
+        "screening": bool(getattr(verdict, "screening", False)),
+        "n_permutations": int(getattr(verdict, "n_permutations",
+                                      DEFAULT_N_PERMUTATIONS)),
         "metrics": {k: _num(v) for k, v in (verdict.metrics or {}).items()},
     }
 

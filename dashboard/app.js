@@ -166,6 +166,10 @@ function renderVerdict(report) {
   const v = report.verdict;
   const extra = report.extra || {};
   const alive = !!v.alive;
+  /* P5: черновой вердикт — третий исход. Прохождение screening-гейтов делает
+   * конфигурацию кандидатом, а не «живой» и не «мёртвой»: показать её как
+   * МЕРТВА значило бы выдать непроверенное за отвергнутое. */
+  const rough = !!v.screening;
 
   const dsr = v.dsr, p = v.p_value, pbo = v.pbo, trades = v.trades;
   const kpis = [
@@ -215,6 +219,9 @@ function renderVerdict(report) {
     }).join('');
 
   const chips = [];
+  if (rough) {
+    chips.push(`<span class="chip amber" title="Черновой прогон (screening): меньше перестановок, минимальный достижимый p-value 1/(N+1). Alive по черновому вердикту не выносится.">черновой вердикт · перестановок ${fmtInt(v.n_permutations)}</span>`);
+  }
   if (extra.symbol) chips.push(`<span class="chip mono">${esc(extra.symbol)}${extra.timeframe ? ' · ' + esc(extra.timeframe) : ''}</span>`);
   if (extra.data_version) chips.push(`<span class="chip mono" title="версия набора данных">данные ${esc(extra.data_version)}</span>`);
   const gen = fmtGenerated(report.generated_at);
@@ -230,18 +237,23 @@ function renderVerdict(report) {
   }
 
   // «Жива» с непроверенными гейтами — не то же самое, что «жива» после всех
-  // проверок; подпись обязана это различать.
+  // проверок; подпись обязана это различать. Черновое прохождение — кандидат,
+  // а не результат: alive по screening не выносится.
+  const candidate = rough && !alive && reasons.length === 0;
   const statusNote = alive
     ? (warnings.length
         ? 'прошла проверку с оговорками — часть гейтов не проверена, см. предупреждения'
         : 'прошла проверку на значимость и переобучение')
-    : 'не прошла проверку — причины ниже';
+    : candidate
+      ? 'черновой вердикт (screening): гейты пройдены, но alive не вынесен — нужен полный прогон'
+      : 'не прошла проверку — причины ниже';
+  const statusText = alive ? 'ЖИВА' : (candidate ? 'КАНДИДАТ' : 'МЕРТВА');
 
   document.getElementById('verdict-box').innerHTML =
     `<div class="verdict ${alive ? 'alive' : 'dead'}">
        <div class="verdict-top">
          <div>
-           <h1>${alive ? 'ЖИВА' : 'МЕРТВА'}</h1>
+           <h1>${statusText}</h1>
            <div class="status-note">${statusNote}</div>
            <div class="sub">
              <span class="mono">${esc(v.strategy_name)}</span> ·

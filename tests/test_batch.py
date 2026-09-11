@@ -38,8 +38,9 @@ class FakeStore:
         self.rows: list[dict] = []
         self.preset = set(preset)
 
-    def completed_ids(self, data_version: str) -> set[str]:
-        done = {r["config_id"] for r in self.rows if not r.get("error")}
+    def completed_ids(self, data_version: str, *, screening: bool = False) -> set[str]:
+        done = {r["config_id"] for r in self.rows
+                if not r.get("error") and (screening or not r.get("screening"))}
         return done | self.preset
 
     def write(self, rows: list[dict]) -> None:
@@ -273,6 +274,52 @@ def test_sweep_causality_failure_is_recorded_not_raised(tmp_path, monkeypatch):
 
     assert summary.executed == 2 and summary.failed == 2
     assert all("причинност" in r["error"] for r in store.rows)
+
+
+def test_sweep_screening_rows_are_rough_and_never_alive(tmp_path):
+    """P5: черновой свип помечает строки и не выносит alive ни по одной."""
+    root = tmp_path / "data"
+    _write_minute_bars(root, "BTCUSDT")
+    u = _write_universe(tmp_path)
+    grid = load_grid(_write_grid(tmp_path))
+    store = FakeStore()
+
+    summary = run_sweep(grid, data_root=root, universe=load_universe(u),
+                        store=store, journal=tmp_path / "trials.jsonl",
+                        screening=True)
+
+    assert summary.executed == 2 and summary.failed == 0
+    for row in store.rows:
+        assert row["screening"] is True
+        assert row["alive"] is False
+        assert row["n_permutations"] == 200
+        assert not row["error"]
+
+
+def test_full_sweep_reruns_screening_rows_and_upgrades_them(tmp_path):
+    """После чернового прогона полный обязан пересчитать финалистов.
+
+    Черновая строка не имеет права остановить полный вердикт: иначе
+    «кандидат» навсегда остался бы непроверенным и воронка показывала бы
+    черновое как окончательное.
+    """
+    root = tmp_path / "data"
+    _write_minute_bars(root, "BTCUSDT")
+    u = _write_universe(tmp_path)
+    grid = load_grid(_write_grid(tmp_path))
+    store = FakeStore()
+
+    rough = run_sweep(grid, data_root=root, universe=load_universe(u),
+                      store=store, journal=tmp_path / "trials1.jsonl",
+                      screening=True)
+    assert rough.executed == 2 and all(r["screening"] for r in store.rows)
+    assert store.completed_ids("dv", screening=False) == set()
+
+    full = run_sweep(grid, data_root=root, universe=load_universe(u),
+                     store=store, journal=tmp_path / "trials2.jsonl")
+    assert full.skipped == 0 and full.executed == 2
+    assert all(r["screening"] is False for r in store.rows)
+    assert all(r["n_permutations"] == 100 for r in store.rows)   # конфиг сетки
 
 
 def test_format_progress_has_position_elapsed_and_eta():

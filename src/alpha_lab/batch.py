@@ -258,6 +258,7 @@ def run_sweep(grid: Grid, *, data_root: Path, universe: Universe,
               force: bool = False, skip_causality: bool = False,
               journal: str | Path | None = None,
               ignore_journal: bool = False,
+              screening: bool = False,
               progress_stream=None,
               progress_interval: float = PROGRESS_INTERVAL) -> SweepSummary:
     """Прогоняет сетку, переиспользуя бары и не повторяя сделанное.
@@ -266,6 +267,10 @@ def run_sweep(grid: Grid, *, data_root: Path, universe: Universe,
     по store_path. force — пересчитать всё, даже лежащее в хранилище.
     Идёт последовательно: замеренные потоки/процессы end-to-end выигрыша не
     дали (докстринг модуля).
+
+    screening=True — черновой прогон P5: меньше перестановок, alive не
+    выносится, строки помечены screening=True. Возобновление учитывает грейд:
+    полный прогон не засчитывает черновые строки (см. results.completed_ids).
     """
     if store is None:
         if store_path is None:
@@ -275,8 +280,12 @@ def run_sweep(grid: Grid, *, data_root: Path, universe: Universe,
     root = Path(data_root)
     dv = data_version(root)
     cells = grid.expand()
+    if screening:
+        from alpha_lab.validation.validator import SCREENING_WARNING
+        print(f"Предупреждение: --screening: {SCREENING_WARNING}",
+              file=sys.stderr)
 
-    done = set() if force else set(store.completed_ids(dv))
+    done = set() if force else set(store.completed_ids(dv, screening=screening))
     pending = [c for c in cells if c.config_id not in done]
     skipped = len(cells) - len(pending)
 
@@ -434,7 +443,7 @@ def run_sweep(grid: Grid, *, data_root: Path, universe: Universe,
                 verdict = cli.validate_config(
                     outcome, data, experiment_id=exp_id, n_trials=n_trials,
                     returns_matrix=matrix, pbo_value=pbo_value,
-                    warnings=cell_warnings)
+                    warnings=cell_warnings, screening=screening)
             except Exception as exc:  # noqa: BLE001 — отказ ячейки изолирован
                 failed += 1
                 buffer.append(_row(
@@ -496,7 +505,7 @@ def cmd_sweep(args) -> int:
             grid, store_path=Path(args.out), data_root=Path(args.data_root),
             universe=universe, force=args.force,
             skip_causality=args.skip_causality, journal=args.journal,
-            ignore_journal=args.ignore_journal)
+            ignore_journal=args.ignore_journal, screening=args.screening)
     except (SweepError, OSError, ValueError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -541,4 +550,10 @@ def add_sweep_subparser(sub) -> None:
     p_sweep.add_argument("--force", action="store_true",
                          help="Пересчитать все конфигурации, даже уже "
                               "лежащие в хранилище")
+    p_sweep.add_argument("--screening", action="store_true",
+                         help="Черновой прогон (P5): 200 перестановок вместо "
+                              "1000; строки помечаются screening, alive не "
+                              "выносится — только отсев кандидатов. Полный "
+                              "прогон без флага пересчитает черновые строки "
+                              "(--force не нужен)")
     p_sweep.set_defaults(func=cmd_sweep)

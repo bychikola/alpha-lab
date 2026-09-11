@@ -30,7 +30,9 @@ from alpha_lab.engine.backtest import run_backtest, trade_returns
 from alpha_lab.engine.costs import RealisticCost
 from alpha_lab.report.writer import build_report, write_report
 from alpha_lab.strategies.base import build_strategy, history_bars_of
-from alpha_lab.validation.validator import build_returns_matrix, validate
+from alpha_lab.validation.validator import (
+    SCREENING_WARNING, build_returns_matrix, validate,
+)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -678,13 +680,17 @@ def run_config(data: LoadedData, exp: Experiment, *,
 def validate_config(outcome: RunOutcome, data: LoadedData, *,
                     experiment_id: str, n_trials: int,
                     returns_matrix=None, pbo_value=None,
-                    warnings: tuple[str, ...] | None = None):
+                    warnings: tuple[str, ...] | None = None,
+                    screening: bool = False):
     """Выносит вердикт по результату прогона — тот же validate, что и в CLI.
 
     Валидатору уходят позиции ДВИЖКА (result.positions — удержанные,
     held[t] = target[t-1]), а не сырые цели strategy.generate(): сырые цели
     смещены на бар, поэтому permutation-тест сравнил бы сигнал не с той
     доходностью (измерено 0.343656 у сырых против 0.000999 у позиций).
+
+    screening=True — черновой вердикт P5: меньше перестановок, alive не
+    выносится, грейд едет в отчёт и строку хранилища.
     """
     exp = outcome.experiment
     return validate(
@@ -697,6 +703,7 @@ def validate_config(outcome: RunOutcome, data: LoadedData, *,
         warnings=data.data_warnings if warnings is None else warnings,
         periods_per_year=data.ppy,
         returns_matrix=returns_matrix, pbo_value=pbo_value,
+        screening=screening,
     )
 
 
@@ -871,6 +878,12 @@ def _cmd_validate(args) -> int:
         # когда текущий свип сам покрывает всю семью.
         n_trials = count_prior_trials_for_keys(journal, trial_keys) + len(configs)
 
+    if args.screening:
+        # Громко и до бэктеста: черновой вердикт не выносит alive, и молчаливо
+        # получить «кандидата» вместо результата нельзя.
+        print(f"Предупреждение: --screening: {SCREENING_WARNING}",
+              file=sys.stderr)
+
     runs: list[dict] = []
     for i, (path, cfg) in enumerate(configs):
         try:
@@ -928,7 +941,8 @@ def _cmd_validate(args) -> int:
     verdicts = [
         validate_config(run["outcome"], data, experiment_id=exp_ids[i],
                         n_trials=n_trials, returns_matrix=matrix,
-                        pbo_value=pbo_value, warnings=data_warnings)
+                        pbo_value=pbo_value, warnings=data_warnings,
+                        screening=args.screening)
         for i, run in enumerate(runs)
     ]
     run0 = runs[0]
@@ -938,6 +952,10 @@ def _cmd_validate(args) -> int:
     extra = {
         "symbol": symbol, "timeframe": exp.timeframe,
         "data_version": dv, "dirty_bars": data.dirty,
+        # P5: грейд прогона виден в extra независимо от вердикта: отчёт,
+        # снятый черновым прогоном, обязан быть отличим от полного.
+        "screening": bool(verdict.screening),
+        "n_permutations": int(verdict.n_permutations),
         "gaps": data.gaps, "missing_bars": data.missing_bars,
         "gap_masked_bars": data.gap_masked,
         "history_bars": run0["outcome"].history,
@@ -1017,9 +1035,20 @@ def _cmd_validate(args) -> int:
                       {"sharpe": verdicts[i].sharpe, "dsr": verdicts[i].dsr,
                        "alive": verdicts[i].alive}, family=family)
 
-    status = "ЖИВА" if verdict.alive else "МЕРТВА"
+    # Три исхода, а не два: черновое прохождение — кандидатура, а не «жива» и
+    # не «мертва». Слить кандидата с МЕРТВА значило бы выдать непроверенное за
+    # отвергнутое, а с ЖИВА — выдать черновое за результат.
+    if verdict.alive:
+        status = "ЖИВА"
+    elif verdict.screening and not verdict.reasons:
+        status = "КАНДИДАТ (черновой вердикт)"
+    else:
+        status = "МЕРТВА"
     print(f"\n{'=' * 62}")
     print(f"  ВЕРДИКТ: {status}")
+    if verdict.screening:
+        print(f"  Грейд: черновой (screening, {verdict.n_permutations} "
+              f"перестановок) — alive не выносится, нужен полный прогон")
     print(f"{'=' * 62}")
     print(f"  Стратегия      {exp.name}  ({exp.strategy}, {exp.timeframe})")
     # Годовой множитель печатается явно: именно его неверное значение
@@ -1134,6 +1163,12 @@ def main(argv: list[str] | None = None) -> int:
                             "стратегии. Это ЕДИНСТВЕННАЯ работающая защита от "
                             "look-ahead (spec 8.1): статистика его не ловит, "
                             "поэтому вердикт с этим флагом может быть ложным")
+    p_val.add_argument("--screening", action="store_true",
+                       help="Черновой прогон (P5): 200 перестановок вместо "
+                            "1000, минимальный достижимый p-value 1/201. Alive "
+                            "по черновому вердикту НЕ выносится: прохождение "
+                            "гейтов — кандидатура, финалисту нужен полный "
+                            "прогон без этого флага")
     p_val.set_defaults(func=_cmd_validate)
 
     # Пакетный свип и воронка регистрируются лениво: batch.py берёт

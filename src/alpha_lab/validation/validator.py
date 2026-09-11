@@ -26,6 +26,25 @@ DEFAULT_THRESHOLDS = {
     "n_permutations": 1000,
 }
 
+# --- P5: режим просеивания -------------------------------------------------
+# Permutation-тест — 97% стоимости validate (замер: 646 из 662 мс). Широкий
+# перебор просеивается 200 перестановками, финалисты проверяются полностью.
+# Потеря точности документирована и записывается в вердикт: минимальный
+# достижимый p-value = 1/(200+1) ≈ 0.0050 — всё ещё ниже порога 0.05, но
+# грубее (полный прогон различает p ~ 0.001). Черновой вердикт может только
+# отсеять: alive по нему не выносится, прохождение гейтов делает конфигурацию
+# кандидатом, а не «живой».
+SCREENING_PERMUTATIONS = 200
+SCREENING_MIN_P = 1.0 / (SCREENING_PERMUTATIONS + 1)
+SCREENING_WARNING = (
+    f"Черновой вердикт (screening): перестановок {SCREENING_PERMUTATIONS} "
+    f"вместо {DEFAULT_THRESHOLDS['n_permutations']}; минимальный достижимый "
+    f"p-value = 1/{SCREENING_PERMUTATIONS + 1} ≈ {SCREENING_MIN_P:.4f} — "
+    f"грубее полного. alive по черновому вердикту НЕ выносится: прогон может "
+    f"только отсеять кандидатов; финалистам нужен полный вердикт "
+    f"(без --screening, при необходимости --force)."
+)
+
 
 @dataclass(frozen=True)
 class Verdict:
@@ -48,6 +67,11 @@ class Verdict:
     # стратегии. Но молчать нельзя: иначе отчёт с пустым reasons читается
     # как «все гейты пройдены», хотя часть из них не запускалась.
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    # P5: грейд вердикта. screening=True — черновой прогон: число перестановок
+    # уменьшено, alive не выносится (может только отсеять). Поле обязано ехать
+    # в отчёт/хранилище/воронку: смешать черновое с полным молча нельзя.
+    screening: bool = False
+    n_permutations: int = DEFAULT_THRESHOLDS["n_permutations"]
 
 
 def build_returns_matrix(columns: dict[str, pd.Series]) -> pd.DataFrame:
@@ -123,7 +147,8 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
              returns_matrix=None, price_returns=None, positions=None,
              warnings: tuple[str, ...] = (),
              periods_per_year: int = DEFAULT_PERIODS,
-             pbo_value: float | None = None) -> Verdict:
+             pbo_value: float | None = None,
+             screening: bool = False) -> Verdict:
     """Выносит вердикт. Все пороги — из config, значения по умолчанию в DEFAULT_THRESHOLDS.
 
     price_returns и positions обязательны для permutation-теста: он перемешивает
@@ -152,6 +177,12 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
     None — посчитать здесь (поведение прямых вызовов не изменилось). Передать
     pbo_value без матрицы нельзя: предвычисленному значению не к чему
     относиться, и гейт spec 6.5 молча остался бы непроверенным.
+
+    screening=True — черновой вердикт (P5): permutation-тест идёт
+    SCREENING_PERMUTATIONS перестановками вместо thresholds["n_permutations"],
+    в warnings добавляется документированная потеря точности, а alive
+    принудительно False. Прохождение всех гейтов делает конфигурацию
+    кандидатом, но не «живой»: черновой вердикт может только отсеять.
     """
     if not np.isfinite(periods_per_year) or periods_per_year <= 0:
         raise ValueError(
@@ -171,17 +202,23 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
     n_trades = int(len(t))
     dsr = deflated_sharpe_ratio(r, n_trials=n_trials)
 
+    # Черновой режим переопределяет число перестановок конфига: его смысл —
+    # «дешевле», и конфиг с n_permutations=1000 не должен его отменять.
+    n_permutations = int(SCREENING_PERMUTATIONS if screening
+                         else thresholds["n_permutations"])
     permutation_available = price_returns is not None and positions is not None
     if permutation_available:
         p_value = permutation_pvalue(
             price_returns, positions,
-            n_permutations=int(thresholds["n_permutations"]), seed=0,
+            n_permutations=n_permutations, seed=0,
         )
     else:
         p_value = 1.0
 
     pbo = float("nan")
     warn: list[str] = list(warnings)
+    if screening:
+        warn.append(SCREENING_WARNING)
     if returns_matrix is not None:
         if pbo_value is None:
             from alpha_lab.validation.significance import pbo_cscv
@@ -247,9 +284,13 @@ def validate(returns, trade_returns, equity, config: dict, n_trials: int,
         total_return=float(eq[-1] / eq[0] - 1.0) if len(eq) > 1 else 0.0,
         trades=n_trades,
         n_configs_tried=n_trials,
-        alive=len(reasons) == 0,
+        # Черновой вердикт не имеет права утверждать alive: прохождение
+        # черновых гейтов — кандидатура, а не результат.
+        alive=len(reasons) == 0 and not screening,
         reasons=tuple(reasons),
         metrics=stats,
         pbo=pbo,
         warnings=tuple(warn),
+        screening=bool(screening),
+        n_permutations=n_permutations,
     )
