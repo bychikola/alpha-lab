@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from alpha_lab.engine.costs import CostModel, ZeroCost
+from alpha_lab.engine.costs import CostModel
 
 BPS = 1e-4
 
