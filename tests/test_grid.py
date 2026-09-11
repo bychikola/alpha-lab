@@ -239,12 +239,19 @@ def test_size_warning_fires_above_threshold():
     warning = size_warning(200_000, 4)
     assert warning is not None
     assert "200 000" in warning
-    # Оценка опирается на измеренную стоимость конфигурации, а не на догадку.
-    assert SECONDS_PER_CONFIG > 0
+    # Оценка опирается на измеренную стоимость полного пути конфигурации, а не
+    # на догадку: причинностный harness обязан входить в число (замер на 1h
+    # 35 064 бара — ~2.3 с), иначе оценка оптимистична в разы.
+    assert SECONDS_PER_CONFIG >= 2.0
     assert "ч" in warning
     assert str(int(200_000 * SECONDS_PER_CONFIG // 3600)) in warning
     assert estimate_wall_clock(200_000, 4) == pytest.approx(
         200_000 * SECONDS_PER_CONFIG + 4 * 22.2)
+    # Текст называет, что именно входит в оценку, и что это оценка.
+    assert "harness" in warning
+    assert "validate" in warning
+    assert "оценка" in warning.lower()
+    assert "35 000" in warning          # названа база замера (длина ряда)
 
 
 def test_size_warning_names_resume_and_axes():
