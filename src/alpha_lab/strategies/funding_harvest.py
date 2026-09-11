@@ -39,6 +39,24 @@ BTCUSDT — не редкость (13 % событий 2022–2025), и «дер
 это задокументированная память окна, а не удержание отрицательного режима:
 как только среднее пересекло порог вниз, позиция закрыта.
 
+Переопределение порога и предел «держать всегда». Параметр threshold_rate
+задаёт порог решения напрямую (ставка на бар): None — априорный порог
+окупаемости из формулы выше (поведение S2 не меняется ни на байте), конечное
+число — явный порог, -inf — предел «держать всегда» (условие mu > -inf
+выполнено для любой конечной ставки: окно не читается, прогрева нет,
+carry ≡ -1), +inf — симметричный предел «не входить никогда». Пределы нужны
+сетке S3: always-hold — базовая книга S1, с которой сравнивается всё
+остальное, и внутрь правила её иначе не поместить. Сам порог окупаемости
+ограничен снизу нулём (4·one_way/H ≥ 0 при H > 0 и неотрицательных
+издержках), поэтому НИКАКОЕ конечное H и даже нулевые издержки не дают
+always-hold: при неположительном среднем ставки правило выходит из книги.
+Измерено на данных 2022–2025: минимум скользящего среднего (window=72, 1h)
+отрицателен у BTCUSDT (-4.5e-5 на 7.8 % баров), ETHUSDT, BNBUSDT (-1.8e-4 на
+69 %), DOTUSDT, SOLUSDT. Значит, -inf — не аппроксимация «очень большим H», а
+точка, в которой условия выхода нет по построению; «приблизить» её конечным
+порогом нельзя, и это проверено тестом
+(test_always_hold_limit_is_exact_and_not_reachable_by_finite_params).
+
 Контракт «вошёл — держи — вышел» (ограничение S2). Стратегия не ребалансирует
 книгу и не разворачивает carry: целевые значения — только 0 и −1, gross —
 только 0 и 2, поэтому каждая заявка — это ровно вход или выход. Ограничение
@@ -88,6 +106,9 @@ DEFAULTS = {
     "horizon_bars": 720,
     "fee_bps": 5.0,
     "slippage_bps": 1.0,
+    # None — априорный порог окупаемости; число задаёт порог напрямую,
+    # ±inf — пределы «держать всегда» / «не входить никогда» (см. docstring).
+    "threshold_rate": None,
 }
 
 # Оборот круглого рейса в единицах |carry|: вход gross=2 и выход gross=2.
@@ -112,6 +133,29 @@ def _non_negative_float(value, name: str) -> float:
     return number
 
 
+def _threshold_override(value, name: str) -> float | None:
+    """Порог решения: None (априорный) или число; ±inf — законные пределы.
+
+    NaN отвергается: сравнение с ним ложно на всех барах, и книга молча
+    стояла бы вне рынка — явное «никогда не входить» должно быть +inf, а не
+    следствием NaN. bool отвергается: True — это флаг, а не ставка 1.0.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(
+            value, (int, float, np.integer, np.floating)):
+        raise ValueError(
+            f"{name} должен быть числом или None, получено {value!r}")
+    number = float(value)
+    if np.isnan(number):
+        raise ValueError(
+            f"{name} не может быть NaN: сравнение с NaN ложно на всех барах, "
+            f"и книга молча стояла бы вне рынка. «Не входить никогда» — это "
+            f"+inf, «держать всегда» — -inf"
+        )
+    return number
+
+
 class FundingHarvestStrategy(TwoLegStrategy):
     """Дельта-нейтральный сбор funding по режиму ставки.
 
@@ -132,11 +176,21 @@ class FundingHarvestStrategy(TwoLegStrategy):
         self.horizon_bars = _positive_int(cfg["horizon_bars"], "horizon_bars")
         self.fee_bps = _non_negative_float(cfg["fee_bps"], "fee_bps")
         self.slippage_bps = _non_negative_float(cfg["slippage_bps"], "slippage_bps")
+        self.threshold_rate = _threshold_override(
+            cfg["threshold_rate"], "threshold_rate")
         self.params = cfg
 
     @property
     def history_bars(self) -> int:
-        """Скользящее среднее требует window баров, включая текущий."""
+        """Скользящее среднее требует window баров, включая текущий.
+
+        У предельных порогов (±inf) решение не читает ставку вовсе, поэтому
+        памяти нет: history_bars = 1. Это честная диагностика, а не
+        оптимизация: harness и отчёт не должны приписывать решению окно,
+        которого оно не видит.
+        """
+        if self.threshold_rate is not None and not np.isfinite(self.threshold_rate):
+            return 1
         return self.window
 
     def cost_recovery_threshold(self) -> float:
@@ -144,16 +198,39 @@ class FundingHarvestStrategy(TwoLegStrategy):
 
         Метод публичный: тесты границы и разбор отчёта обязаны брать ровно то
         число, по которому принимается решение, а не пересчитывать его заново.
+        threshold_rate это число не меняет — он переопределяет точку решения
+        (entry_threshold), а не модель окупаемости.
         """
         one_way = (self.fee_bps + self.slippage_bps) * 1e-4
         return ROUND_TRIP_TURNOVER * one_way / self.horizon_bars
 
+    def entry_threshold(self) -> float:
+        """Порог, по которому реально принимается решение.
+
+        threshold_rate=None → априорный cost_recovery_threshold(); иначе явное
+        значение, включая пределы ±inf. Публичный по той же причине, что и
+        cost_recovery_threshold: потребитель обязан видеть ровно то число, по
+        которому принято решение.
+        """
+        if self.threshold_rate is None:
+            return self.cost_recovery_threshold()
+        return float(self.threshold_rate)
+
     def generate_legs(self, bars: pd.DataFrame) -> PositionLegs:
-        rate = self._funding_rate(bars)
-        # min_periods=window: до первого полного окна статистики нет — стоим.
-        # rolling смотрит только назад, поэтому решение причинно по построению.
-        trailing = rate.rolling(self.window, min_periods=self.window).mean()
-        in_book = (trailing > self.cost_recovery_threshold()).to_numpy()
+        threshold = self.entry_threshold()
+        if np.isneginf(threshold):
+            # Предел «держать всегда»: условия выхода нет по построению,
+            # ставка не читается, прогрев окна не нужен.
+            in_book = np.ones(len(bars), dtype=bool)
+        elif np.isposinf(threshold):
+            # Симметричный предел «не входить никогда».
+            in_book = np.zeros(len(bars), dtype=bool)
+        else:
+            rate = self._funding_rate(bars)
+            # min_periods=window: до первого полного окна статистики нет —
+            # стоим. rolling смотрит только назад, поэтому решение причинно.
+            trailing = rate.rolling(self.window, min_periods=self.window).mean()
+            in_book = (trailing > threshold).to_numpy()
         index = bars.index
         zero = pd.Series(0.0, index=index, name="net")
         return PositionLegs(

@@ -122,6 +122,12 @@ def test_parameters_are_validated():
         _strategy(fee_bps=-1.0)
     with pytest.raises(ValueError, match="slippage_bps"):
         _strategy(slippage_bps=-1.0)
+    with pytest.raises(ValueError, match="threshold_rate"):
+        _strategy(threshold_rate=float("nan"))
+    with pytest.raises(ValueError, match="threshold_rate"):
+        _strategy(threshold_rate="0")
+    with pytest.raises(ValueError, match="threshold_rate"):
+        _strategy(threshold_rate=True)
 
 
 # --- 2. Синтетический контроль: точная арифметика ----------------------------
@@ -437,3 +443,111 @@ def test_cli_reports_missing_funding_without_traceback(tmp_path, capsys):
     assert "funding" in captured.err.lower()
     assert "остановлен" in captured.err
     assert "Traceback" not in captured.err
+
+
+# --- 9. Порог напрямую и предел «держать всегда» ------------------------------
+
+
+def test_threshold_override_replaces_decision_threshold_only():
+    """threshold_rate задаёт порог решения напрямую; априорный порог цел.
+
+    cost_recovery_threshold() остаётся арифметикой издержек (4·one_way/H) —
+    переопределяется только точка принятия решения, а не модель окупаемости.
+    """
+    n = 200
+    window = 24
+    rate = np.concatenate([np.full(100, 1e-3), np.full(100, -1e-3)])
+    bars = _bars(n, funding_rate=rate)
+    override = 1e-4
+    strategy = _strategy(window=window, fee_bps=_FEE_BPS, slippage_bps=0.0,
+                         threshold_rate=override)
+
+    assert strategy.cost_recovery_threshold() == pytest.approx(
+        4.0 * _FEE_BPS * 1e-4 / DEFAULTS["horizon_bars"], rel=1e-15)
+    assert strategy.entry_threshold() == override
+    legs = strategy.generate_legs(bars)
+    ma = pd.Series(rate).rolling(window, min_periods=window).mean()
+    np.testing.assert_array_equal(legs.carry.to_numpy() != 0.0,
+                                  (ma > override).to_numpy())
+    # Переопределение действительно меняет решение: порог выше априорного —
+    # книга выходит из режима раньше, чем по правилу S2.
+    default = _strategy(window=window, fee_bps=_FEE_BPS, slippage_bps=0.0)
+    assert 0 < int((legs.carry != 0.0).sum()) < int(
+        (default.generate_legs(bars).carry != 0.0).sum())
+
+
+def test_always_hold_limit_is_exact_and_not_reachable_by_finite_params():
+    """Предел −∞ — единственный способ держать книгу всегда; конечные
+    параметры S2 его не достигают.
+
+    Порог окупаемости ограничен снизу нулём: 4·one_way/H ≥ 0 при любом H и
+    неотрицательных издержках, а правило требует μ > порога. При неположительном
+    среднем ставки никакое конечное H (и даже нулевые издержки) не удерживает
+    книгу — это измеренное свойство правила, а не деталь реализации. Отсюда
+    явный предел threshold_rate = −∞: условие выполнено для любой конечной
+    ставки, окно не читается, прогрева нет.
+    """
+    n = 50
+    rate = np.full(n, -1e-3)
+    bars = _bars(n, funding_rate=rate)
+
+    # Конечный предел: H → ∞ даёт порог → 0, но не always-hold: книга стоит.
+    finite = _strategy(window=1, horizon_bars=10 ** 12, fee_bps=0.0,
+                       slippage_bps=0.0)
+    assert finite.entry_threshold() == 0.0
+    assert finite.generate_legs(bars).carry.tolist() == [0.0] * n
+
+    # Явный предел: точная постоянная книга на любых ставках, включая
+    # заведомо отрицательные, и без прогрева окна.
+    limit = _strategy(threshold_rate=-np.inf)
+    assert limit.history_bars == 1
+    legs = limit.generate_legs(bars)
+    assert legs.carry.tolist() == [-1.0] * n
+    assert legs.gross.tolist() == [2.0] * n
+    assert legs.net.tolist() == [0.0] * n
+
+
+def test_always_hold_runs_through_cli_as_constant_book():
+    """Предел проходит рабочий путь CLI и даёт ровно книгу S1: net ≡ 0,
+    carry ≡ −1, один вход и ни одного выхода.
+
+    Доход — вся сумма ставок на удержанных барах, издержки — ровно два
+    ноционала входа (одна нога спота и одна нога перпа), без ребалансировок.
+    Синтетика нарочно знакопеременная: правило S2 здесь вышло бы из книги, а
+    предел держит.
+    """
+    n = 40
+    rate = np.linspace(-1e-3, 1e-3, n)
+    bars = _bars(n, funding_rate=rate)
+    exp = _exp(params={"threshold_rate": -np.inf})
+    outcome = cli.run_config(
+        _loaded_data(bars, funding_rate=pd.Series(rate)), exp)
+    res = outcome.result
+
+    assert res.positions.tolist() == [0.0] * n            # ценовой экспозиции нет
+    assert res.gross_positions.tolist() == [0.0] + [2.0] * (n - 1)
+    assert res.turnover.tolist() == [0.0, 2.0] + [0.0] * (n - 2)
+    # funding начисляется на удерживаемый carry, доход = сумма ставок баров 1..n−1
+    assert -res.costs["funding"].sum() == pytest.approx(rate[1:].sum(), rel=1e-12)
+    assert res.costs["fee"].sum() == pytest.approx(
+        2.0 * _FEE_BPS * 1e-4, rel=1e-12)
+    assert res.costs["slippage"].sum() == 0.0
+    assert float(res.returns.sum()) == pytest.approx(
+        rate[1:].sum() - 2.0 * _FEE_BPS * 1e-4, rel=1e-12)
+
+
+def test_always_hold_limit_is_causal():
+    """Решение предела не зависит от данных: harness проходит с history_bars=1."""
+    n = 120
+    bars = _bars(n, funding_rate=np.linspace(-1e-3, 1e-3, n))
+    strategy = _strategy(threshold_rate=-np.inf)
+    assert assert_strategy_is_causal(strategy, bars) == n - 2
+
+
+def test_positive_infinity_threshold_means_never_hold():
+    """+∞ — второй предел: ни одна конечная ставка порога не превышает."""
+    n = 30
+    bars = _bars(n, funding_rate=1.0)
+    legs = _strategy(window=1, threshold_rate=np.inf).generate_legs(bars)
+    assert legs.carry.tolist() == [0.0] * n
+    assert legs.gross.tolist() == [0.0] * n

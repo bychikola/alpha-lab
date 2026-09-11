@@ -1,8 +1,11 @@
 """Тесты сетки гипотез: детерминированная развёртка, пространство параметров, размер.
 
-Сеть и реальное хранилище не трогаются: все сетки — временные YAML в tmp_path.
+Сеть и реальное хранилище не трогаются: все сетки — временные YAML в tmp_path
+(кроме теста поставочной сетки S3 — он читает только файл конфига).
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -267,3 +270,35 @@ def test_grid_carries_name_and_path(tmp_path):
     assert isinstance(grid, Grid)
     assert grid.name == "mr_grid"
     assert grid.path == tmp_path / "grid.yaml"
+
+
+def test_committed_funding_grid_contains_always_hold_limit():
+    """Поставочная сетка S3 несёт предел «держать всегда» как значение оси.
+
+    Сеть и озеро не трогаются: читается только YAML. Контракт сетки —
+    символы, лежащие в озере на момент прогона, три таймфрейма и четыре порога,
+    среди которых -inf (always-hold S1) и null (априорное правило S2).
+    """
+    repo = Path(__file__).resolve().parents[1]
+    grid = load_grid(repo / "configs" / "grids" / "funding.yaml")
+    cells = grid.expand()
+
+    assert len(cells) == 9 * 3 * 4
+    assert {c.symbol for c in cells} == {
+        "ADAUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT", "DOTUSDT",
+        "ETHUSDT", "LTCUSDT", "SOLUSDT", "XRPUSDT",
+    }
+    assert {c.experiment.timeframe for c in cells} == {"1h", "4h", "1d"}
+    thresholds = [c.experiment.params["threshold_rate"] for c in cells]
+    assert set(thresholds) == {None, float("-inf"), 0.0, 1e-05}
+    # Предел есть ровно один раз на каждую пару (символ, таймфрейм).
+    per_pair = {}
+    for cell in cells:
+        key = (cell.symbol, cell.experiment.timeframe)
+        per_pair.setdefault(key, []).append(cell.experiment.params["threshold_rate"])
+    assert len(per_pair) == 27
+    assert all(values.count(float("-inf")) == 1 for values in per_pair.values())
+    # Решение предела не читает ставку: памяти у него нет.
+    always = next(c for c in cells if c.experiment.params["threshold_rate"] == float("-inf"))
+    assert strategies_base.build_strategy(
+        always.experiment.strategy, always.experiment.params).history_bars == 1

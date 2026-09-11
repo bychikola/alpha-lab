@@ -1,0 +1,65 @@
+# Сетка фазы 3 S3: устойчивость carry-премии по юниверсу и таймфреймам.
+#
+# Развёртка: 9 символов × 3 таймфрейма × 4 порога входа = 108 конфигураций.
+# Символы — только те, что ФАКТИЧЕСКИ лежат в D:\alpha-lab\data на момент
+# прогона (фоновая загрузка ещё идёт): ADAUSDT, BNBUSDT, BTCUSDT, DOGEUSDT,
+# DOTUSDT, ETHUSDT, LTCUSDT, SOLUSDT, XRPUSDT. LINKUSDT и остальные 15 пар
+# юниверса в озере отсутствуют; полные 4 года 1m-баров И funding есть только у
+# BNBUSDT, BTCUSDT, DOTUSDT, ETHUSDT, SOLUSDT — остальные пары дадут строки-
+# ошибки, которые воронка честно исключает из знаменателя. Прогон обязан быть
+# повторён, когда ingest завершится.
+#
+# Ось порога включает ПРЕДЕЛ «держать всегда» (-.inf) — базовую книгу S1, с
+# которой сравнивается всё остальное. Конечные параметры S2 этот предел не
+# достигают: их порог окупаемости 4·(fee+slippage)/horizon_bars ограничен снизу
+# нулём, а правило требует μ > порога, поэтому при неположительном среднем
+# ставки книга выходит (измерено: BTC 1h window=72 — среднее отрицательно на
+# 7.8 % баров, BNB — на 69 %). -.inf — не аппроксимация большим H, а точка, где
+# условия выхода нет по построению (см. docstring стратегии и тест
+# test_always_hold_limit_is_exact_and_not_reachable_by_finite_params).
+# null — априорное правило S2 (порог считается из costs/horizon), 0.0 — вход по
+# любому положительному среднему без требования окупаемости, 1e-5 — порог
+# строже априорного (3.33e-6 на 1h).
+#
+# ВНИМАНИЕ: window=72 и horizon_bars=720 заданы в БАРАХ и не пересчитаны под
+# 4h/1d (на 4h 72 бара — 12 суток, на 1d — 72 суток). Для чернового свипа это
+# зафиксированное упрощение, как impact_coef в mr_grid: на доказательную часть
+# (always-hold) параметры окна не влияют вовсе — решение предела не читает
+# ставку.
+experiment:
+  name: funding_grid
+  strategy: funding_harvest
+  timeframe: 1h            # базовый; ось timeframes переопределяет
+  start: "2022-01-01"
+  end: "2025-12-31"
+  params:
+    window: 72             # скользящее среднее ставки, баров
+    horizon_bars: 720      # горизонт окупаемости, баров
+    fee_bps: 5.0           # комиссия одной ноги, bps (как в funding_base)
+    slippage_bps: 1.0      # проскальзывание одной ноги, bps
+  costs:                   # издержки Binance USDT-M, VIP0 — как в funding_base
+    taker_fee_bps: 5.0
+    maker_fee_bps: 2.0
+    maker_share: 0.0
+    impact_coef: 0.1
+    min_slippage_bps: 0.5
+  validation:
+    n_permutations: 1000
+    min_trades: 100
+    max_pbo: 0.5
+    max_p_value: 0.05
+
+axes:
+  symbols:
+    - ADAUSDT
+    - BNBUSDT
+    - BTCUSDT
+    - DOGEUSDT
+    - DOTUSDT
+    - ETHUSDT
+    - LTCUSDT
+    - SOLUSDT
+    - XRPUSDT
+  timeframes: [1h, 4h, 1d]
+  params:
+    threshold_rate: [null, -.inf, 0.0, 1.0e-05]
