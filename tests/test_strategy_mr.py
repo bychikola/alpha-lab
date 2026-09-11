@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
-from fixtures.causality import assert_strategy_is_causal
+from alpha_lab.causality import assert_strategy_is_causal
 from fixtures.synthetic import ou_bars, random_walk_bars
 
 from alpha_lab.data.quality import check_bars
@@ -30,7 +30,7 @@ def test_position_is_bounded():
 def test_no_lookahead_position_depends_only_on_past():
     """Изменение будущих баров не должно менять прошлые позиции.
 
-    Проверку ведёт общий harness (tests/fixtures/causality.py): он сравнивает
+    Проверку ведёт общий harness (alpha_lab.causality): он сравнивает
     generate(bars.iloc[:k]) с generate(bars).iloc[:k] в нескольких точках
     усечения и падает с русским сообщением о первом расхождении. Дублировать
     сравнение здесь не нужно — harness и есть контракт.

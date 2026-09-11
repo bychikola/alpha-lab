@@ -26,6 +26,7 @@ from alpha_lab.strategies.mean_reversion import atr_decay_bars
 from alpha_lab.validation.significance import permutation_pvalue
 from alpha_lab.validation.validator import Verdict
 from fixtures.synthetic import random_walk_bars
+from fixtures.traps import AlwaysLongStrategy, LookAheadStrategy
 
 N_MINUTES = 30000
 PARAMS = {"window": 20, "k": 2.0}
@@ -1258,3 +1259,94 @@ def test_gap_segmentation_is_noop_without_gaps():
     raw = strategy.generate(bars)
 
     pd.testing.assert_series_equal(seg, raw)
+
+
+def _run_validate_extra(root: Path, u: Path, e: Path, out: Path,
+                        journal: Path, *extra: str) -> int:
+    return main(["validate", "--config", str(e), "--universe", str(u),
+                 "--data-root", str(root), "--out", str(out),
+                 "--journal", str(journal), *extra])
+
+
+def test_non_causal_strategy_blocks_verdict_before_backtest(tmp_path,
+                                                            monkeypatch, capsys):
+    """Стратегия без причинности не получает вердикта, и бэктест не запускается.
+
+    Подглядывание статистикой по результатам не ловится (spec 8.1), поэтому
+    единственная защита — harness над generate. Он обязан жить в рабочем пути
+    CLI, а не только в pytest: иначе новая стратегия молча получит «ЖИВА» с
+    отличными метриками. Проверка обязана стоять ДО бэктеста: подменённый
+    run_backtest падает, если его всё-таки вызвали.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+
+    monkeypatch.setattr(cli, "build_strategy",
+                        lambda name, params: LookAheadStrategy())
+
+    def boom(*args, **kwargs):
+        raise AssertionError("бэктест запущен до проверки причинности")
+
+    monkeypatch.setattr(cli, "run_backtest", boom)
+
+    code = _run_validate(root, u, e, out, tmp_path / "trials.jsonl")
+
+    assert code == cli.EXIT_ERROR
+    assert not (out / "report.json").exists(), "отчёт не должен быть записан"
+    err = capsys.readouterr().err
+    # Сообщение обязано называть стратегию и первую разошедшуюся точку усечения.
+    assert "trap_lookahead" in err
+    assert "не причинн" in err
+    assert "k=" in err
+    assert "Отчёт не записан" in err
+
+
+def test_causal_strategy_proceeds_through_validation(tmp_path, monkeypatch,
+                                                     capsys):
+    """Причинная стратегия проходит проверку и получает обычный вердикт.
+
+    Контроль в обратную сторону: harness, блокирующий всё подряд, бесполезен.
+    AlwaysLong причинна (игнорирует вход), поэтому CLI обязан записать отчёт.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+
+    monkeypatch.setattr(cli, "build_strategy",
+                        lambda name, params: AlwaysLongStrategy())
+
+    code = _run_validate(root, u, e, out, tmp_path / "trials.jsonl")
+
+    assert code == cli.EXIT_OK
+    assert (out / "report.json").exists()
+    assert "не причинн" not in capsys.readouterr().err
+
+
+def test_skip_causality_flag_bypasses_check_with_loud_warning(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """--skip-causality — осознанный отказ от единственной защиты от look-ahead.
+
+    Флаг существует для отладки, но обязан громко объяснять цену: без harness
+    подглядывающая стратегия получает вердикт, и он оптимистичен по построению.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    out = tmp_path / "out"
+
+    monkeypatch.setattr(cli, "build_strategy",
+                        lambda name, params: LookAheadStrategy())
+
+    code = _run_validate_extra(root, u, e, out, tmp_path / "trials.jsonl",
+                               "--skip-causality")
+
+    assert code == cli.EXIT_OK
+    assert (out / "report.json").exists()
+    err = capsys.readouterr().err
+    assert "skip-causality" in err
+    assert "ОТКЛЮЧЕНА" in err
+    assert "look-ahead" in err.lower()

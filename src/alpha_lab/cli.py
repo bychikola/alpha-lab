@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from alpha_lab.causality import assert_strategy_is_causal
 from alpha_lab.config import load_experiment, load_universe
 from alpha_lab.data.quality import FREQ_DELTA, clean_mask, periods_per_year
 from alpha_lab.data.query import (
@@ -398,6 +399,46 @@ def _cmd_validate(args) -> int:
     # дыры история стратегии перезапущена — окна сквозь пропуск не тянутся.
     # history_bars остаётся в отчёте диагностикой подлинной памяти стратегии.
     strategy = build_strategy(exp.strategy, exp.params)
+
+    # Причинность проверяется ДО бэктеста и до всего, что порождает вердикт:
+    # look-ahead статистикой по результатам не ловится (spec 8.1), поэтому
+    # единственная работающая защита — запрос к функции решения. Без неё
+    # подглядывающая стратегия получает «ЖИВА» с отличными метриками, и это
+    # не гипотеза, а измеренный факт (tests/test_traps.py).
+    #
+    # Политика разрезов — штатная плотная сетка harness'а (n // TARGET_CUTS =
+    # 200 точек, для рядов <= 600 баров — сплошная). На реальном прогоне BTC
+    # 35 064 бара это 205 точек и ~1.6 с — не material на фоне загрузки данных
+    # (~22 с) и бэктеста, поэтому сплошное покрытие (cut_points="all", ~35 000
+    # вызовов generate) не берётся. Плотная сетка ловит утечку в любой позиции
+    # непосредственно перед точкой разреза; утечка, целиком лежащая между
+    # соседними точками (окно <= n // 200 баров), теоретически может остаться
+    # незамеченной — это зафиксировано в docstring harness'а.
+    if args.skip_causality:
+        print(
+            "Предупреждение: --skip-causality: причинностная проверка "
+            "ОТКЛЮЧЕНА. Подглядывание статистикой по результатам не ловится "
+            "(spec 8.1), поэтому подглядывающая стратегия может получить "
+            "«ЖИВА» с отличными метриками. Этот вердикт не защищён от "
+            "look-ahead; флаг — только для отладки.",
+            file=sys.stderr,
+        )
+    else:
+        try:
+            assert_strategy_is_causal(strategy, bars)
+        except (AssertionError, ValueError) as exc:
+            print(
+                f"Ошибка: стратегия "
+                f"'{getattr(strategy, 'name', exp.strategy)}' не прошла "
+                f"проверку причинности: {exc} "
+                f"Прогон остановлен до бэктеста: look-ahead статистикой по "
+                f"результатам не ловится (spec 8.1), поэтому без harness "
+                f"вердикт был бы оптимистичной ложью. Отчёт не записан. "
+                f"Осознанный отказ от проверки — --skip-causality",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+
     history = history_bars_of(strategy)
     gaps, missing_bars = _gap_stats(bars, exp.timeframe)
     gap_excluded = _gap_mask(bars, exp.timeframe, lookahead=0)
@@ -555,7 +596,7 @@ def _cmd_validate(args) -> int:
     if result.over_capacity:
         # Диагностика ликвидности, а не детектор look-ahead: флаг привязан к
         # выбранному капиталу. Поэтому предупреждаем, но не блокируем вердикт —
-        # от look-ahead защищает причинностный harness (тесты).
+        # от look-ahead защищает причинностная проверка выше (alpha_lab.causality).
         print("  !!! ПРЕДУПРЕЖДЕНИЕ: заявки превышают лимит участия в объёме")
         print("      бара — прогон оптимистичен, ёмкость не доказана.")
     if verdict.warnings:
@@ -599,6 +640,11 @@ def main(argv: list[str] | None = None) -> int:
                        help="Сознательно не читать и не писать журнал: "
                             "n_trials = 1, защита от множественных сравнений "
                             "отключается")
+    p_val.add_argument("--skip-causality", action="store_true",
+                       help="Сознательно отключить причинностную проверку "
+                            "стратегии. Это ЕДИНСТВЕННАЯ работающая защита от "
+                            "look-ahead (spec 8.1): статистика его не ловит, "
+                            "поэтому вердикт с этим флагом может быть ложным")
     p_val.set_defaults(func=_cmd_validate)
 
     args = parser.parse_args(argv)

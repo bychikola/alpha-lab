@@ -17,7 +17,7 @@
 в доходностях подглядывание неотличимо от настоящего edge, и validate() его
 не ловит — это фундаментальное ограничение, а не баг (spec 8.1). Регрессия
 на слепоту валидатора зафиксирована ниже явно. Отбраковывает подглядывание
-не статистика, а причинностный harness (tests/fixtures/causality.py):
+не статистика, а причинностный harness (alpha_lab.causality):
 generate(bars[:k]) обязана совпадать с generate(bars)[:k]. Тесты ниже
 доказывают, что harness действительно ловит обе ловушки и не падает на
 причинной AlwaysLong.
@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from fixtures.causality import assert_strategy_is_causal
+from alpha_lab.causality import assert_strategy_is_causal
 from fixtures.synthetic import ou_bars
 from fixtures.traps import (
     AlwaysLongStrategy, LookAheadStrategy, OverfitNoiseStrategy,
@@ -300,7 +300,7 @@ def test_validator_cannot_detect_lookahead_documented_limitation():
     никакая проверка по returns/price_returns/positions их не различит (spec 8.1).
     Замер: validate() на выходах движка с ZeroCost даёт alive=True, DSR 1.0,
     p 0.001, годовой Sharpe 125.1. Защита — не статистика, а причинностный
-    harness (tests/fixtures/causality.py), которому обязана подвергаться каждая
+    harness (alpha_lab.causality), которому обязана подвергаться каждая
     стратегия; здесь зафиксирована именно слепота валидатора.
 
     ЕСЛИ ЭТОТ ТЕСТ НАЧНЁТ ПАДАТЬ — значит в валидаторе появился механизм,
@@ -590,7 +590,7 @@ def test_default_cut_points_are_dense():
 
     Регрессия на исходный дефект: четыре точки проверяли четыре позиции из n.
     """
-    from fixtures.causality import EXHAUSTIVE_LIMIT, _default_cut_points
+    from alpha_lab.causality import EXHAUSTIVE_LIMIT, _default_cut_points
 
     short = _default_cut_points(EXHAUSTIVE_LIMIT)
     assert short == list(range(2, EXHAUSTIVE_LIMIT)), "короткий ряд — сплошное покрытие"
