@@ -44,7 +44,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.31" },
     { name = "scipy", specifier = ">=1.11" },
-    { name = "statsmodels", specifier = ">=0.14" },
+    { name = "statsmodels", specifier = ">=0.15" },
 ]
 
 [package.metadata.requires-dev]

@@ -68,9 +68,12 @@ def adf_pvalue(series: pd.Series | np.ndarray, maxlag: int | None = None) -> flo
     if len(s) < 20 or np.std(s) < 1e-12:
         return 1.0
     try:
-        return float(adfuller(s, maxlag=maxlag, autolag="AIC")[1])
+        # result_object=True — новый API statsmodels (>=0.15): tuple-индексация [1]
+        # помечена FutureWarning, в 0.16 adfuller вернёт ADFullerResult по умолчанию.
+        res = adfuller(s, maxlag=maxlag, autolag="AIC", result_object=True)
     except (ValueError, np.linalg.LinAlgError):
         return 1.0
+    return float(res.pvalue)
 
 
 def hurst_exponent(series: pd.Series | np.ndarray, min_lag: int = 2,

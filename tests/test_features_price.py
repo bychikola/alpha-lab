@@ -55,12 +55,32 @@ def test_hurst_mean_reverting_below_half():
 
 
 def test_zscore_is_standardized():
-    s = ou_series(n=5000, seed=8)
+    """theta=0.5 → полужизнь ≈ 1.4 бара, ряд почти iid.
+
+    Окно 100 бар покрывает маргинальное распределение, поэтому скользящий
+    z-скор действительно стандартизован.
+    """
+    s = ou_series(n=5000, theta=0.5, seed=8)
 
     z = zscore(s, window=100).dropna()
 
     assert abs(z.mean()) < 0.15
     assert abs(z.std() - 1.0) < 0.15
+
+
+def test_zscore_on_persistent_series_is_wider_than_one():
+    """На устойчивом ряду (theta=0.05, полужизнь ≈ 14 бар) окно 100 бар — лишь ~5 τ.
+
+    Скользящее среднее успевает следовать за ценой, поэтому скользящая σ внутри
+    окна занижает маргинальную σ из-за автокорреляции, и z-скор выходит шире
+    единицы. Практический смысл: порог в k сигм срабатывает реже, чем настоящее
+    k-сигма событие на таком ряду.
+    """
+    s = ou_series(n=5000, theta=0.05, seed=8)
+
+    z = zscore(s, window=100).dropna()
+
+    assert z.std() > 1.1
 
 
 def test_zscore_is_zero_on_constant_series():
