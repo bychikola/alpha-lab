@@ -11,7 +11,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from alpha_lab.data.store import DEFAULT_ROOT
+from alpha_lab.data.store import DEFAULT_ROOT, end_bound
 
 # Правила агрегации минутных баров в старший таймфрейм
 _AGG = {
@@ -26,15 +26,22 @@ _PANDAS_FREQ = {"1m": "1min", "5m": "5min", "15m": "15min",
 def load_bars(root: Path = DEFAULT_ROOT, symbol: str = "BTCUSDT",
               freq: str = "1m", start: str | None = None, end: str | None = None,
               resample: str | None = None) -> pd.DataFrame:
-    """Читает бары символа. Если задан resample — агрегирует из freq в resample."""
-    pattern = str(Path(root) / "bars" / symbol / freq / "*.parquet")
+    """Читает бары символа. Если задан resample — агрегирует из freq в resample.
+
+    Границы периода: start включается с начала дня/момента; end-дата включает
+    весь конечный день, явный момент времени — точная граница (см. store.end_bound).
+    """
+    # Только файлы своего символа и таймфрейма: глоб *.parquet подмешал бы в ряд
+    # чужой parquet, случайно оказавшийся в каталоге.
+    pattern = str(Path(root) / "bars" / symbol / freq / f"{symbol}-{freq}-*.parquet")
     where, params = [], []
     if start:
         where.append("ts >= ?")
         params.append(pd.Timestamp(start, tz="UTC").to_pydatetime())
     if end:
-        where.append("ts <= ?")
-        params.append(pd.Timestamp(end, tz="UTC").to_pydatetime())
+        bound, strict = end_bound(end)
+        where.append("ts < ?" if strict else "ts <= ?")
+        params.append(bound.to_pydatetime())
     clause = f"WHERE {' AND '.join(where)}" if where else ""
 
     try:

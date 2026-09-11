@@ -13,6 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from alpha_lab.config import load_experiment, load_universe
@@ -37,6 +38,15 @@ DEFAULT_JOURNAL = Path("reports") / "trials.jsonl"
 # цене. Явно передаётся в движок, чтобы диагностика и её печать не разъехались
 # при смене дефолта run_backtest.
 MAX_PARTICIPATION = 0.01
+
+# Окно маскирования разрыва по умолчанию (в барах таймфрейма стратегии).
+# Нужны обе стороны. Назад: позиция, удерживаемая через дыру, была решена за бар
+# до неё, а решение на последнем баре перед дырой принималось, когда о разрыве
+# ещё не было известно, — такие позиции обязаны быть закрыты. Вперёд: первые
+# решения после дыры опираются на скользящие окна, пересекающие пропуск, и их
+# сигнал недостоверен, пока окно не обновится.
+GAP_MASK_LOOKBACK_BARS = 1
+GAP_MASK_LOOKAHEAD_BARS = 1
 
 
 def git_hash() -> str:
@@ -168,13 +178,27 @@ def _cmd_ingest(args) -> int:
     from alpha_lab.data.ingest import ingest_universe
 
     results = ingest_universe(universe, args.freq, root=Path(args.data_root))
-    ok = [r for r in results if r.ok]
+    # Делистингованные пары не растворяются в «ок»: они посчитаны отдельно, а
+    # исключённые явным include_delisted=false — тоже (молчаливый отказ от них
+    # создавал бы ошибку выживаемости незаметно).
+    ok = [r for r in results if r.ok and not r.excluded]
     bad = [r for r in results if not r.ok]
+    delisted = [r for r in results if r.delisted]
+    excluded = [r for r in results if r.excluded]
     for r in results:
-        mark = "OK " if r.ok else "ERR"
+        if r.excluded:
+            mark = "SKIP"
+        elif r.delisted:
+            mark = "DELIST"
+        elif r.ok:
+            mark = "OK "
+        else:
+            mark = "ERR"
         detail = r.quality if r.ok else r.error
         print(f"[{mark}] {r.symbol:<12} {r.kind:<8} {r.rows:>10,}  {detail}")
-    print(f"\nИтого: {len(ok)} успешно, {len(bad)} с ошибками")
+    print(f"\nИтого: {len(ok)} успешно, {len(bad)} с ошибками, "
+          f"делистингованных: {len(delisted)} "
+          f"(исключено: {len(excluded)})")
     return EXIT_OK if not bad else EXIT_FAILED
 
 
@@ -194,6 +218,37 @@ def _gap_stats(bars: pd.DataFrame, timeframe: str) -> tuple[int, int]:
         return 0, 0
     missing = int(round(float(((holes - delta) / delta).sum())))
     return int(len(holes)), missing
+
+
+def _gap_mask(bars: pd.DataFrame, timeframe: str,
+              lookback: int = GAP_MASK_LOOKBACK_BARS,
+              lookahead: int = GAP_MASK_LOOKAHEAD_BARS) -> np.ndarray:
+    """Маска баров, которые нельзя торговать из-за разрыва (True = исключён).
+
+    Разрыв — интервал между соседними барами больше шага таймфрейма. Для
+    разрыва перед баром i обнуляются цели на [i-1-lookback, i-1+lookahead]:
+
+    * назад — позиция, удерживаемая через дыру, решена раньше, и решение на
+      последнем баре перед дырой принималось, когда о разрыве ещё не было
+      известно; такие позиции обязаны быть закрыты, а не пройти сквозь дыру;
+    * вперёд — первые решения после дыры опираются на скользящие окна,
+      пересекающие пропуск, поэтому их сигнал недостоверен.
+
+    Разрыв не инвалидирует весь прогон: 120 пропущенных часов на четырёх годах
+    сделали бы пару непригодной, тогда как честный ответ — не торговать короткое
+    окно вокруг дыры и продолжить после него. Границы клипуются по краям ряда.
+    """
+    n = len(bars)
+    mask = np.zeros(n, dtype=bool)
+    if n < 2:
+        return mask
+    diffs = pd.to_datetime(bars["ts"], utc=True).diff()
+    holes = np.flatnonzero((diffs > FREQ_DELTA[timeframe]).to_numpy())
+    for i in holes:                      # i — первый бар после разрыва
+        lo = max(0, i - 1 - lookback)
+        hi = min(n - 1, i - 1 + lookahead)
+        mask[lo:hi + 1] = True
+    return mask
 
 
 def _cmd_validate(args) -> int:
@@ -273,23 +328,29 @@ def _cmd_validate(args) -> int:
 
     # Грязные бары: стратегия на них не торгует. Не чиним и не интерполируем —
     # иначе тихо неверный бэктест выглядел бы как честный.
-    mask = clean_mask(bars).to_numpy()
-    dirty = int((~mask).sum())
+    clean = clean_mask(bars).to_numpy()
+    dirty = int((~clean).sum())
     if dirty:
         print(f"Предупреждение: {dirty} грязных баров исключено из торговли",
               file=sys.stderr)
 
-    # Разрывы: маскировать их в этой волне не решено (это выбор владельца), но
-    # молчать нельзя — стратегия торгует через дыру как через обычный бар.
+    # Разрывы: через дыру цена шла неизвестно как, поэтому торговля вокруг неё
+    # приостанавливается (spec 8: грязные данные → стратегия не торгует).
+    # Маска компонуется с маской грязных баров; движок не меняется.
     gaps, missing_bars = _gap_stats(bars, exp.timeframe)
+    gap_excluded = _gap_mask(bars, exp.timeframe)
+    gap_masked = int(gap_excluded.sum())
     gap_warning = None
     if gaps:
         gap_warning = (
             f"В данных разрывов: {gaps}, пропущено баров: {missing_bars} "
-            f"(таймфрейм {exp.timeframe}) — стратегия торгует через них, "
-            f"вердикт оптимистичен"
+            f"(таймфрейм {exp.timeframe}) — торговля приостановлена на "
+            f"{gap_masked} барах вокруг них (lookback="
+            f"{GAP_MASK_LOOKBACK_BARS}, lookahead={GAP_MASK_LOOKAHEAD_BARS})"
         )
         print(f"Предупреждение: {gap_warning}", file=sys.stderr)
+
+    tradable = clean & ~gap_excluded
 
     # Предупреждения о данных уходят тем же каналом, что и неоценённый PBO:
     # они не делают вердикт мёртвым (нет данных — не дефект стратегии), но
@@ -322,9 +383,9 @@ def _cmd_validate(args) -> int:
 
     strategy = build_strategy(exp.strategy, exp.params)
     # copy=True: to_numpy() в pandas 3 отдаёт read-only массив, а маска ниже
-    # пишет в него на месте.
+    # пишет в него на месте. Обнуляются цели и грязных баров, и окна разрывов.
     targets = strategy.generate(bars).to_numpy(dtype="float64", copy=True)
-    targets[~mask] = 0.0
+    targets[~tradable] = 0.0
     targets = pd.Series(targets, index=bars.index)
 
     cost_model = RealisticCost.from_config(exp.costs)
@@ -360,6 +421,7 @@ def _cmd_validate(args) -> int:
         extra={"symbol": symbol, "timeframe": exp.timeframe,
                "data_version": dv, "dirty_bars": dirty,
                "gaps": gaps, "missing_bars": missing_bars,
+               "gap_masked_bars": gap_masked,
                "funding_available": funding_available,
                "funding_events": funding_events,
                "funding_matched": funding_matched,

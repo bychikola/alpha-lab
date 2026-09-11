@@ -41,6 +41,23 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _parse_include_delisted(data: dict[str, Any]) -> bool:
+    """include_delisted — строго bool; отсутствие или null — безопасный true.
+
+    bool(None) == False молча выключал бы делистингованные пары и вносил
+    ошибку выживаемости, а строка "no"/"yes" вообще не проходила бы проверку
+    смысла. Поэтому null трактуется как «не задано» (spec 5 требует включать
+    делистингованные пары), а любое не-bool значение — ошибка конфига.
+    """
+    value = data.get("include_delisted")
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"include_delisted должен быть true или false, получено {value!r}")
+    return value
+
+
 def load_universe(path: str | Path) -> Universe:
     data = _read_yaml(Path(path))
     symbols = data.get("symbols") or []
@@ -57,7 +74,7 @@ def load_universe(path: str | Path) -> Universe:
         start=str(data["start"]),
         end=str(data["end"]) if data.get("end") else None,
         market=str(data["market"]),
-        include_delisted=bool(data.get("include_delisted", True)),
+        include_delisted=_parse_include_delisted(data),
     )
 
 

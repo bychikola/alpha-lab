@@ -32,10 +32,39 @@ class IngestResult:
     quality: str
     error: str | None = None
     dropped_rows: int = 0
+    # История пары обрывается раньше запрошенного периода (делистинг или
+    # неполный архивный файл). По spec 5 такие пары обязаны оставаться в
+    # юниверсе, иначе возникает ошибка выживаемости; поле делает обрыв
+    # наблюдаемым, а не молчаливым.
+    delisted: bool = False
+    last_bar_ts: pd.Timestamp | None = None
+    # Пара исключена из ingest явным include_delisted=false. Отдельное поле, а
+    # не error: отказ от пары — решение конфига, а не сбой загрузки.
+    excluded: bool = False
 
     @property
     def ok(self) -> bool:
         return self.error is None
+
+
+def _is_truncated(months: list[str], present: list[str],
+                  last_bar_ts: pd.Timestamp, now: pd.Timestamp) -> bool:
+    """Обрывается ли история раньше запрошенного периода.
+
+    Два признака: (а) после последнего доступного месяца идут отсутствующие
+    завершённые месяцы; (б) файл последнего месяца неполон — последний бар
+    заметно раньше конца месяца. Текущий (незавершённый) месяц пропуском не
+    считается: месячный архив публикуется только после его окончания, поэтому
+    живая пара в середине месяца не должна выглядеть делистингованной.
+    """
+    if not present:
+        return False
+    trailing = months[months.index(present[-1]) + 1:]
+    if any(pd.Period(m, freq="M").end_time.tz_localize("UTC") < now
+           for m in trailing):
+        return True
+    month_end = pd.Period(present[-1], freq="M").end_time.tz_localize("UTC")
+    return month_end < now and last_bar_ts < month_end - pd.Timedelta(days=1)
 
 
 def archive_url(market: str, kind: str, symbol: str, freq: str | None,
@@ -150,12 +179,19 @@ def _download(url: str) -> bytes | None:
 
 def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
                   root: Path = DEFAULT_ROOT, market: str = "futures-um",
-                  with_funding: bool = True) -> list[IngestResult]:
-    """Скачивает и раскладывает все месяцы для одного символа."""
+                  with_funding: bool = True,
+                  include_delisted: bool = True) -> list[IngestResult]:
+    """Скачивает и раскладывает все месяцы для одного символа.
+
+    include_delisted=False исключает пару с оборванной историей из области
+    исследования — явно и с пометкой excluded, а не молча (иначе отказ от
+    делистингованных пар незаметно вносил бы ошибку выживаемости).
+    """
     results: list[IngestResult] = []
     months = month_range(start, end)
 
     bar_frames, bar_files, missing, dropped = [], 0, 0, 0
+    present: list[str] = []
     for period in months:
         try:
             raw = _download(archive_url(market, "klines", symbol, freq, period))
@@ -165,12 +201,24 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
         if raw is None:
             missing += 1
             continue
+        present.append(period)
         stats: dict[str, int] = {}
         bar_frames.append(parse_kline_csv(raw, stats=stats))
         dropped += stats["dropped_rows"]
 
     if bar_frames:
         bars = pd.concat(bar_frames, ignore_index=True)
+        last_bar_ts = pd.Timestamp(pd.to_datetime(bars["ts"], utc=True).max())
+        delisted = _is_truncated(months, present, last_bar_ts,
+                                 pd.Timestamp.now(tz="UTC"))
+        if delisted and not include_delisted:
+            results.append(IngestResult(
+                symbol, "klines", 0, 0,
+                "исключён: include_delisted=false, история обрывается раньше "
+                f"периода (последний бар {last_bar_ts:%Y-%m-%d %H:%M} UTC); "
+                "отказ от делистингованных пар создаёт ошибку выживаемости",
+                delisted=True, last_bar_ts=last_bar_ts, excluded=True))
+            return results
         bar_files = len(write_bars(bars, root, symbol, freq))
         rep = check_bars(normalize_bars(bars), freq)
         detail = rep.summary()
@@ -180,8 +228,14 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
         if missing:
             # 404 — норма для ранних месяцев, но оператор должен видеть масштаб.
             detail += f"; пропущено месяцев: {missing}"
+        if delisted:
+            # Пара остаётся в юниверсе (spec 5), но обрыв истории виден.
+            detail += ("; история обрывается раньше периода "
+                       f"(делистинг/обрезка): последний бар "
+                       f"{last_bar_ts:%Y-%m-%d %H:%M} UTC")
         results.append(IngestResult(symbol, "klines", bar_files, len(bars),
-                                    detail, dropped_rows=dropped))
+                                    detail, dropped_rows=dropped,
+                                    delisted=delisted, last_bar_ts=last_bar_ts))
     else:
         results.append(IngestResult(symbol, "klines", 0, 0, "",
                                     f"нет файлов за {len(months)} мес."))
@@ -212,10 +266,13 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
 def ingest_universe(universe, freq: str, root: Path = DEFAULT_ROOT
                     ) -> list[IngestResult]:
     out: list[IngestResult] = []
+    # getattr: юниверс может быть duck-typed (тесты), дефолт spec 5 — true.
+    include_delisted = bool(getattr(universe, "include_delisted", True))
     for symbol in universe.symbols:
         try:
             out.extend(ingest_symbol(symbol, freq, universe.start, universe.end,
-                                     root=root, market=universe.market))
+                                     root=root, market=universe.market,
+                                     include_delisted=include_delisted))
         except Exception as exc:
             # Изоляция символов: один сбойный символ не должен уносить с собой
             # отчёт по остальным — цикл обязан дойти до последнего.

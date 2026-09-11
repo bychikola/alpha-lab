@@ -195,6 +195,9 @@ def test_validate_command_writes_report(tmp_path, capsys):
     assert payload["extra"]["timeframe"] == "1h"
     assert payload["extra"]["data_version"]
     assert payload["extra"]["dirty_bars"] == 0
+    # Чистый ряд: ни одного разрыва и ни одного бара, исключённого маской дыр.
+    assert payload["extra"]["gaps"] == 0
+    assert payload["extra"]["gap_masked_bars"] == 0
 
     printed = capsys.readouterr().out
     assert "ВЕРДИКТ" in printed
@@ -735,6 +738,32 @@ def test_ingest_all_ok_returns_zero(tmp_path, monkeypatch, capsys):
     assert "Итого: 1 успешно, 0 с ошибками" in capsys.readouterr().out
 
 
+def test_ingest_summary_counts_delisted_and_excluded(tmp_path, monkeypatch,
+                                                     capsys):
+    """Делистингованные пары видны в итоге ingest, а не растворяются в «ок»."""
+    from alpha_lab.data import ingest as ingest_mod
+    from alpha_lab.data.ingest import IngestResult
+
+    u, _ = _write_configs(tmp_path, tmp_path)
+    results = [
+        IngestResult("BTCUSDT", "klines", 3, 1000, "OK"),
+        IngestResult("OLDUSDT", "klines", 0, 0,
+                     "исключён: include_delisted=false — ошибка выживаемости",
+                     delisted=True, excluded=True,
+                     last_bar_ts=pd.Timestamp("2022-01-01", tz="UTC")),
+    ]
+    monkeypatch.setattr(ingest_mod, "ingest_universe", lambda *a, **k: results)
+
+    code = main(["ingest", "--config", str(u), "--data-root",
+                 str(tmp_path / "d")])
+
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "делистингованных: 1" in printed
+    assert "исключено: 1" in printed
+    assert "[SKIP]" in printed
+
+
 def test_configure_stdio_forces_utf8(monkeypatch):
     """На Windows cp1251 превращает русский текст в мусор — поток обязан стать UTF-8."""
     calls = []
@@ -864,11 +893,11 @@ def test_funding_events_are_counted_and_matched(tmp_path, capsys):
 
 
 def test_data_gaps_are_surfaced_and_warned(tmp_path, capsys):
-    """Разрыв в данных обязан быть виден: стратегия торгует через него.
+    """Разрыв в данных обязан быть виден, а торговля вокруг него — остановлена.
 
-    spec раздел 8 требует «пропуск → не торговать», но маскирование разрывов —
-    решение владельца; минимум этой волны — честно показать счётчики и
-    предупредить, что вердикт через дыру оптимистичен.
+    spec раздел 8: пропуск → не торговать. Разрыв не инвалидирует весь прогон
+    (120 часов дыры на 4 годах сделали бы пару непригодной), но позиция вокруг
+    него обнуляется, и счётчики обязаны это показать.
     """
     root = tmp_path / "data"
     _write_fixture_data(root)
@@ -882,11 +911,74 @@ def test_data_gaps_are_surfaced_and_warned(tmp_path, capsys):
     payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
     assert payload["extra"]["gaps"] == 1
     assert payload["extra"]["missing_bars"] == 1
+    # Окно по умолчанию: lookback=1 + грязный бар + lookahead=1.
+    assert payload["extra"]["gap_masked_bars"] == 3
 
     warnings = payload["verdict"]["warnings"]
-    assert any("разрыв" in w and "оптимистич" in w for w in warnings), warnings
+    assert any("разрыв" in w and "приостановлена" in w for w in warnings), warnings
 
     captured = capsys.readouterr()
     assert "разрыв" in captured.err
+    assert "приостановлена" in captured.err
     for warning in warnings:
         assert warning in captured.out
+
+
+def test_gap_mask_window_margins_are_configurable():
+    """Окно маскирования — параметр: запас назад и вперёд задаётся явно.
+
+    i — индекс первого бара после разрыва (здесь 04:00 после пропущенного
+    03:00). По умолчанию маскируются [i-2..i]; при lookback=2, lookahead=3 —
+    [i-3..i+2].
+    """
+    ts = pd.date_range("2024-01-01", periods=8, freq="1h", tz="UTC").delete(3)
+    bars = pd.DataFrame({"ts": ts})
+
+    default = cli._gap_mask(bars, "1h")
+    wide = cli._gap_mask(bars, "1h", lookback=2, lookahead=3)
+
+    assert default.tolist() == [False, True, True, True, False, False, False]
+    assert wide.tolist() == [True, True, True, True, True, True, False]
+
+
+def test_gap_window_is_flat_and_trading_resumes(tmp_path, capsys):
+    """Сквозная проверка маски разрыва на часовом прогоне.
+
+    Сравниваем весь ряд удержанных позиций с эталоном: цели внутри окна
+    обнулены, вне окна — ровно то, что дала стратегия. Иначе «торговля
+    возобновилась» ничего не доказывала бы.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+
+    bars = _hourly_bars(root)
+    raw = _raw_targets(bars)
+    # Час k: цель за три бара до него и через два после — ненулевые, иначе
+    # проверка возобновления торговли была бы пустой.
+    k = next(j for j in range(6, len(raw) - 3)
+             if raw[j - 3] != 0.0 and raw[j + 2] != 0.0)
+    _remove_hours(root, [bars["ts"].iloc[k]])
+
+    out = tmp_path / "out"
+    assert _run_validate(root, u, e, out, tmp_path / "trials.jsonl") == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert payload["extra"]["gaps"] == 1
+    assert payload["extra"]["missing_bars"] == 1
+    assert payload["extra"]["gap_masked_bars"] == 3
+    assert payload["extra"]["dirty_bars"] == 0
+
+    # После вырезания часа k первый бар за дырой снова имеет индекс k.
+    bars_after = _hourly_bars(root)
+    raw_after = _raw_targets(bars_after)
+    targets = raw_after.copy()
+    targets[k - 2:k + 1] = 0.0
+    expected = _held_from_targets(targets)
+
+    # Вне окна позиции не обнулены: торговля именно возобновляется.
+    assert expected[k - 2] != 0.0
+    assert expected[k + 2] != 0.0
+
+    got = np.asarray(payload["series"]["position"], dtype="float64")
+    np.testing.assert_allclose(got, expected, atol=1e-6)

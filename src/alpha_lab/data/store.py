@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import re
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +14,27 @@ import pandas as pd
 from alpha_lab.data.schema import FUNDING_COLUMNS, normalize_bars
 
 DEFAULT_ROOT = Path(r"D:\alpha-lab\data")
+
+_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def end_bound(end) -> tuple[pd.Timestamp, bool]:
+    """Граница периода по end: (момент времени, строгое ли неравенство).
+
+    Семантика: end-дата без времени ("2025-12-31") означает конец этого дня
+    включительно — иначе фильтр ts <= end покрывал бы только полночь, и
+    последние 23 часа периода молча выпадали из прогона. Явный момент времени
+    ("2025-12-31T12:00" или datetime) остаётся точной границей: ts <= end.
+    """
+    ts = pd.Timestamp(end, tz="UTC")
+    if isinstance(end, datetime):
+        return ts, False
+    if isinstance(end, date):
+        # date без времени — это дата, а не полночь: следующий день, ts < bound.
+        return ts + pd.Timedelta(days=1), True
+    if _DATE_ONLY.fullmatch(str(end).strip()):
+        return ts + pd.Timedelta(days=1), True
+    return ts, False
 
 
 def bars_dir(root: Path, symbol: str, freq: str) -> Path:
@@ -34,7 +57,9 @@ def write_bars(df: pd.DataFrame, root: Path, symbol: str, freq: str) -> list[Pat
 def read_bars(root: Path, symbol: str, freq: str,
               start: str | None = None, end: str | None = None) -> pd.DataFrame:
     out_dir = bars_dir(root, symbol, freq)
-    files = sorted(out_dir.glob("*.parquet"))
+    # Только файлы своего символа и таймфрейма: глоб *.parquet молча подмешал бы
+    # в ряд чужой parquet, случайно оказавшийся в каталоге.
+    files = sorted(out_dir.glob(f"{symbol}-{freq}-*.parquet"))
     if not files:
         raise FileNotFoundError(f"Нет данных: {out_dir}")
 
@@ -44,7 +69,8 @@ def read_bars(root: Path, symbol: str, freq: str,
     if start is not None:
         df = df[df["ts"] >= pd.Timestamp(start, tz="UTC")]
     if end is not None:
-        df = df[df["ts"] <= pd.Timestamp(end, tz="UTC")]
+        bound, strict = end_bound(end)
+        df = df[df["ts"] < bound] if strict else df[df["ts"] <= bound]
     return df.reset_index(drop=True)
 
 

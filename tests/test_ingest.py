@@ -159,7 +159,8 @@ def test_ingest_universe_isolates_failing_symbol(tmp_path, monkeypatch):
         end = "2024-01-31"
         market = "futures-um"
 
-    def fake_ingest(symbol, freq, start, end, root=None, market="futures-um"):
+    def fake_ingest(symbol, freq, start, end, root=None, market="futures-um",
+                    **kwargs):
         if symbol == "BBBUSDT":
             raise RuntimeError("битый символ")
         return [ingest_module.IngestResult(symbol, "klines", 1, 10, "OK")]
@@ -187,3 +188,135 @@ def test_ingest_reports_missing_months(tmp_path, monkeypatch):
     assert len(results) == 1
     assert results[0].ok
     assert "пропущено месяцев: 1" in results[0].quality
+
+
+def _kline_month(period: str, day: int | None = None) -> bytes:
+    """Месячный CSV: одна минута в конце месяца (или в указанный день).
+
+    Файлы архива не фильтруются по start/end при ingest — месячный файл
+    покрывает весь месяц, поэтому «полное покрытие» обязано кончаться в
+    последнюю минуту месяца.
+    """
+    end = pd.Period(period, freq="M").end_time
+    if day is not None:
+        end = end.replace(day=day, hour=12, minute=0, second=0, microsecond=0)
+    ms = int(end.tz_localize("UTC").timestamp() * 1000)
+    header = (b"open_time,open,high,low,close,volume,close_time,quote_volume,"
+              b"count,taker_buy_volume,taker_buy_quote_volume,ignore\n")
+    row = f"{ms},100,101,99,100,10,{ms + 59999},1000,5,6,600,0\n".encode()
+    return header + row
+
+
+def _download_by_month(available: dict[str, bytes]):
+    """Подменяет _download: отдаёт файл только для перечисленных месяцев."""
+    import re
+
+    def download(url: str):
+        if "fundingRate" in url:
+            return None
+        match = re.search(r"(\d{4}-\d{2})\.zip", url)
+        if match is None:
+            return None
+        return available.get(match.group(1))
+
+    return download
+
+
+def test_ingest_marks_tail_truncation_as_delisted(tmp_path, monkeypatch):
+    """Хвост из отсутствующих месяцев — делистинг/обрыв истории, а не «ок».
+
+    Пара, у которой данные кончаются раньше периода, обязана быть помечена:
+    молчаливый пропуск хвоста — это и есть ошибка выживаемости из spec 5.
+    """
+    import alpha_lab.data.ingest as ingest_module
+
+    monkeypatch.setattr(ingest_module, "_download",
+                        _download_by_month({"2024-01": _kline_month("2024-01")}))
+    results = ingest_module.ingest_symbol(
+        "OLDUSDT", "1m", "2024-01-01", "2024-03-31", tmp_path,
+        with_funding=False)
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.ok and result.delisted and not result.excluded
+    assert result.last_bar_ts >= pd.Timestamp("2024-01-31 23:59", tz="UTC")
+    assert "делистинг" in result.quality
+
+
+def test_ingest_marks_partial_final_month_as_delisted(tmp_path, monkeypatch):
+    """Обрыв внутри последнего месяца виден по last_bar_ts, а не по 404."""
+    import alpha_lab.data.ingest as ingest_module
+
+    available = {period: _kline_month("2024-03", day=15)
+                 for period in ("2024-01", "2024-02", "2024-03")}
+    monkeypatch.setattr(ingest_module, "_download", _download_by_month(available))
+    results = ingest_module.ingest_symbol(
+        "OLDUSDT", "1m", "2024-01-01", "2024-03-31", tmp_path,
+        with_funding=False)
+
+    result = results[0]
+    assert result.ok and result.delisted
+    assert result.last_bar_ts == pd.Timestamp("2024-03-15 12:00", tz="UTC")
+
+
+def test_ingest_full_coverage_is_not_delisted(tmp_path, monkeypatch):
+    """Контроль: полное покрытие периода не считается делистингом."""
+    import alpha_lab.data.ingest as ingest_module
+
+    available = {period: _kline_month(period)
+                 for period in ("2024-01", "2024-02", "2024-03")}
+    monkeypatch.setattr(ingest_module, "_download", _download_by_month(available))
+    results = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-03-31", tmp_path,
+        with_funding=False)
+
+    result = results[0]
+    assert result.ok and not result.delisted and not result.excluded
+    assert result.last_bar_ts is not None
+
+
+def test_ingest_include_delisted_false_excludes_truncated_symbol(
+        tmp_path, monkeypatch):
+    """include_delisted=false — явный отказ от усечённой пары, и он виден.
+
+    Пара не пишется в хранилище, но результат помечен excluded и объясняет,
+    что отказ создаёт ошибку выживаемости: молчаливого исключения нет.
+    """
+    import alpha_lab.data.ingest as ingest_module
+
+    monkeypatch.setattr(ingest_module, "_download",
+                        _download_by_month({"2024-01": _kline_month("2024-01")}))
+    results = ingest_module.ingest_symbol(
+        "OLDUSDT", "1m", "2024-01-01", "2024-03-31", tmp_path,
+        with_funding=False, include_delisted=False)
+
+    result = results[0]
+    assert result.excluded and result.delisted
+    assert result.rows == 0 and result.files == 0
+    assert "выживаем" in result.quality
+    assert not (tmp_path / "bars" / "OLDUSDT").exists()
+
+
+def test_ingest_universe_passes_include_delisted(tmp_path, monkeypatch):
+    """Флаг юниверса обязан доходить до ingest, а не лежать мёртвым грузом."""
+    import alpha_lab.data.ingest as ingest_module
+
+    class Universe:
+        symbols = ["OLDUSDT"]
+        start = "2024-01-01"
+        end = "2024-03-31"
+        market = "futures-um"
+
+        def __init__(self, include_delisted):
+            self.include_delisted = include_delisted
+
+    monkeypatch.setattr(ingest_module, "_download",
+                        _download_by_month({"2024-01": _kline_month("2024-01")}))
+
+    excluded = ingest_module.ingest_universe(
+        Universe(False), "1m", tmp_path / "excluded")
+    kept = ingest_module.ingest_universe(
+        Universe(True), "1m", tmp_path / "kept")
+
+    assert excluded[0].excluded and excluded[0].rows == 0
+    assert kept[0].delisted and not kept[0].excluded and kept[0].rows > 0

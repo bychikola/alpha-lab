@@ -39,6 +39,35 @@ def test_universe_rejects_duplicate_symbols(tmp_path):
         load_universe(p)
 
 
+def test_universe_null_include_delisted_defaults_to_true(tmp_path):
+    """null — это «не задано», а не false.
+
+    bool(None) == False молча выключал бы делистингованные пары и вносил
+    ошибку выживаемости; безопасный дефолт spec 5 — true.
+    """
+    p = tmp_path / "u.yaml"
+    p.write_text(yaml.safe_dump({
+        "market": "futures-um", "start": "2022-01-01", "end": None,
+        "include_delisted": None, "symbols": ["BTCUSDT"],
+    }), encoding="utf-8")
+
+    u = load_universe(p)
+
+    assert u.include_delisted is True
+
+
+def test_universe_rejects_non_bool_include_delisted(tmp_path):
+    """Строка "yes" не должна молча становиться true — значение только bool."""
+    p = tmp_path / "u.yaml"
+    p.write_text(yaml.safe_dump({
+        "market": "futures-um", "start": "2022-01-01", "end": None,
+        "include_delisted": "yes", "symbols": ["BTCUSDT"],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="include_delisted"):
+        load_universe(p)
+
+
 def test_load_experiment(tmp_path):
     p = tmp_path / "e.yaml"
     p.write_text(yaml.safe_dump({

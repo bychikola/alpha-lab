@@ -32,6 +32,49 @@ def test_load_bars_reads_all(tmp_path):
     assert len(df) == 120
 
 
+def test_load_bars_date_only_end_includes_whole_day(tmp_path):
+    """end="2024-01-01" — это дата, а не полночь: день обязан входить целиком.
+
+    Раньше фильтр ts <= end отсекал всё после 00:00, и последние 23 часа
+    периода молча выпадали из прогона.
+    """
+    _make(tmp_path, n=2880)   # 2024-01-01 00:00 .. 2024-01-02 23:59
+
+    out = load_bars(tmp_path, "BTCUSDT", "1m", "2024-01-01", "2024-01-01")
+
+    assert len(out) == 1440
+    assert out["ts"].iloc[-1] == pd.Timestamp("2024-01-01 23:59", tz="UTC")
+
+
+def test_load_bars_date_only_end_resamples_full_day(tmp_path):
+    _make(tmp_path, n=2880)
+
+    out = load_bars(tmp_path, "BTCUSDT", "1m", "2024-01-01", "2024-01-01",
+                    resample="1h")
+
+    assert len(out) == 24
+    assert out["ts"].iloc[-1] == pd.Timestamp("2024-01-01 23:00", tz="UTC")
+
+
+def test_load_bars_explicit_timestamp_end_is_exact(tmp_path):
+    """Явный момент времени — точная граница, даже если это полночь.
+
+    Проверка на «полночь по значению, а не по формату»: иначе end=
+    "2024-01-01T00:00" неожиданно включал бы весь день.
+    """
+    _make(tmp_path, n=2880)
+
+    exact = load_bars(tmp_path, "BTCUSDT", "1m", "2024-01-01",
+                      "2024-01-01T00:30")
+    assert len(exact) == 31
+    assert exact["ts"].iloc[-1] == pd.Timestamp("2024-01-01 00:30", tz="UTC")
+
+    midnight = load_bars(tmp_path, "BTCUSDT", "1m", "2024-01-01",
+                         "2024-01-01T00:00")
+    assert len(midnight) == 1
+    assert midnight["ts"].iloc[-1] == pd.Timestamp("2024-01-01 00:00", tz="UTC")
+
+
 def test_load_bars_resamples_to_hourly(tmp_path):
     _make(tmp_path, n=600)   # 10 часов по минутам
 

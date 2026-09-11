@@ -55,9 +55,44 @@ def test_read_bars_filters_by_date(tmp_path):
     assert len(out) == 10
 
 
+def test_read_bars_date_only_end_includes_full_day(tmp_path):
+    """Та же семантика, что у query.load_bars: дата включает весь конечный день."""
+    write_bars(normalize_bars(_bars(2880)), tmp_path, "BTCUSDT", "1m")
+
+    whole_day = read_bars(tmp_path, "BTCUSDT", "1m",
+                          start="2024-01-01", end="2024-01-01")
+    assert len(whole_day) == 1440
+    assert whole_day["ts"].iloc[-1] == pd.Timestamp("2024-01-01 23:59", tz="UTC")
+
+    exact = read_bars(tmp_path, "BTCUSDT", "1m", end="2024-01-01T00:00")
+    assert len(exact) == 1
+
+
 def test_read_bars_missing_symbol_raises(tmp_path):
     with pytest.raises(FileNotFoundError, match="Нет данных"):
         read_bars(tmp_path, "NOPEUSDT", "1m")
+
+
+def test_read_bars_ignores_foreign_parquet_in_same_dir(tmp_path):
+    """Глоб обязан читать только файлы своего символа и таймфрейма.
+
+    Соседний parquet (другой символ или другой таймфрейм) при глобе *.parquet
+    молча подмешивался бы в ряд — цены чужого актива выглядели бы как дыры
+    и скачки своего.
+    """
+    write_bars(normalize_bars(_bars(10)), tmp_path, "BTCUSDT", "1m")
+    other_symbol = normalize_bars(_bars(50, "2024-02-01"))
+    other_symbol.to_parquet(
+        tmp_path / "bars" / "BTCUSDT" / "1m" / "ETHUSDT-1m-2024-02.parquet",
+        index=False)
+    other_freq = normalize_bars(_bars(7, "2024-03-01"))
+    other_freq.to_parquet(
+        tmp_path / "bars" / "BTCUSDT" / "1m" / "BTCUSDT-4h-2024-03.parquet",
+        index=False)
+
+    back = read_bars(tmp_path, "BTCUSDT", "1m")
+
+    assert len(back) == 10
 
 
 def test_funding_roundtrip(tmp_path):
