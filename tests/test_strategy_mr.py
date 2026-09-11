@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
 import pytest
-from fixtures.synthetic import ou_bars, random_walk
+from fixtures.synthetic import ou_bars, random_walk_bars
 
+from alpha_lab.data.quality import check_bars
 from alpha_lab.features.price import zscore
 from alpha_lab.strategies import mean_reversion as mr_module
 from alpha_lab.strategies.base import Strategy, build_strategy
@@ -58,22 +59,39 @@ def test_generates_trades_on_mean_reverting_series():
     assert (pos != 0).sum() > 50      # на возвращающемся ряде входы обязаны быть
 
 
+def test_random_walk_bars_ohlc_invariants_and_quality_gate():
+    """Бар случайного блуждания физически возможен и проходит гейт качества.
+
+    Прежняя конструкция теста подменяла close у ou_bars и оставляла high/low
+    от OU-ряда: на 4868 из 5000 баров close выходил за [low, high], ATR был
+    раздут до ~33, а метрики стратегии — артефактом чужого конверта.
+    """
+    bars = random_walk_bars(n=5000)
+
+    assert (bars["low"] <= bars["open"]).all(), "low > open"
+    assert (bars["open"] <= bars["high"]).all(), "open > high"
+    assert (bars["low"] <= bars["close"]).all(), "low > close"
+    assert (bars["close"] <= bars["high"]).all(), "close > high"
+    assert (bars["high"] >= bars["low"]).all(), "high < low"
+
+    report = check_bars(random_walk_bars(n=500), "1m")
+    assert report.is_clean, report.summary()
+
+
 def test_random_walk_is_traded_not_avoided():
     """Опровержение посылки «на случайном блуждании z-скор редко даёт входы».
 
-    Замер на этом же фикстуре (окно 20, k=2, max_bars=500):
+    Замер на физически согласованных барах (окно 20, k=2, max_bars=500):
       * сырой сигнал |z| >= 2 — 11.6% баров против 9.3% на OU(theta=0.10,
         seed=13): блуждание даёт входы не реже, а чаще;
-      * позиция занята 97.5% баров, 8 из 11 входов закрыл тайм-стоп
-        (high/low фикстуры остались от OU-ряда, ATR раздут до ~33, поэтому
-        стопы и цели почти не достигаются, а держит позицию max_bars).
+      * 96 входов, среднее удержание 41.5 бара, 68/27/0 стоп/тейк/тайм-стоп
+        (+1 сделка открыта в конце), позиция занята 77.1% баров.
     Голый z-порог без фильтров Pine (режим волатильности, ADX, RSI, объём)
     не «редко торгует» на трендовом ряде. Проверяем измеренную картину, а не
     ложную интуицию: входы есть в обе стороны и позиция занята больше
     половины баров.
     """
-    bars = ou_bars(n=5000, seed=14)
-    bars["close"] = random_walk(n=5000, seed=14).to_numpy()
+    bars = random_walk_bars(n=5000, seed=14)
     s = MeanReversionStrategy({"window": 20, "k": 2.0})
 
     pos = s.generate(bars)
@@ -161,6 +179,64 @@ def test_nan_brackets_guard_suppresses_entry(monkeypatch):
         return nan, nan.rename("tp")
 
     monkeypatch.setattr(mr_module, "atr_brackets", nan_brackets)
+
+    pos = s.generate(bars)
+
+    assert (pos == 0).all()
+
+
+def test_nan_tp_only_suppresses_entry(monkeypatch):
+    """Второй конъюнкт страховки: тейк нефинитен, а стоп конечен.
+
+    Страховка — это `isfinite(sl) & isfinite(tp)`; тест фиксирует вторую
+    половину конъюнкции, которую общий NaN-тест выше не проверяет (там оба
+    уровня NaN сразу). Сырые сигналы z в обе стороны на этих барах есть —
+    иначе тест прошёл бы потому, что сигнала нет вовсе, а не потому, что
+    страховка сработала.
+    """
+    bars = ou_bars(n=2000, seed=12)
+    s = MeanReversionStrategy({"window": 20, "k": 2.0})
+
+    z = zscore(bars["close"], 20)
+    assert (z.iloc[19:] <= -2.0).any()      # сырой лонг-сигнал есть
+    assert (z.iloc[19:] >= 2.0).any()       # сырой шорт-сигнал есть
+
+    def finite_sl_nan_tp(close, atr, direction, sl_atr, tp_atr):
+        c = pd.Series(close).astype("float64")
+        a = pd.Series(atr).astype("float64")
+        sl = (c - direction * sl_atr * a).rename("sl")
+        nan = pd.Series(np.nan, index=c.index, name="tp")
+        return sl, nan
+
+    monkeypatch.setattr(mr_module, "atr_brackets", finite_sl_nan_tp)
+
+    pos = s.generate(bars)
+
+    assert (pos == 0).all()
+
+
+def test_nan_sl_only_suppresses_entry(monkeypatch):
+    """Первая половина конъюнкции изолированно: стоп нефинитен, тейк конечен.
+
+    Мутация «проверять только тейк» обязана валить этот тест: без проверки
+    конечности стопа позиция открылась бы без защиты и держалась бы до
+    тайм-стопа. Сырые сигналы z на этих барах есть (см. тест выше).
+    """
+    bars = ou_bars(n=2000, seed=12)
+    s = MeanReversionStrategy({"window": 20, "k": 2.0})
+
+    z = zscore(bars["close"], 20)
+    assert (z.iloc[19:] <= -2.0).any()
+    assert (z.iloc[19:] >= 2.0).any()
+
+    def nan_sl_finite_tp(close, atr, direction, sl_atr, tp_atr):
+        c = pd.Series(close).astype("float64")
+        a = pd.Series(atr).astype("float64")
+        nan = pd.Series(np.nan, index=c.index, name="sl")
+        tp = (c + direction * tp_atr * a).rename("tp")
+        return nan, tp
+
+    monkeypatch.setattr(mr_module, "atr_brackets", nan_sl_finite_tp)
 
     pos = s.generate(bars)
 
