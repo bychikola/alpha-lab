@@ -157,16 +157,87 @@ class _MisalignedIndexStrategy:
         return pd.Series(1.0, index=pd.Index(bars["ts"], name="ts"))
 
 
+class _SegmentLeak:
+    """Подглядывает на один бар вперёд, но только на отрезке [start, end).
+
+    Вне отрезка позиции нулевые, поэтому дефект сегментный: прежние четыре
+    точки усечения (250/500/750/999) в него не попадали — при k=250 последняя
+    позиция префикса 249 уже не подглядывает, и harness пропускал ловушку.
+    При усечении до k последняя позиция k−1 теряет будущий бар и обнуляется,
+    поэтому плотная сетка ловит расхождение внутри отрезка.
+    """
+
+    name = "trap_segment_leak"
+
+    def __init__(self, start: int = 100, end: int = 249):
+        self.start = start
+        self.end = end
+
+    def generate(self, bars: pd.DataFrame) -> pd.Series:
+        close = bars["close"].astype("float64")
+        fwd = np.sign(close.shift(-1) / close - 1.0).fillna(0.0)
+        pos = pd.Series(0.0, index=bars.index)
+        lo, hi = self.start, min(self.end, len(bars))
+        if lo < hi:
+            pos.iloc[lo:hi] = fwd.iloc[lo:hi]
+        return pos
+
+
+class _WarmupLeak:
+    """Утечка нормализации: центрированное окно [t−1, t+1] в первых n_warmup барах.
+
+    Нормировка на будущий бар — тот самый «признак, читающий t+1», который
+    spec 8.1 называет незащищённым. Здесь дефект ограничен прогревом: при
+    усечении до k у последнего бара префикса будущего нет, окно вырождается,
+    и значение отличается от полного прогона. За пределами прогрева позиции
+    нулевые, поэтому четыре прежние точки (k ≥ 250) дефекта не видели.
+    """
+
+    name = "trap_warmup_leak"
+
+    def __init__(self, n_warmup: int = 100):
+        self.n_warmup = n_warmup
+
+    def generate(self, bars: pd.DataFrame) -> pd.Series:
+        close = bars["close"].astype("float64")
+        centered = (close.shift(-1) - close.shift(1)) / (2.0 * close)
+        pos = pd.Series(0.0, index=bars.index)
+        w = min(self.n_warmup, len(bars))
+        pos.iloc[:w] = centered.iloc[:w].fillna(0.0)
+        return pos
+
+
+class _ParityLeak:
+    """Подглядывает только на чётных позициях; нечётные точки усечения слепы.
+
+    При n=1001 дефолтные k = 250/500/750/1000 все чётные, поэтому позиция k−1
+    нечётна и не подглядывает — ловушка проходила целиком. При n=1000 её ловил
+    только k=999 (нечётный): случайность чётности, а не политика harness'а.
+    """
+
+    name = "trap_parity_leak"
+
+    def generate(self, bars: pd.DataFrame) -> pd.Series:
+        close = bars["close"].astype("float64")
+        fwd = np.sign(close.shift(-1) / close - 1.0).fillna(0.0).to_numpy()
+        idx = np.arange(len(bars))
+        vals = np.where(idx % 2 == 0, fwd, 0.0)
+        return pd.Series(vals, index=bars.index)
+
+
 def test_causality_harness_catches_lookahead_trap():
     """Harness обязан поймать подглядывание: усечение вскрывает чтение будущего.
 
     На усечённом ряде последний бар не имеет будущего, и ловушка ставит там 0;
     в полном прогоне на той же позиции стоит знак следующего бара. Расхождение
     ровно в одной позиции на каждую точку усечения — этого достаточно.
+
+    Конкретное k не привязываем: его определяет политика плотности, и она
+    обязана ловить тем раньше, чем плотнее сетка (сейчас — на первой же точке).
     """
     bars = ou_bars(n=1000, seed=22)
 
-    with pytest.raises(AssertionError, match=r"k=250 — позиций 1 из 250"):
+    with pytest.raises(AssertionError, match="не причинн"):
         assert_strategy_is_causal(LookAheadStrategy(), bars)
 
 
@@ -174,7 +245,7 @@ def test_causality_harness_catches_perfect_foresight_trap():
     """PerfectForesight читает весь ряд целиком — harness ловит и его."""
     bars = ou_bars(n=1000, seed=22)
 
-    with pytest.raises(AssertionError, match=r"k=250 — позиций 1 из 250"):
+    with pytest.raises(AssertionError, match="не причинн"):
         assert_strategy_is_causal(PerfectForesightStrategy(), bars)
 
 
@@ -460,5 +531,53 @@ def test_many_trials_penalty_is_isolated_via_dsr():
     assert "DSR" in reason
     assert many.n_configs_tried == 10000
     assert many.dsr < 0.95
-    # p-value и min_trades не изменились — они не могли убить many_trials.
+    # p-value и min_trades ПОБИТОВО те же, что при n_trials=1: значит, они не
+    # могли убить many_trials — убила ровно дефляция. Проверяем равенство, а не
+    # «< 0.05»: последнее лишь подразумевало бы неизменность.
+    assert one.p_value == many.p_value
+    assert one.trades == many.trades
     assert many.p_value < 0.05 and many.trades >= 100
+
+
+@pytest.mark.parametrize("leak_cls", [_SegmentLeak, _WarmupLeak, _ParityLeak])
+def test_causality_harness_catches_segment_confined_leaks(leak_cls):
+    """Плотная сетка обязана ловить утечку, ограниченную отрезком.
+
+    Четыре структурные точки (n//4, n//2, 3n//4, n−1) проверяли ровно четыре
+    позиции, поэтому утечка, целиком лежащая ниже наименьшей из них, проходила:
+    замерено на этих трёх классах. Политика _default_cut_points сделана плотной
+    именно ради этого, и тест закрепляет, что она такой остаётся.
+    """
+    bars = ou_bars(n=1001, seed=22)   # нечётная длина: все структурные k чётны
+
+    with pytest.raises(AssertionError, match="не причинн"):
+        assert_strategy_is_causal(leak_cls(), bars)
+
+
+def test_causality_harness_catches_parity_leak_on_even_length():
+    """Та же ловушка на чётной длине: раньше её ловил только k=999 — по везению.
+
+    При n=1000 из четырёх структурных точек нечётна лишь последняя, поэтому
+    обнаружение зависело от чётности длины ряда, а не от политики harness'а.
+    Плотная сетка убирает эту зависимость.
+    """
+    bars = ou_bars(n=1000, seed=22)
+
+    with pytest.raises(AssertionError, match="не причинн"):
+        assert_strategy_is_causal(_ParityLeak(), bars)
+
+
+def test_default_cut_points_are_dense():
+    """Политика разрезов обязана быть плотной, а не четырёхточечной.
+
+    Регрессия на исходный дефект: четыре точки проверяли четыре позиции из n.
+    """
+    from fixtures.causality import EXHAUSTIVE_LIMIT, _default_cut_points
+
+    short = _default_cut_points(EXHAUSTIVE_LIMIT)
+    assert short == list(range(2, EXHAUSTIVE_LIMIT)), "короткий ряд — сплошное покрытие"
+
+    long_cuts = _default_cut_points(2000)
+    assert len(long_cuts) >= 200, f"длинный ряд покрыт редкой сеткой: {len(long_cuts)}"
+    assert 2 <= min(long_cuts) and max(long_cuts) < 2000
+

@@ -30,8 +30,32 @@ def _name(strategy) -> str:
     return str(getattr(strategy, "name", type(strategy).__name__))
 
 
+# До этой длины точки усечения берутся сплошь: k = 2 .. n-1.
+EXHAUSTIVE_LIMIT = 600
+# Выше — плотная сетка: не реже одной точки на каждые TARGET_CUTS позиций.
+TARGET_CUTS = 200
+
+
 def _default_cut_points(n: int) -> list[int]:
-    return [n // 4, n // 2, 3 * n // 4, n - 1]
+    """Плотная сетка точек усечения.
+
+    Точка k проверяет зависимость от будущего ровно в одной позиции — последней
+    в префиксе (k−1): все предыдущие позиции присутствуют и в усечённом прогоне,
+    поэтому утечка в них невидима. Четыре структурные точки проверяли четыре
+    позиции и пропускали утечку, ограниченную отрезком (например, прогревом или
+    окном переобучения) — замерено на _SegmentLeak и _WarmupLeak.
+
+    Политика:
+        n <= EXHAUSTIVE_LIMIT — сплошь, k = 2 .. n−1 (полное покрытие);
+        иначе — шаг max(1, n // TARGET_CUTS), объединённый со структурными
+        точками n//4, n//2, 3n//4, n−1.
+    """
+    if n <= EXHAUSTIVE_LIMIT:
+        return list(range(2, n))
+    stride = max(1, n // TARGET_CUTS)
+    cuts = set(range(2, n, stride))
+    cuts.update({n // 4, n // 2, 3 * n // 4, n - 1})
+    return sorted(k for k in cuts if 0 < k < n)
 
 
 def _diff_mask(actual: np.ndarray, expected: np.ndarray) -> np.ndarray:
@@ -58,16 +82,28 @@ def _check_output(series, expected_index, strategy, k: int | None) -> pd.Series:
 
 
 def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> None:
-    """Проверяет, что стратегия не читает будущее и не зависит от длины ряда.
+    """Проверяет причинность стратегии: решение на баре t не зависит от баров > t.
 
-    Для каждой точки k из [len//4, len//2, 3*len//4, len-1] и переданных
-    cut_points требует побитового равенства значений:
+    Для каждой точки k требует побитового равенства значений:
         generate(bars.iloc[:k]) == generate(bars).iloc[:k].
-    Если будущее на баре t влияет на решение, усечение ряда это вскроет:
-    префикс решений изменится. Сравнение поэлементное по позициям баров, с
-    явной проверкой индексной конвенции (см. docstring модуля).
+
+    **Что именно проверяется.** Точка k вскрывает зависимость от будущего ровно
+    в одной позиции — последней в префиксе (k−1). Все предыдущие позиции t ≤ k−2
+    присутствуют и в усечённом прогоне, поэтому утечка в них при данном k
+    невидима: сравнивать не с чем. Отсюда политика плотности (см.
+    _default_cut_points) — при n <= EXHAUSTIVE_LIMIT покрываются ВСЕ позиции;
+    выше этого порога сетка плотная, но не сплошная, и утечка, целиком лежащая
+    между её точками, теоретически может остаться незамеченной. Для полной
+    гарантии на длинном ряде передайте cut_points="all".
+
+    **Чего не проверяется** (зафиксировано в spec 8.1): утечка на уровне
+    признаков — если стратегия получает уже посчитанные признаки, harness судит
+    лишь по её решению; поведение последнего бара полного ряда (позиция n−1 в
+    точки усечения не входит); стратегия, ведущая себя причинно только под
+    усечением.
 
     cut_points — дополнительные k; каждое обязано быть целым и 0 < k < len(bars).
+    cut_points="all" — сплошное покрытие 2..n−1 независимо от длины ряда.
 
     Бросает AssertionError с русским сообщением: первое расхождение k и число
     разошедшихся позиций. ValueError — на некорректные аргументы.
@@ -78,16 +114,23 @@ def assert_strategy_is_causal(strategy, bars: pd.DataFrame, cut_points=None) -> 
 
     full = _check_output(strategy.generate(bars), bars.index, strategy, None)
 
-    cuts = {k for k in _default_cut_points(n) if 0 < k < n}
-    if cut_points is not None:
-        for k in cut_points:
-            if isinstance(k, bool) or not isinstance(k, (int, np.integer)):
-                raise ValueError(f"Точка усечения должна быть целой, получено {k!r}")
-            if not 0 < int(k) < n:
-                raise ValueError(
-                    f"Точка усечения k={k} вне диапазона 0 < k < {n}"
-                )
-            cuts.add(int(k))
+    if isinstance(cut_points, str):
+        if cut_points != "all":
+            raise ValueError(
+                f"cut_points как строка допускает только 'all', получено {cut_points!r}"
+            )
+        cuts = set(range(2, n))
+    else:
+        cuts = {k for k in _default_cut_points(n) if 0 < k < n}
+        if cut_points is not None:
+            for k in cut_points:
+                if isinstance(k, bool) or not isinstance(k, (int, np.integer)):
+                    raise ValueError(f"Точка усечения должна быть целой, получено {k!r}")
+                if not 0 < int(k) < n:
+                    raise ValueError(
+                        f"Точка усечения k={k} вне диапазона 0 < k < {n}"
+                    )
+                cuts.add(int(k))
     if not cuts:
         raise ValueError(f"Нет допустимых точек усечения для ряда длины {n}")
 
