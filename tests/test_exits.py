@@ -128,6 +128,78 @@ def test_position_length_matches_bars():
     assert len(pos) == 20
 
 
+# --- нефинитные уровни (NaN = защиты нет) ----------------------------------------------
+
+
+def test_long_nan_stop_held_until_take_profit():
+    """NaN-стоп у лонга — защиты нет: провал цены позицию не закрывает.
+
+    Сентинел выбирается по направлению: лонгу подставляется -inf, и
+    `low <= -inf` не может сработать.
+    """
+    bars = _bars(highs=[100.0, 101.0, 102.0, 105.0, 106.0],
+                 lows=[100.0, 85.0, 70.0, 100.0, 101.0])
+    entries = pd.Series([True, False, False, False, False])
+    sl = pd.Series([np.nan] * 5)
+    tp = pd.Series([104.0] * 5)
+
+    pos = simulate_bracket_exits(bars, entries, sl, tp, max_bars=10)
+
+    # low 85 и 70 не стоп; тейк 104 пробит на баре 3 (high 105).
+    assert pos.tolist() == [1.0, 1.0, 1.0, 0.0, 0.0]
+
+
+def test_long_nan_target_never_takes_profit():
+    """NaN-тейк у лонга — цели нет: рост high не закрывает позицию.
+
+    До тайм-стопа доходим с позицией, хотя high доходил до 140.
+    """
+    bars = _bars(highs=[100.0, 120.0, 130.0, 140.0, 100.0],
+                 lows=[100.0, 100.0, 100.0, 100.0, 100.0])
+    entries = pd.Series([True, False, False, False, False])
+    sl = pd.Series([50.0] * 5)
+    tp = pd.Series([np.nan] * 5)
+
+    pos = simulate_bracket_exits(bars, entries, sl, tp, max_bars=3)
+
+    assert pos.iloc[2] == 1.0     # high 130 — тейка нет, держим
+    assert pos.iloc[3] == 0.0     # (3 - 0) >= 3 — только тайм-стоп
+
+
+def test_short_nan_stop_is_held_not_exited_on_entry():
+    """Регрессия: NaN-стоп шорта не должен закрывать позицию в баре входа.
+
+    До фикса шорту подставлялся -inf, и `high >= -inf` было истинно всегда:
+    позиция выходила на баре входа, а сигнал молча терялся. Серия позиций
+    была [0, 0, 0, 0, 0, 0]; теперь шорт держится до тайм-стопа.
+    """
+    bars = _bars(highs=[100.0] * 6, lows=[100.0] * 6)
+    entries = pd.Series([0.0, -1.0, 0.0, 0.0, 0.0, 0.0])
+    sl = pd.Series([np.nan] * 6)
+    tp = pd.Series([80.0] * 6)
+
+    pos = simulate_bracket_exits(bars, entries, sl, tp, max_bars=3)
+
+    # Бар 1 — вход, а не выход; (4 - 1) >= 3 — тайм-стоп.
+    assert pos.tolist() == [0.0, -1.0, -1.0, -1.0, 0.0, 0.0]
+
+
+def test_short_nan_target_never_takes_profit():
+    """NaN-тейк у шорта — цели нет: low не может её пробить.
+
+    До фикса шорту подставлялся +inf, и `low <= +inf` закрывало позицию на
+    баре входа. Стей без стопа (sl=200 не достижим) держится до тайм-стопа.
+    """
+    bars = _bars(highs=[100.0] * 5, lows=[100.0] * 5)
+    entries = pd.Series([0.0, -1.0, 0.0, 0.0, 0.0])
+    sl = pd.Series([200.0] * 5)
+    tp = pd.Series([np.nan] * 5)
+
+    pos = simulate_bracket_exits(bars, entries, sl, tp, max_bars=2)
+
+    assert pos.tolist() == [0.0, -1.0, -1.0, 0.0, 0.0]
+
+
 # --- приоритет и вариант A (бар входа) --------------------------------------------------
 
 
@@ -244,6 +316,24 @@ def test_numba_and_python_loops_agree():
             np.array([110.0, 110.0]),
             10,
         ),
+        # нефинитные уровни: nan-стоп и nan-тейк у шорта
+        (
+            np.array([100.0] * 5),
+            np.array([100.0] * 5),
+            np.array([0.0, -1.0, 0.0, 0.0, 0.0]),
+            np.array([np.nan] * 5),
+            np.array([np.nan] * 5),
+            2,
+        ),
+        # нефинитный стоп у лонга при провале цены
+        (
+            np.array([100.0, 130.0, 90.0, 100.0]),
+            np.array([100.0, 100.0, 90.0, 100.0]),
+            np.array([1.0, 0.0, 0.0, 0.0]),
+            np.array([np.nan] * 4),
+            np.array([200.0] * 4),
+            10,
+        ),
     ]
 
     for high, low, entry, sl, tp, max_bars in cases:
@@ -255,6 +345,50 @@ def test_numba_and_python_loops_agree():
         assert _simulate is not _simulate_py   # боевой путь действительно скомпилирован
     else:
         assert _simulate is _simulate_py
+
+
+# --- валидация входов (до jit) ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_field", ["entries", "sl_price", "tp_price"])
+def test_length_mismatch_raises_value_error(bad_field):
+    """Короткий ряд — ValueError, а не чтение за границей массива в numba.
+
+    У скомпилированного цикла boundscheck=False: без проверки короткий ряд
+    дал бы молчаливый мусор вместо IndexError чисто-Python пути.
+    """
+    bars = _bars(highs=[100.0] * 4, lows=[100.0] * 4)
+    kwargs = {
+        "entries": pd.Series([True, False, False, False]),
+        "sl_price": pd.Series([90.0] * 4),
+        "tp_price": pd.Series([110.0] * 4),
+    }
+    kwargs[bad_field] = kwargs[bad_field].iloc[:3]
+
+    with pytest.raises(ValueError, match="длина"):
+        simulate_bracket_exits(bars, **kwargs)
+
+
+def test_invalid_entry_value_raises():
+    """entries = 2.0 нарушает контракт 1/-1/0 и падает до цикла."""
+    bars = _bars(highs=[100.0] * 3, lows=[100.0] * 3)
+    entries = pd.Series([0.0, 2.0, 0.0])
+
+    with pytest.raises(ValueError, match="entries"):
+        simulate_bracket_exits(bars, entries, pd.Series([90.0] * 3),
+                               pd.Series([110.0] * 3))
+
+
+def test_bool_entries_still_supported():
+    """bool — валидный вход: True → +1.0, False → 0.0 (регрессия для Task 11)."""
+    bars = _bars(highs=[100.0, 105.0], lows=[100.0, 100.0])
+    sl = pd.Series([90.0, 90.0])
+    tp = pd.Series([104.0, 104.0])
+
+    for entries in (pd.Series([True, False]), np.array([True, False]),
+                    [True, False]):
+        pos = simulate_bracket_exits(bars, entries, sl, tp, max_bars=5)
+        assert pos.tolist() == [1.0, 0.0]     # лонг, затем тейк 104 на баре 1
 
 
 # --- уровни ATR -------------------------------------------------------------------------

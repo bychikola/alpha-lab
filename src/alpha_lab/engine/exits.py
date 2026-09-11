@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -45,8 +47,12 @@ def _simulate_py(high, low, entry_idx, sl, tp, max_bars):
         if direction == 0.0 and entry_idx[i] != 0.0:
             direction = entry_idx[i]
             entry_bar = i
-            cur_sl = sl[i]
-            cur_tp = tp[i]
+            # Нефинитный уровень (NaN или ±inf) = «этой защиты нет». Сентинел
+            # выбирается по направлению, иначе проверка шорта ложно сработает на
+            # баре входа: при -inf-стопе high >= -inf истинно всегда, при
+            # +inf-тейке — low <= +inf. math.isfinite поддерживается numba.
+            cur_sl = sl[i] if math.isfinite(sl[i]) else -direction * np.inf
+            cur_tp = tp[i] if math.isfinite(tp[i]) else direction * np.inf
 
         if direction != 0.0:
             pos[i] = direction
@@ -69,6 +75,20 @@ else:  # pragma: no cover — с установленной numba ветка н�
     _simulate = _simulate_py
 
 
+def _checked_float_array(values, n, name, fill):
+    """float64-массив длины n с заполненными NaN; иначе ValueError.
+
+    Проверка длины обязана жить вне numba: скомпилированный цикл собирается с
+    boundscheck=False, и короткий ряд читал бы чужую память вместо IndexError.
+    """
+    arr = pd.Series(values).astype("float64").fillna(fill).to_numpy()
+    if len(arr) != n:
+        raise ValueError(
+            f"{name}: длина {len(arr)} не совпадает с длиной bars ({n})"
+        )
+    return arr
+
+
 def simulate_bracket_exits(bars: pd.DataFrame, entries: pd.Series,
                            sl_price: pd.Series, tp_price: pd.Series,
                            max_bars: int = 500) -> pd.Series:
@@ -81,22 +101,31 @@ def simulate_bracket_exits(bars: pd.DataFrame, entries: pd.Series,
     занижался бы. Если бар пробил и стоп, и тейк, приоритет у стопа.
     Бар выхода не переоткрывается, даже если на нём есть сигнал.
 
-    NaN в уровнях заполняется как −inf для стопа и +inf для тейка: для лонга
-    это «нет уровня», но у шорта незаданный стоп из-за этого сработает в баре
-    входа — передавайте конечные значения.
+    Нефинитный уровень (NaN или ±inf) означает «этой защиты нет»: при входе
+    стоп заменяется на -direction * inf, тейк — на +direction * inf. Знак
+    выбран по направлению, поэтому проверка не срабатывает ложно ни для лонга,
+    ни для шорта (у шорта отсутствующий стоп не закрывает позицию в баре
+    входа). NaN — штатное состояние уровней ATR на прогреве, не экзотика.
+
+    Ряды entries, sl_price и tp_price обязаны совпадать по длине с bars, а
+    entries — содержать только -1.0/0.0/+1.0 (bool приводится к 1.0/0.0);
+    иначе ValueError. Проверки выполняются до компилируемого цикла.
     """
     n = len(bars)
     high = bars["high"].astype("float64").to_numpy()
     low = bars["low"].astype("float64").to_numpy()
 
-    raw = pd.Series(entries)
-    if raw.dtype == bool:
-        entry_idx = raw.astype("float64").to_numpy()
-    else:
-        entry_idx = raw.astype("float64").fillna(0.0).to_numpy()
+    entry_idx = _checked_float_array(entries, n, "entries", 0.0)
+    valid_entry = np.isin(entry_idx, (-1.0, 0.0, 1.0))
+    if not valid_entry.all():
+        bad = float(entry_idx[~valid_entry][0])
+        raise ValueError(
+            f"entries: недопустимое значение {bad}; "
+            "разрешены только -1.0, 0.0, +1.0"
+        )
 
-    sl = pd.Series(sl_price).astype("float64").fillna(-np.inf).to_numpy()
-    tp = pd.Series(tp_price).astype("float64").fillna(np.inf).to_numpy()
+    sl = _checked_float_array(sl_price, n, "sl_price", -np.inf)
+    tp = _checked_float_array(tp_price, n, "tp_price", np.inf)
 
     pos = _simulate(high, low, entry_idx, sl, tp, int(max_bars))
     return pd.Series(pos, index=bars.index, name="position")
