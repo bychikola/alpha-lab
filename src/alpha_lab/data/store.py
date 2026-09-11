@@ -10,6 +10,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from alpha_lab.data.schema import FUNDING_COLUMNS, normalize_bars
 
@@ -41,6 +42,40 @@ def bars_dir(root: Path, symbol: str, freq: str) -> Path:
     return Path(root) / "bars" / symbol / freq
 
 
+def bars_path(root: Path, symbol: str, freq: str, period: str) -> Path:
+    """Путь месячного parquet: <freq>/<symbol>-<freq>-<YYYY-MM>.parquet.
+
+    Единственный источник правды о раскладке: ingest проверяет по этому пути
+    «месяц уже загружен», а write_bars по нему же пишет — разойтись не могут.
+    """
+    return bars_dir(root, symbol, freq) / f"{symbol}-{freq}-{period}.parquet"
+
+
+def funding_path(root: Path, symbol: str) -> Path:
+    return Path(root) / "funding" / symbol / f"{symbol}-funding.parquet"
+
+
+def parquet_row_count(path: Path) -> int | None:
+    """Число строк parquet или None, если файлу доверять нельзя.
+
+    «Файл существует» не равно «файл дописан»: write_bars/write_funding пишут
+    parquet прямо по конечному пути, поэтому обрыв процесса или диска может
+    оставить усечённый (вплоть до нулевого) файл. None — файла нет, он пуст,
+    его footer не читается или в нём ноль строк; вызывающий обязан перекачать
+    месяц, а не считать его готовым.
+    """
+    path = Path(path)
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return None
+        rows = pq.ParquetFile(path).metadata.num_rows
+    except Exception:
+        # Битый/усечённый parquet кидает разные типы (ArrowInvalid, OSError);
+        # для нас любой из них означает одно — данным доверять нельзя.
+        return None
+    return rows if rows > 0 else None
+
+
 def write_bars(df: pd.DataFrame, root: Path, symbol: str, freq: str) -> list[Path]:
     df = normalize_bars(df)
     out_dir = bars_dir(root, symbol, freq)
@@ -48,7 +83,7 @@ def write_bars(df: pd.DataFrame, root: Path, symbol: str, freq: str) -> list[Pat
 
     written: list[Path] = []
     for period, chunk in df.groupby(df["ts"].dt.strftime("%Y-%m")):
-        path = out_dir / f"{symbol}-{freq}-{period}.parquet"
+        path = bars_path(root, symbol, freq, period)
         chunk.reset_index(drop=True).to_parquet(path, index=False, compression="zstd")
         written.append(path)
     return sorted(written)
@@ -77,7 +112,7 @@ def read_bars(root: Path, symbol: str, freq: str,
 def write_funding(df: pd.DataFrame, root: Path, symbol: str) -> Path:
     out_dir = Path(root) / "funding" / symbol
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{symbol}-funding.parquet"
+    path = funding_path(root, symbol)
 
     out = df.loc[:, FUNDING_COLUMNS].copy()
     out["ts"] = pd.to_datetime(out["ts"], utc=True)
@@ -89,7 +124,7 @@ def write_funding(df: pd.DataFrame, root: Path, symbol: str) -> Path:
 
 
 def read_funding(root: Path, symbol: str) -> pd.DataFrame:
-    path = Path(root) / "funding" / symbol / f"{symbol}-funding.parquet"
+    path = funding_path(root, symbol)
     if not path.exists():
         raise FileNotFoundError(f"Нет данных о funding: {path}")
     out = pd.read_parquet(path)

@@ -6,6 +6,9 @@ ccxt используется только как резерв, если арх�
 from __future__ import annotations
 
 import io
+import random
+import sys
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import date
@@ -16,15 +19,37 @@ import requests
 
 from alpha_lab.data.quality import check_bars
 from alpha_lab.data.schema import RAW_KLINE_COLUMNS, normalize_bars
-from alpha_lab.data.store import DEFAULT_ROOT, write_bars, write_funding
+from alpha_lab.data.store import (
+    DEFAULT_ROOT,
+    bars_path,
+    parquet_row_count,
+    write_bars,
+    write_funding,
+)
 
 BASE_URL = "https://data.binance.vision/data"
 MARKET_PREFIX = {"futures-um": "futures/um", "spot": "spot"}
 REQUEST_TIMEOUT = 60
 
+# Политика повторов. В прогоне по вселенной ~2000 файлов; единичный Read
+# timed out — не редкость, а закономерность, и без повтора он стоит символа
+# целиком (четыре года истории из-за одного запроса из ~96).
+DEFAULT_RETRIES = 3              # повторов после первой попытки (итого до 4)
+DEFAULT_RETRY_BASE_DELAY = 0.5   # база экспоненциального backoff, сек
+MAX_RETRY_DELAY = 30.0           # потолок одной паузы backoff, сек
+MAX_RETRY_AFTER = 60.0           # потолок уважения чужого Retry-After, сек
+
 
 @dataclass(frozen=True)
 class IngestResult:
+    """Итог по одной паре (symbol, kind).
+
+    Категории не растворяются в «ок»: `files` — сколько файлов записано в
+    этом прогоне (downloaded), `skipped` — сколько месяцев пропущено как уже
+    лежащие в хранилище (resume), `missing` — сколько месяцев отсутствует в
+    архиве (404), сбой загрузки виден по `error` (ok == False). Оператор
+    завершившегося прогона обязан по отчёту видеть, что именно не качалось.
+    """
     symbol: str
     kind: str
     files: int
@@ -32,6 +57,12 @@ class IngestResult:
     quality: str
     error: str | None = None
     dropped_rows: int = 0
+    # Сколько месяцев не перекачивалось, потому что валидный parquet уже лежит
+    # в хранилище (при force=False). Ноль означает, что качалось всё.
+    skipped: int = 0
+    # Сколько месяцев архива отсутствовало (404) — норма для ранних месяцев,
+    # но масштаб обязан быть виден.
+    missing: int = 0
     # История пары обрывается раньше запрошенного периода (делистинг или
     # неполный архивный файл). По spec 5 такие пары обязаны оставаться в
     # юниверсе, иначе возникает ошибка выживаемости; поле делает обрыв
@@ -168,20 +199,113 @@ def parse_funding_csv(raw: bytes) -> pd.DataFrame:
               .reset_index(drop=True))
 
 
-def _download(url: str) -> bytes | None:
-    """Скачивает файл. None означает «файла нет» (404) — это норма для ранних месяцев."""
-    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-    if resp.status_code == 404:
+def _backoff_delay(base_delay: float, attempt: int) -> float:
+    """Пауза перед повтором номер attempt (1-based): экспонента с джиттером.
+
+    Потолок MAX_RETRY_DELAY не даёт мёртвому эндпоинту растянуть прогон на
+    часы; джиттер разводит одновременные повторы разных символов, чтобы они не
+    били в архив синхронно.
+    """
+    capped = min(base_delay * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+    if capped <= 0:
+        return 0.0
+    return random.uniform(capped / 2, capped)
+
+
+def _retry_after_delay(resp: requests.Response) -> float | None:
+    """Retry-After в секундах, если он есть и разбирается.
+
+    Заголовок может быть и HTTP-датой; такой формат не поддерживаем и
+    откатываемся на обычный backoff — главное, что чужое значение не может
+    превысить MAX_RETRY_AFTER.
+    """
+    value = resp.headers.get("Retry-After")
+    if value is None:
         return None
-    resp.raise_for_status()
-    return resp.content
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return max(0.0, min(seconds, MAX_RETRY_AFTER))
+
+
+def _log_retry(url: str, attempt: int, total: int, exc: BaseException,
+               delay: float) -> None:
+    """Строка в stderr на каждый повтор: длинный прогон должен быть разбираем."""
+    print(f"[retry] {url}: попытка {attempt}/{total} не удалась "
+          f"({exc.__class__.__name__}: {exc}); повтор через {delay:.1f} с",
+          file=sys.stderr)
+
+
+def _download(url: str, *, retries: int = DEFAULT_RETRIES,
+              base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+              timeout: float = REQUEST_TIMEOUT) -> bytes | None:
+    """Скачивает файл, повторяя только временные сбои.
+
+    None означает «файла нет» (404) — норма для ранних месяцев и текущего
+    незавершённого: 404 не повторяется никогда, иначе полный прогон тратит
+    минуты на заведомо отсутствующие файлы.
+
+    Повторяются: Timeout, ConnectionError, 429 и 5xx. Прочие 4xx — ошибка
+    запроса (URL, права), повтор её не исправит и только откладывает провал.
+    После исчерпания повторов последняя ошибка всплывает наружу, а не
+    превращается в тихий None.
+    """
+    total = retries + 1
+    for attempt in range(1, total + 1):
+        try:
+            resp = requests.get(url, timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt == total:
+                raise
+            delay = _backoff_delay(base_delay, attempt)
+            _log_retry(url, attempt, total, exc, delay)
+            time.sleep(delay)
+            continue
+
+        if resp.status_code == 404:
+            return None
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt == total:
+                resp.raise_for_status()
+            retry_after = (_retry_after_delay(resp)
+                           if resp.status_code == 429 else None)
+            delay = (retry_after if retry_after is not None
+                     else _backoff_delay(base_delay, attempt))
+            _log_retry(url, attempt, total,
+                       requests.HTTPError(f"HTTP {resp.status_code}", response=resp),
+                       delay)
+            time.sleep(delay)
+            continue
+
+        resp.raise_for_status()
+        return resp.content
+    raise RuntimeError("цикл повторов завершился без результата")  # pragma: no cover
+
+
+def _parquet_max_ts(path: Path) -> pd.Timestamp | None:
+    """Максимальная метка ts месячного parquet (читается только колонка ts)."""
+    ts = pd.read_parquet(path, columns=["ts"])["ts"]
+    if ts.empty:
+        return None
+    return pd.Timestamp(pd.to_datetime(ts, utc=True).max())
 
 
 def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
                   root: Path = DEFAULT_ROOT, market: str = "futures-um",
                   with_funding: bool = True,
-                  include_delisted: bool = True) -> list[IngestResult]:
+                  include_delisted: bool = True,
+                  force: bool = False,
+                  retries: int = DEFAULT_RETRIES,
+                  retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY
+                  ) -> list[IngestResult]:
     """Скачивает и раскладывает все месяцы для одного символа.
+
+    Повторный прогон не перекачивает то, что уже лежит в хранилище: месяц
+    пропускается, если его parquet читается и непуст (см. store.parquet_row_count).
+    force=True отменяет пропуск — явная перекачка поверх существующего.
+
+    retries/retry_base_delay настраивают политику повторов HTTP.
 
     include_delisted=False исключает пару с оборванной историей из области
     исследования — явно и с пометкой excluded, а не молча (иначе отказ от
@@ -190,62 +314,107 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
     results: list[IngestResult] = []
     months = month_range(start, end)
 
-    bar_frames, bar_files, missing, dropped = [], 0, 0, 0
+    bar_frames: list[pd.DataFrame] = []
     present: list[str] = []
+    downloaded_periods: list[str] = []
+    downloaded = skipped = missing = dropped = skipped_rows = 0
+
     for period in months:
+        if not force:
+            rows_on_disk = parquet_row_count(bars_path(root, symbol, freq, period))
+            if rows_on_disk is not None:
+                # Валидный непустой parquet — месяц уже загружен, сеть не нужна.
+                skipped += 1
+                skipped_rows += rows_on_disk
+                present.append(period)
+                continue
         try:
-            raw = _download(archive_url(market, "klines", symbol, freq, period))
+            raw = _download(archive_url(market, "klines", symbol, freq, period),
+                            retries=retries, base_delay=retry_base_delay)
         except requests.RequestException as exc:
-            results.append(IngestResult(symbol, "klines", 0, 0, "", str(exc)))
+            results.append(IngestResult(
+                symbol, "klines", 0, skipped_rows, "", str(exc),
+                skipped=skipped, missing=missing))
             return results
         if raw is None:
             missing += 1
             continue
         present.append(period)
+        downloaded_periods.append(period)
+        downloaded += 1
         stats: dict[str, int] = {}
         bar_frames.append(parse_kline_csv(raw, stats=stats))
         dropped += stats["dropped_rows"]
 
-    if bar_frames:
-        bars = pd.concat(bar_frames, ignore_index=True)
+    bars = pd.concat(bar_frames, ignore_index=True) if bar_frames else None
+    last_bar_ts: pd.Timestamp | None = None
+    if bars is not None and present and present[-1] in downloaded_periods:
         last_bar_ts = pd.Timestamp(pd.to_datetime(bars["ts"], utc=True).max())
-        delisted = _is_truncated(months, present, last_bar_ts,
-                                 pd.Timestamp.now(tz="UTC"))
-        if delisted and not include_delisted:
-            results.append(IngestResult(
-                symbol, "klines", 0, 0,
-                "исключён: include_delisted=false, история обрывается раньше "
-                f"периода (последний бар {last_bar_ts:%Y-%m-%d %H:%M} UTC); "
-                "отказ от делистингованных пар создаёт ошибку выживаемости",
-                delisted=True, last_bar_ts=last_bar_ts, excluded=True))
-            return results
+    elif present:
+        # Последний присутствующий месяц не перекачивался: его максимум ts
+        # читается с диска (одна колонка). Иначе last_bar_ts оказался бы раньше
+        # реального конца ряда, и пара ложно выглядела бы делистингованной.
+        last_bar_ts = _parquet_max_ts(
+            bars_path(root, symbol, freq, present[-1]))
+
+    delisted = bool(present) and last_bar_ts is not None and _is_truncated(
+        months, present, last_bar_ts, pd.Timestamp.now(tz="UTC"))
+    if delisted and not include_delisted:
+        results.append(IngestResult(
+            symbol, "klines", 0, 0,
+            "исключён: include_delisted=false, история обрывается раньше "
+            f"периода (последний бар {last_bar_ts:%Y-%m-%d %H:%M} UTC); "
+            "отказ от делистингованных пар создаёт ошибку выживаемости",
+            skipped=skipped, missing=missing,
+            delisted=True, last_bar_ts=last_bar_ts, excluded=True))
+        return results
+
+    total_rows = (len(bars) if bars is not None else 0) + skipped_rows
+    if bars is not None:
         bar_files = len(write_bars(bars, root, symbol, freq))
         rep = check_bars(normalize_bars(bars), freq)
         detail = rep.summary()
-        if dropped:
-            # Отброшенные бары не проглатываем: они видны в отчёте.
-            detail += f"; отброшено строк: {dropped}"
+        detail += f"; скачано месяцев: {downloaded}"
+        if skipped:
+            # Пропуск по resume виден: иначе «ок» скрывал бы, что месяц не качался.
+            detail += f"; уже в хранилище: {skipped}"
         if missing:
             # 404 — норма для ранних месяцев, но оператор должен видеть масштаб.
             detail += f"; пропущено месяцев: {missing}"
+        if dropped:
+            # Отброшенные бары не проглатываем: они видны в отчёте.
+            detail += f"; отброшено строк: {dropped}"
         if delisted:
             # Пара остаётся в юниверсе (spec 5), но обрыв истории виден.
             detail += ("; история обрывается раньше периода "
                        f"(делистинг/обрезка): последний бар "
                        f"{last_bar_ts:%Y-%m-%d %H:%M} UTC")
-        results.append(IngestResult(symbol, "klines", bar_files, len(bars),
+        results.append(IngestResult(symbol, "klines", bar_files, total_rows,
                                     detail, dropped_rows=dropped,
+                                    skipped=skipped, missing=missing,
+                                    delisted=delisted, last_bar_ts=last_bar_ts))
+    elif skipped:
+        # Все месяцы уже в хранилище: это успех, а не «нет файлов». Строки
+        # считаются по метаданным parquet, чтобы отчёт не показывал ноль.
+        detail = (f"OK: данные уже в хранилище (месяцев: {skipped}); "
+                  f"скачано месяцев: 0; проверка качества не выполнялась")
+        if missing:
+            detail += f"; пропущено месяцев: {missing}"
+        results.append(IngestResult(symbol, "klines", 0, total_rows, detail,
+                                    skipped=skipped, missing=missing,
                                     delisted=delisted, last_bar_ts=last_bar_ts))
     else:
         results.append(IngestResult(symbol, "klines", 0, 0, "",
-                                    f"нет файлов за {len(months)} мес."))
+                                    f"нет файлов за {len(months)} мес.",
+                                    missing=missing))
 
     if with_funding:
         fund_frames = []
         for period in months:
             try:
                 raw = _download(archive_url(market, "fundingRate", symbol, None,
-                                            period))
+                                            period),
+                                retries=retries, base_delay=retry_base_delay)
             except requests.RequestException as exc:
                 # Сбой funding не должен уносить с собой уже загруженные klines.
                 results.append(IngestResult(symbol, "funding", 0, 0, "", str(exc)))
@@ -263,7 +432,10 @@ def ingest_symbol(symbol: str, freq: str, start: str, end: str | None,
     return results
 
 
-def ingest_universe(universe, freq: str, root: Path = DEFAULT_ROOT
+def ingest_universe(universe, freq: str, root: Path = DEFAULT_ROOT,
+                    force: bool = False,
+                    retries: int = DEFAULT_RETRIES,
+                    retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY
                     ) -> list[IngestResult]:
     out: list[IngestResult] = []
     # getattr: юниверс может быть duck-typed (тесты), дефолт spec 5 — true.
@@ -272,7 +444,9 @@ def ingest_universe(universe, freq: str, root: Path = DEFAULT_ROOT
         try:
             out.extend(ingest_symbol(symbol, freq, universe.start, universe.end,
                                      root=root, market=universe.market,
-                                     include_delisted=include_delisted))
+                                     include_delisted=include_delisted,
+                                     force=force, retries=retries,
+                                     retry_base_delay=retry_base_delay))
         except Exception as exc:
             # Изоляция символов: один сбойный символ не должен уносить с собой
             # отчёт по остальным — цикл обязан дойти до последнего.

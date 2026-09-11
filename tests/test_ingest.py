@@ -96,7 +96,8 @@ def test_parse_kline_reports_dropped_nan_price_rows():
 def test_ingest_reports_dropped_rows(tmp_path, monkeypatch):
     import alpha_lab.data.ingest as ingest_module
 
-    monkeypatch.setattr(ingest_module, "_download", lambda url: KLINE_WITH_NAN_PRICE)
+    monkeypatch.setattr(ingest_module, "_download",
+                        lambda url, **kwargs: KLINE_WITH_NAN_PRICE)
     results = ingest_module.ingest_symbol(
         "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path, with_funding=False)
 
@@ -131,7 +132,7 @@ def test_parse_kline_reports_dropped_nat_timestamp_rows():
 def test_funding_download_error_is_isolated(tmp_path, monkeypatch):
     import alpha_lab.data.ingest as ingest_module
 
-    def fake_download(url):
+    def fake_download(url, **kwargs):
         if "fundingRate" in url:
             raise requests.RequestException("funding timeout")
         return KLINE_WITH_HEADER
@@ -181,7 +182,7 @@ def test_ingest_reports_missing_months(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         ingest_module, "_download",
-        lambda url: None if "2024-02" in url else KLINE_WITH_HEADER)
+        lambda url, **kwargs: None if "2024-02" in url else KLINE_WITH_HEADER)
     results = ingest_module.ingest_symbol(
         "BTCUSDT", "1m", "2024-01-01", "2024-02-29", tmp_path, with_funding=False)
 
@@ -211,7 +212,7 @@ def _download_by_month(available: dict[str, bytes]):
     """Подменяет _download: отдаёт файл только для перечисленных месяцев."""
     import re
 
-    def download(url: str):
+    def download(url: str, **kwargs):
         if "fundingRate" in url:
             return None
         match = re.search(r"(\d{4}-\d{2})\.zip", url)
@@ -320,3 +321,310 @@ def test_ingest_universe_passes_include_delisted(tmp_path, monkeypatch):
 
     assert excluded[0].excluded and excluded[0].rows == 0
     assert kept[0].delisted and not kept[0].excluded and kept[0].rows > 0
+
+
+class _FakeResponse:
+    """Минимальный ответ requests: тесты не выходят в сеть."""
+
+    def __init__(self, status_code: int = 200, content: bytes = b"",
+                 headers: dict | None = None):
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(
+                f"{self.status_code} Client Error", response=self)
+
+
+def test_download_retries_transient_timeout(monkeypatch):
+    """Read timed out — временный сбой: повтор, а не потеря символа."""
+    import alpha_lab.data.ingest as ingest_module
+
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append(url)
+        if len(calls) < 3:
+            raise requests.Timeout("read timed out")
+        return _FakeResponse(200, KLINE_WITH_HEADER)
+
+    sleeps = []
+    monkeypatch.setattr(ingest_module.requests, "get", fake_get)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+
+    raw = ingest_module._download("http://example.test/x.zip",
+                                  retries=3, base_delay=0.1)
+
+    assert raw == KLINE_WITH_HEADER
+    assert len(calls) == 3
+    # Пауза только между попытками: после успеха спать нечего.
+    assert len(sleeps) == 2
+
+
+def test_download_persistent_timeout_fails_after_bounded_attempts(
+        tmp_path, monkeypatch):
+    """Мёртвый эндпоинт обязан упасть за конечное число попыток, отдав ошибку."""
+    import alpha_lab.data.ingest as ingest_module
+
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append(url)
+        raise requests.Timeout("read timed out")
+
+    monkeypatch.setattr(ingest_module.requests, "get", fake_get)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    results = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-03-31", tmp_path,
+        with_funding=False, retries=2, retry_base_delay=0.1)
+
+    assert len(results) == 1
+    assert not results[0].ok
+    assert "read timed out" in results[0].error
+    # 1 исходная попытка + 2 повтора; дальше ошибка обязана всплыть наружу.
+    assert len(calls) == 3
+
+
+def test_download_retries_5xx(monkeypatch):
+    """5xx — временный сбой сервера: повторяем."""
+    import alpha_lab.data.ingest as ingest_module
+
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append(url)
+        if len(calls) == 1:
+            return _FakeResponse(503)
+        return _FakeResponse(200, KLINE_WITH_HEADER)
+
+    monkeypatch.setattr(ingest_module.requests, "get", fake_get)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    raw = ingest_module._download("http://example.test/x.zip",
+                                  retries=2, base_delay=0)
+
+    assert raw == KLINE_WITH_HEADER
+    assert len(calls) == 2
+
+
+def test_download_404_is_not_retried(monkeypatch):
+    """404 — «месяца ещё нет»: норма, повтор тратил бы минуты на полном прогоне."""
+    import alpha_lab.data.ingest as ingest_module
+
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append(url)
+        return _FakeResponse(404)
+
+    monkeypatch.setattr(ingest_module.requests, "get", fake_get)
+    monkeypatch.setattr("time.sleep",
+                        lambda seconds: pytest.fail("404 повторять нельзя"))
+
+    assert ingest_module._download("http://example.test/gone.zip") is None
+    assert len(calls) == 1
+
+
+def test_download_429_honours_retry_after(monkeypatch):
+    """429 с Retry-After: пауза берётся из заголовка, а не из догадки."""
+    import alpha_lab.data.ingest as ingest_module
+
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append(url)
+        if len(calls) == 1:
+            return _FakeResponse(429, headers={"Retry-After": "2"})
+        return _FakeResponse(200, KLINE_WITH_HEADER)
+
+    sleeps = []
+    monkeypatch.setattr(ingest_module.requests, "get", fake_get)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+
+    raw = ingest_module._download("http://example.test/x.zip",
+                                  retries=2, base_delay=0.1)
+
+    assert raw == KLINE_WITH_HEADER
+    assert len(calls) == 2
+    assert sleeps[0] == pytest.approx(2.0, abs=0.05)
+
+
+def test_download_retry_after_is_bounded(monkeypatch):
+    """Чужой Retry-After не должен вешать прогон на часы."""
+    import alpha_lab.data.ingest as ingest_module
+
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append(url)
+        if len(calls) == 1:
+            return _FakeResponse(429, headers={"Retry-After": "100000"})
+        return _FakeResponse(200, KLINE_WITH_HEADER)
+
+    sleeps = []
+    monkeypatch.setattr(ingest_module.requests, "get", fake_get)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+
+    raw = ingest_module._download("http://example.test/x.zip",
+                                  retries=1, base_delay=0.1)
+
+    assert raw == KLINE_WITH_HEADER
+    assert 0 < sleeps[0] <= ingest_module.MAX_RETRY_AFTER
+
+
+def test_download_retry_is_logged_to_stderr(monkeypatch, capsys):
+    """Долгий прогон обязан быть диагностируемым: URL, попытка, ошибка."""
+    import alpha_lab.data.ingest as ingest_module
+
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.Timeout("read timed out")
+        return _FakeResponse(200, KLINE_WITH_HEADER)
+
+    monkeypatch.setattr(ingest_module.requests, "get", fake_get)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    ingest_module._download("http://example.test/x.zip", retries=2, base_delay=0)
+
+    err = capsys.readouterr().err
+    assert "http://example.test/x.zip" in err
+    assert "1/3" in err
+    assert "Timeout" in err
+    assert err.count("[retry]") == 1
+
+
+def test_ingest_skips_months_already_in_lake(tmp_path, monkeypatch):
+    """Повторный прогон не перекачивает уже лежащие месяцы."""
+    import alpha_lab.data.ingest as ingest_module
+
+    monkeypatch.setattr(ingest_module, "_download",
+                        _download_by_month({"2024-01": _kline_month("2024-01")}))
+    first = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path, with_funding=False)
+    assert first[0].ok and first[0].files == 1 and first[0].skipped == 0
+
+    def forbid(url, **kwargs):
+        raise AssertionError(f"месяц уже в хранилище, повторная загрузка: {url}")
+
+    monkeypatch.setattr(ingest_module, "_download", forbid)
+    second = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path, with_funding=False)
+
+    result = second[0]
+    assert result.ok
+    assert result.files == 0 and result.skipped == 1
+    assert result.rows == 1
+    assert "уже в хранилище" in result.quality
+
+
+def test_ingest_partial_resume_downloads_only_absent_month(tmp_path, monkeypatch):
+    """Докачивается только отсутствующий месяц, а не весь период символа."""
+    import alpha_lab.data.ingest as ingest_module
+
+    monkeypatch.setattr(ingest_module, "_download",
+                        _download_by_month({"2024-01": _kline_month("2024-01")}))
+    ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-02-29", tmp_path, with_funding=False)
+
+    requested: list[str] = []
+    full = _download_by_month({"2024-01": _kline_month("2024-01"),
+                               "2024-02": _kline_month("2024-02")})
+
+    def recording(url, **kwargs):
+        import re
+
+        requested.append(re.search(r"(\d{4}-\d{2})\.zip", url).group(1))
+        return full(url)
+
+    monkeypatch.setattr(ingest_module, "_download", recording)
+    result = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-02-29", tmp_path, with_funding=False)[0]
+
+    assert result.ok
+    assert requested == ["2024-02"]
+    assert result.skipped == 1 and result.files == 1
+    assert result.rows == 2 and result.missing == 0
+
+
+def test_ingest_force_redownloads_present_months(tmp_path, monkeypatch):
+    """force=True — явный перекач поверх уже лежащего (смена схемы, порча)."""
+    import alpha_lab.data.ingest as ingest_module
+
+    available = {"2024-01": _kline_month("2024-01")}
+    monkeypatch.setattr(ingest_module, "_download", _download_by_month(available))
+    ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path, with_funding=False)
+
+    calls = []
+
+    def recording(url, **kwargs):
+        calls.append(url)
+        return _download_by_month(available)(url)
+
+    monkeypatch.setattr(ingest_module, "_download", recording)
+    result = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path, with_funding=False,
+        force=True)[0]
+
+    assert result.ok
+    assert len(calls) == 1
+    assert result.files == 1 and result.skipped == 0
+
+
+@pytest.mark.parametrize("damaged", [b"", b"ne-tot-parquet\n\x00\x01"])
+def test_ingest_does_not_trust_damaged_month_file(tmp_path, monkeypatch, damaged):
+    """Существующий файл != дописанный: нулевой/битый перекачивается.
+
+    write_bars пишет parquet прямо по конечному пути, поэтому обрыв процесса
+    оставляет усечённый файл; считать его «месяц уже загружен» нельзя.
+    """
+    import alpha_lab.data.ingest as ingest_module
+
+    path = tmp_path / "bars" / "BTCUSDT" / "1m" / "BTCUSDT-1m-2024-01.parquet"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(damaged)
+
+    calls = []
+
+    def fake_download(url, **kwargs):
+        calls.append(url)
+        return _kline_month("2024-01")
+
+    monkeypatch.setattr(ingest_module, "_download", fake_download)
+    result = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path, with_funding=False)[0]
+
+    assert len(calls) == 1
+    assert result.ok and result.files == 1 and result.skipped == 0
+    assert path.stat().st_size > 0
+
+
+def test_ingest_result_distinguishes_downloaded_skipped_missing(tmp_path,
+                                                                 monkeypatch):
+    """В отчёте видны все четыре категории, а не только «ок»."""
+    import alpha_lab.data.ingest as ingest_module
+
+    monkeypatch.setattr(ingest_module, "_download",
+                        _download_by_month({"2024-01": _kline_month("2024-01")}))
+    ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-01-31", tmp_path, with_funding=False)
+
+    # 2024-01 уже есть (skip), 2024-02 отсутствует в архиве (404),
+    # 2024-03 скачивается.
+    available = {"2024-01": _kline_month("2024-01"),
+                 "2024-03": _kline_month("2024-03")}
+    monkeypatch.setattr(ingest_module, "_download", _download_by_month(available))
+    result = ingest_module.ingest_symbol(
+        "BTCUSDT", "1m", "2024-01-01", "2024-03-31", tmp_path, with_funding=False)[0]
+
+    assert result.ok
+    assert result.files == 1 and result.skipped == 1 and result.missing == 1
+    assert "скачано месяцев: 1" in result.quality
+    assert "уже в хранилище: 1" in result.quality
+    assert "пропущено месяцев: 1" in result.quality
