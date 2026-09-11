@@ -63,15 +63,32 @@ def count_prior_trials(journal: Path, key: dict) -> int:
     if not journal.exists():
         return 0
     fingerprint = json.dumps(key, sort_keys=True, ensure_ascii=False)
+    try:
+        # errors="replace": один битый байт (обрыв записи при падении процесса)
+        # не должен ронять весь прогон — испорченная строка просто пропустится.
+        text = journal.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        # Журнал нечитаем целиком (каталог на месте файла, нет прав). Падать
+        # нельзя — это черновик, а не входные данные. Но и молчать нельзя: ноль
+        # попыток завышает DSR, поэтому честно предупреждаем о занижении.
+        print(f"Предупреждение: журнал попыток нечитаем ({exc}); "
+              f"считаю, что попыток не было — DSR может быть завышен",
+              file=sys.stderr)
+        return 0
     count = 0
-    for line in journal.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
-            if json.dumps(json.loads(line)["key"], sort_keys=True,
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                continue
+            if json.dumps(record["key"], sort_keys=True,
                           ensure_ascii=False) == fingerprint:
                 count += 1
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
+            # Валидный JSON не-объект (null/[]/123/"x"), обрыв объекта или
+            # запись без "key" — строку пропускаем, счёт остальных не теряем.
             continue
     return count
 
@@ -129,6 +146,10 @@ def _cmd_validate(args) -> int:
         "experiment": exp.name, "strategy": exp.strategy, "params": exp.params,
         "timeframe": exp.timeframe, "start": exp.start, "end": exp.end,
         "costs": exp.costs,
+        # Пороги валидации — часть гипотезы: без них два прогона с разными
+        # min_trades делят id, отчёт второго молча затирает первый, а журнал
+        # считает их одной попыткой.
+        "validation": exp.validation,
     }
     exp_id = experiment_id(cfg_payload, dv, git_hash())
 
@@ -185,10 +206,6 @@ def _cmd_validate(args) -> int:
         price_returns=result.price_returns, positions=result.positions,
     )
 
-    log_trial(journal, trial_key, exp_id,
-              {"sharpe": verdict.sharpe, "dsr": verdict.dsr,
-               "alive": verdict.alive})
-
     payload = build_report(
         verdict, equity=result.equity, close=bars["close"],
         positions=result.positions, costs=result.costs, price_bars=bars,
@@ -204,6 +221,13 @@ def _cmd_validate(args) -> int:
     )
     out = Path(args.out) if args.out else Path("reports") / exp_id
     json_path, _ = write_report(payload, out)
+
+    # Журнал — только после успешного отчёта: если запись отчёта упала,
+    # незавершённый прогон не должен остаться в журнале и завысить n_trials
+    # следующего запуска (это молча усилило бы штраф DSR).
+    log_trial(journal, trial_key, exp_id,
+              {"sharpe": verdict.sharpe, "dsr": verdict.dsr,
+               "alive": verdict.alive})
 
     status = "ЖИВА" if verdict.alive else "МЕРТВА"
     print(f"\n{'=' * 62}")

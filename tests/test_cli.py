@@ -127,6 +127,40 @@ def test_experiment_id_ignores_key_order():
            experiment_id({"b": 2, "a": 1}, "d", "g")
 
 
+def test_experiment_id_includes_validation(tmp_path, monkeypatch):
+    """Пороги валидации — часть гипотезы, а не оформление.
+
+    Иначе два прогона с разными min_trades делят experiment_id: второй молча
+    перезапишет отчёт первого, а журнал сочтёт их одной попыткой.
+    """
+    _, e1 = _write_configs(tmp_path)
+    e2 = tmp_path / "exp2.yaml"
+    e2.write_text(
+        e1.read_text(encoding="utf-8").replace(
+            "validation: {min_trades: 1}", "validation: {min_trades: 999}"),
+        encoding="utf-8")
+
+    seen: list[dict] = []
+    real = cli.experiment_id
+
+    def spy(cfg, dv, gh):
+        seen.append(cfg)
+        return real(cfg, dv, gh)
+
+    monkeypatch.setattr(cli, "experiment_id", spy)
+    for config in (e1, e2):
+        # Данных нет намеренно: experiment_id считается до чтения баров,
+        # поэтому тесту не нужен полный бэктест.
+        assert main(["validate", "--config", str(config), "--data-root",
+                     str(tmp_path / "no_data"), "--out",
+                     str(tmp_path / "out")]) == 2
+
+    assert len(seen) == 2
+    assert seen[0] != seen[1]              # RED без validation в нагрузке
+    assert "validation" in seen[0]
+    assert real(seen[0], "d", "g") != real(seen[1], "d", "g")
+
+
 def test_validate_command_writes_report(tmp_path, capsys):
     root = tmp_path / "data"
     _write_fixture_data(root)
@@ -220,6 +254,46 @@ def test_repeated_runs_increment_n_trials(tmp_path):
     assert trials == [1, 2, 3, 4]
 
 
+def test_validate_survives_corrupt_journal(tmp_path):
+    """Битый журнал не роняет прогон: валидные строки вокруг мусора считаются."""
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    journal = tmp_path / "trials.jsonl"
+    key = {"strategy": "mean_reversion", "params": PARAMS,
+           "symbol": "BTCUSDT", "timeframe": "1h"}
+    record = json.dumps({"key": key, "experiment_id": "x"}).encode()
+    # Первой идёт строка с невалидным UTF-8: она проверяет, что чтение файла
+    # не падает ещё до разбора строк.
+    journal.write_bytes(b"\n".join([
+        record, b"\xff\xfe", b"null", b'{"key": "mean', b"[]", record,
+    ]) + b"\n")
+
+    out = tmp_path / "out"
+    assert _run_validate(root, u, e, out, journal) == 0
+
+    payload = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    # Две валидные записи + текущий прогон; мусор пропущен.
+    assert payload["verdict"]["n_configs_tried"] == 3
+
+
+def test_failed_report_write_leaves_journal_unchanged(tmp_path, monkeypatch):
+    """Журнал пишется после отчёта: иначе упавшая запись оставит фантомную попытку."""
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+    journal = tmp_path / "trials.jsonl"
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("диск полон")
+
+    monkeypatch.setattr(cli, "write_report", boom)
+    with pytest.raises(RuntimeError):
+        _run_validate(root, u, e, tmp_path / "out", journal)
+
+    assert not journal.exists()
+
+
 def test_count_prior_trials_counts_only_same_key(tmp_path):
     journal = tmp_path / "trials.jsonl"
     key = {"strategy": "mean_reversion", "params": PARAMS,
@@ -242,6 +316,53 @@ def test_count_prior_trials_counts_only_same_key(tmp_path):
     with journal.open("a", encoding="utf-8") as fh:
         fh.write("не json\n")
     assert count_prior_trials(journal, key) == 2
+
+
+def test_count_prior_trials_skips_malformed_lines(tmp_path):
+    """Любой мусор в журнале пропускается, валидные строки вокруг — считаются.
+
+    Журнал — append-only черновик: его может оборвать упавший процесс или
+    правка руками. Валидный JSON не-объект (null/[]/123/"x"), обрыв объекта и
+    невалидный UTF-8 не имеют права ни уронить прогон, ни обнулить счётчик.
+    """
+    journal = tmp_path / "trials.jsonl"
+    key = {"strategy": "mean_reversion", "params": PARAMS,
+           "symbol": "BTCUSDT", "timeframe": "1h"}
+    other = {**key, "params": {"window": 30, "k": 2.0}}
+    good_key = json.dumps({"key": key, "experiment_id": "e1"}).encode()
+    good_other = json.dumps({"key": other, "experiment_id": "e2"}).encode()
+    journal.write_bytes(b"\n".join([
+        good_key,
+        b"null",                          # валидный JSON, но не объект
+        b"[]",
+        b"123",
+        b'"x"',
+        b'{"key": "mean_reversion", "params":',   # обрыв объекта
+        b"\xff\xfe",                      # не UTF-8
+        b'{"key": "\xff"}',               # валидный JSON с битым байтом внутри
+        good_other,
+        good_key,
+    ]) + b"\n")
+
+    assert count_prior_trials(journal, key) == 2
+    assert count_prior_trials(journal, other) == 1
+
+
+def test_unreadable_journal_warns_and_counts_zero(tmp_path, capsys):
+    """Нечитаемый журнал — не повод падать, но и не повод молчать.
+
+    Молчаливый ноль занижает число попыток и тем завышает DSR, поэтому CLI
+    обязан явно предупредить пользователя.
+    """
+    journal = tmp_path / "journal_is_a_dir"
+    journal.mkdir()
+    key = {"strategy": "mean_reversion", "params": PARAMS}
+
+    assert count_prior_trials(journal, key) == 0
+
+    err = capsys.readouterr().err
+    assert "Предупреждение" in err
+    assert "нечитаем" in err
 
 
 def test_dirty_bar_targets_are_forced_flat(tmp_path, capsys):
