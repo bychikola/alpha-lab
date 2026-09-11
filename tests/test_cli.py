@@ -1268,6 +1268,45 @@ def _run_validate_extra(root: Path, u: Path, e: Path, out: Path,
                  "--journal", str(journal), *extra])
 
 
+def test_same_journal_state_gives_same_verdict(tmp_path):
+    """Критерий 7: воспроизводимость — при одинаковом состоянии журнала.
+
+    Бит-в-бит report.json не воспроизводится и не может: generated_at — метка
+    времени, а n_trials берётся из журнала и растёт с каждым прогоном, меняя
+    DSR (у границы — и alive). Гарантия честнее и уже: при идентичных входах,
+    версии данных и состоянии журнала совпадает ВЕРДИКТ (alive, метрики,
+    причины, предупреждения) и все ряды; различается только generated_at.
+    Оба прогона идут с чистым журналом — то есть в одном состоянии.
+    """
+    root = tmp_path / "data"
+    _write_fixture_data(root)
+    u, e = _write_configs(tmp_path, root)
+
+    payloads = []
+    for i in range(2):
+        out = tmp_path / f"out{i}"
+        journal = tmp_path / f"trials{i}.jsonl"     # свежий журнал на прогон
+        assert _run_validate(root, u, e, out, journal) == 0
+        payloads.append(json.loads((out / "report.json").read_text(encoding="utf-8")))
+    first, second = payloads
+
+    # Метка времени различается by design — это и есть единственное отличие.
+    assert first["generated_at"] != second["generated_at"]
+
+    first.pop("generated_at")
+    second.pop("generated_at")
+    # Полное равенство после снятия метки: вердикт, extra и все ряды.
+    assert first == second
+
+    # Несущие поля перечислены явно, чтобы падение было локализуемым.
+    for key in ("alive", "metrics", "reasons", "warnings", "sharpe", "dsr",
+                "p_value", "max_dd", "total_return", "trades",
+                "n_configs_tried"):
+        assert first["verdict"][key] == second["verdict"][key], key
+    for key, series in first["series"].items():
+        assert len(series) == len(second["series"][key]), key
+
+
 def test_non_causal_strategy_blocks_verdict_before_backtest(tmp_path,
                                                             monkeypatch, capsys):
     """Стратегия без причинности не получает вердикта, и бэктест не запускается.
