@@ -259,13 +259,14 @@ plotshape(showExit and fExited and fExitKind == 1 ? fExitP : na, "Выход с�
 plotshape(showExit and fExited and fExitKind == 2 ? fExitP : na, "Выход тейк", shape.xcross, location.absolute, color.new(color.green, 0), size=size.tiny)
 plotshape(showExit and fExited and fExitKind == 3 ? fExitP : na, "Выход время", shape.circle, location.absolute, color.new(color.gray, 0), size=size.tiny)
 
-// Линии защиты активной позиции.
+// Линии активной позиции: цена входа, стоп, тейк.
 //
 // ВАЖНО: line.new создаёт НОВУЮ линию, а старая остаётся на графике навсегда.
-// Без удаления за 70 сделок накапливается 140 пунктирных линий от давно
-// закрытых позиций, и график превращается в кашу. Поэтому линии живут ровно
-// столько, сколько открыта позиция: появились на входе, тянутся по барам,
-// удаляются на выходе.
+// Без удаления за 70 сделок накапливаются сотни линий от давно закрытых
+// позиций, и график превращается в кашу. Поэтому линии живут ровно столько,
+// сколько открыта позиция: появились на входе, тянутся по барам, удаляются
+// на выходе.
+var line lnEN = na
 var line lnSL = na
 var line lnTP = na
 
@@ -274,21 +275,29 @@ if showLevels
         // Позиции нет — линий быть не должно. Ветка самовосстанавливающаяся:
         // если линия почему-то осталась (например, вход и выход на одном баре
         // не дошли до создания), она будет удалена здесь.
-        if not na(lnSL)
+        if not na(lnEN)
+            line.set_x2(lnEN, bar_index)
             line.set_x2(lnSL, bar_index)
             line.set_x2(lnTP, bar_index)
+            line.delete(lnEN)
             line.delete(lnSL)
             line.delete(lnTP)
+            lnEN := na
             lnSL := na
             lnTP := na
     else if fEnteredLong or fEnteredShort
+        // Цена входа — сплошная линия по центру: стоп и тейк отмеряются от
+        // неё, и без неё непонятно, где именно точка отсчёта.
+        lnEN := line.new(bar_index, gEntryP, bar_index + 1, gEntryP, color=color.new(color.white, 25), width=1, style=line.style_dotted)
         lnSL := line.new(bar_index, gStopP, bar_index + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
         lnTP := line.new(bar_index, gTakeP, bar_index + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
-    else if not na(lnSL)
+    else if not na(lnEN)
+        line.set_x2(lnEN, bar_index + 1)
         line.set_x2(lnSL, bar_index + 1)
         line.set_x2(lnTP, bar_index + 1)
     else
         // Позиция открыта, а линий нет — восстановим по текущим уровням.
+        lnEN := line.new(bar_index, gEntryP, bar_index + 1, gEntryP, color=color.new(color.white, 25), width=1, style=line.style_dotted)
         lnSL := line.new(bar_index, gStopP, bar_index + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
         lnTP := line.new(bar_index, gTakeP, bar_index + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
 
