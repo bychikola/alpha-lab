@@ -60,16 +60,28 @@ always-hold: при неположительном среднем ставки �
 (test_always_hold_limit_is_exact_and_not_reachable_by_finite_params).
 
 Контракт «вошёл — держи — вышел» (ограничение S2). Стратегия не ребалансирует
-книгу и не разворачивает carry: целевые значения — только 0 и −1, gross —
-только 0 и 2, поэтому каждая заявка — это ровно вход или выход. Ограничение
-намеренное: magnitude-база издержек `|Δgross|` (S1) не видит встречного
-движения ног (спот 1.5 → 1.2, перп −0.5 → −0.2: net и gross стоят, а 0.6
-ноционала торгуется) и не заряжает прямой разворот carry −1 → +1 (4 единицы
-оборота). Это известное ограничение МОДЕЛИ ДВИЖКА, а не свойство стратегии;
-S2 обходит его тем, что никогда не ребалансирует, а закрепивший его тест
-(`test_magnitude_gross_undercount_is_pinned`) обязан упасть, если движок
-когда-нибудь «починят» иначе. Вариант стратегии с ребалансировкой обязан
-сначала пересмотреть модель издержек.
+книгу и не разворачивает carry: целевые значения — только 0 и −notional,
+gross — только 0 и 2·notional, поэтому каждая заявка — это ровно вход или
+выход. Ограничение намеренное: magnitude-база издержек `|Δgross|` (S1) не
+видит встречного движения ног (спот 1.5 → 1.2, перп −0.5 → −0.2: net и gross
+стоят, а 0.6 ноционала торгуется) и не заряжает прямой разворот carry
+−1 → +1 (4 единицы оборота). Это известное ограничение МОДЕЛИ ДВИЖКА, а не
+свойство стратегии; S2 обходит его тем, что никогда не ребалансирует, а
+закрепивший его тест (`test_magnitude_gross_undercount_is_pinned`) обязан
+упасть, если движок когда-нибудь «починят» иначе. Вариант стратегии с
+ребалансировкой обязан сначала пересмотреть модель издержек.
+
+Фиксированный ноционал `notional` — размер плеча для кросс-секционного
+портфеля (E2). Портфель — это N независимых плеч равного бюджета: символ
+входит в книгу и выходит из неё целиком, а размер уже открытой книги не
+меняется никогда. `notional` задаёт ровно этот размер в единицах счёта плеча
+(carry = −notional при сигнале, gross = 2·notional); дефолт 1.0 сохраняет
+поведение S1/S2 побитово. Менять размер внутри удержания запрещено: движок
+оценивает оборот как |Δgross| и не увидел бы такого изменения. Порог
+окупаемости от ноционала не зависит — и funding, и издержки масштабируются им
+одинаково, — поэтому размер плеча не является параметром правила входа: в
+портфеле он выбирается из модели капитала (доля плеча, которую занимает
+книга), а не по результату.
 
 Единица сделки — открытый вопрос S4. net ≡ 0, поэтому `trade_returns` не
 видит ни одной направленной сделки, и `min_trades ≥ 100` провалит такой
@@ -111,6 +123,9 @@ DEFAULTS = {
     # None — априорный порог окупаемости; число задаёт порог напрямую,
     # ±inf — пределы «держать всегда» / «не входить никогда» (см. docstring).
     "threshold_rate": None,
+    # Размер плеча в единицах его счёта: carry = −notional, gross = 2·notional
+    # (см. docstring, раздел о фиксированном ноционале). 1.0 — поведение S1/S2.
+    "notional": 1.0,
 }
 
 # Оборот круглого рейса в единицах |carry|: вход gross=2 и выход gross=2.
@@ -130,6 +145,24 @@ def _non_negative_float(value, name: str) -> float:
     if not np.isfinite(number) or number < 0.0:
         raise ValueError(
             f"{name} должен быть конечным неотрицательным числом, "
+            f"получено {value!r}"
+        )
+    return number
+
+
+def _positive_float(value, name: str) -> float:
+    """Конечное строго положительное число; bool — не число, а флаг.
+
+    Ноль отвергается: книга нулевого размера — это молчаливое «никогда не
+    торговать», которое обязано быть явным (threshold_rate=+inf), а не
+    следствием размера плеча.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} должен быть числом, получено {value!r}")
+    number = float(value)
+    if not np.isfinite(number) or number <= 0.0:
+        raise ValueError(
+            f"{name} должен быть конечным положительным числом, "
             f"получено {value!r}"
         )
     return number
@@ -162,8 +195,10 @@ class FundingHarvestStrategy(TwoLegStrategy):
     """Дельта-нейтральный сбор funding по режиму ставки.
 
     Решение — общее на все три базы (см. модульный docstring): net ≡ 0,
-    gross = 2·|carry|, carry = −1, пока скользящее среднее ставки выше порога
-    окупаемости, и 0 иначе.
+    gross = 2·|carry|, carry = −notional, пока скользящее среднее ставки выше
+    порога окупаемости, и 0 иначе. Notional — фиксированный размер плеча
+    кросс-секционного портфеля (дефолт 1.0 — поведение S1/S2), а не параметр
+    правила входа: решение от него не зависит.
     """
 
     name = "funding_harvest"
@@ -180,6 +215,7 @@ class FundingHarvestStrategy(TwoLegStrategy):
         self.slippage_bps = _non_negative_float(cfg["slippage_bps"], "slippage_bps")
         self.threshold_rate = _threshold_override(
             cfg["threshold_rate"], "threshold_rate")
+        self.notional = _positive_float(cfg["notional"], "notional")
         self.params = cfg
 
     @property
@@ -233,14 +269,19 @@ class FundingHarvestStrategy(TwoLegStrategy):
             # стоим. rolling смотрит только назад, поэтому решение причинно.
             trailing = rate.rolling(self.window, min_periods=self.window).mean()
             in_book = (trailing > threshold).to_numpy()
+        # Размер плеча фиксирован: целевые carry/gross принимают ровно два
+        # значения, 0 и −notional / 2·notional. Вход/выход соседнего символа
+        # портфеля не меняет это число — иначе изменение размера внутри книги
+        # движок (magnitude-базис издержек) не увидел бы вовсе.
+        w = self.notional
         index = bars.index
         zero = pd.Series(0.0, index=index, name="net")
         return PositionLegs(
             net=zero,
             gross=pd.Series(
-                np.where(in_book, 2.0, 0.0), index=index, name="gross"),
+                np.where(in_book, 2.0 * w, 0.0), index=index, name="gross"),
             carry=pd.Series(
-                np.where(in_book, -1.0, 0.0), index=index, name="carry"),
+                np.where(in_book, -w, 0.0), index=index, name="carry"),
         )
 
     def _funding_rate(self, bars: pd.DataFrame) -> pd.Series:

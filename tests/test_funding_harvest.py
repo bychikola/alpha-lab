@@ -551,3 +551,126 @@ def test_positive_infinity_threshold_means_never_hold():
     legs = _strategy(window=1, threshold_rate=np.inf).generate_legs(bars)
     assert legs.carry.tolist() == [0.0] * n
     assert legs.gross.tolist() == [0.0] * n
+
+
+# --- 10. Фиксированный ноционал плеча: кросс-секционный портфель (E2) --------
+#
+# Кросс-секционный портфель — сумма независимых плеч равного размера. Чтобы
+# вход/выход одного символа не перекладывал капитал других, ноционал каждого
+# плеча фиксирован: целевые значения могут быть только 0 и −w (carry) при
+# gross 0 и 2w. Изменение размера внутри книги движок оценить не может
+# (magnitude-базис S1), поэтому правило обязано его не создавать — эти тесты
+# закрепляют инвариант, на котором стоит весь портфельный замер E2.
+
+
+def test_notional_scales_book_legs_without_changing_decision():
+    """notional масштабирует carry/gross, но не решение: 0 ↔ −w, gross 2w."""
+    n = 200
+    window = 24
+    rate = np.concatenate([np.full(100, 1e-3), np.full(100, -1e-3)])
+    bars = _bars(n, funding_rate=rate)
+    base = _strategy(window=window, fee_bps=_FEE_BPS, slippage_bps=0.0)
+    scaled = _strategy(window=window, fee_bps=_FEE_BPS, slippage_bps=0.0,
+                       notional=0.25)
+    legs_base = base.generate_legs(bars)
+    legs_scaled = scaled.generate_legs(bars)
+    in_book = legs_base.carry.to_numpy() != 0.0
+
+    assert not legs_scaled.net.to_numpy().any()
+    np.testing.assert_array_equal(legs_scaled.carry.to_numpy() != 0.0, in_book)
+    np.testing.assert_allclose(legs_scaled.carry.to_numpy(),
+                               -0.25 * in_book)
+    np.testing.assert_allclose(legs_scaled.gross.to_numpy(), 0.5 * in_book)
+    assert not (legs_scaled.carry > 0.0).any()
+    # Порог окупаемости — ставка на бар: и доход, и издержки масштабируются
+    # ноционалом, поэтому порог от него не зависит (иначе размер плеча менял бы
+    # само правило входа, чего априорная формулировка не допускает).
+    assert scaled.cost_recovery_threshold() == pytest.approx(
+        base.cost_recovery_threshold(), rel=0, abs=0)
+
+
+def test_notional_is_validated():
+    """Ноционал — конечное положительное число; bool/finf/NaN/ноль — отказ."""
+    for bad in (0.0, -0.5, float("nan"), float("inf"), True):
+        with pytest.raises(ValueError, match="notional"):
+            _strategy(notional=bad)
+
+
+def test_notional_control_arithmetic_scales_exactly():
+    """Синтетический контроль w=0.25: funding = w·Σ ставок, издержки = 4w·fee."""
+    n = 200
+    w = 0.25
+    rate = np.concatenate([np.full(100, 1e-3), np.zeros(100)])
+    bars = _bars(n)                      # ставку прикрепляет путь CLI
+    exp = _exp(params={"window": 72, "horizon_bars": 720,
+                       "fee_bps": _FEE_BPS, "slippage_bps": 0.0,
+                       "notional": w})
+    outcome = cli.run_config(
+        _loaded_data(bars, funding_rate=pd.Series(rate)), exp)
+    res = outcome.result
+
+    assert res.gross_positions.tolist() == [0.0] * 72 + [2 * w] * 100 + [0.0] * 28
+    expected_funding = w * 1e-3 * 28     # ненулевые ставки на удержанных барах
+    assert -res.costs["funding"].sum() == pytest.approx(
+        expected_funding, rel=1e-12, abs=0)
+    assert res.costs["fee"].sum() == pytest.approx(
+        4 * w * _FEE_BPS * 1e-4, rel=1e-12, abs=0)
+    assert float(res.returns.sum()) == pytest.approx(
+        expected_funding - 4 * w * _FEE_BPS * 1e-4, rel=1e-12, abs=0)
+
+
+def test_fixed_notional_sleeves_do_not_resize_on_membership_change():
+    """Размер книги фиксирован: вход/выход соседнего плеча её не меняет.
+
+    Плечо A держит книгу всё время (ставка положительна), плечо B входит и
+    выходит блоками. По удержанным рядам обоих видно: gross ∈ {0, 2w} и любой
+    ненулевой оборот равен ровно 2w — значит, смена состава портфеля нигде не
+    меняет размер уже открытой книги. Движок ценит 0 ↔ 2w точно; изменение
+    размера внутри книги он оценить не может (ограничение magnitude-базиса
+    S1), поэтому правило обязано его не создавать.
+    """
+    n = 400
+    w = 0.5
+    window = 5
+    block = 30
+    rate_a = np.full(n, 1e-3)
+    rate_b = np.where((np.arange(n) // block) % 2 == 0, 1e-3, -1e-3)
+    params = {"window": window, "horizon_bars": 100, "fee_bps": 5.0,
+              "slippage_bps": 0.0, "notional": w}
+    costs = {"taker_fee_bps": 5.0, "min_slippage_bps": 0.0, "impact_coef": 0.0}
+    results = {}
+    for label, rate in (("A", rate_a), ("B", rate_b)):
+        outcome = cli.run_config(
+            _loaded_data(_bars(n), funding_rate=pd.Series(rate)),
+            _exp(params=params, costs=costs))
+        res = outcome.result
+        held = res.gross_positions.to_numpy()
+        turnover = res.turnover.to_numpy()
+
+        assert res.positions.to_numpy().tolist() == [0.0] * n
+        assert set(np.unique(held)) <= {0.0, 2 * w}
+        nz = np.unique(turnover[turnover != 0.0])
+        np.testing.assert_allclose(nz, [2 * w])
+        # funding начисляется ровно на фиксированный carry: 0 или −w·rate.
+        funding = res.costs["funding"].to_numpy()
+        in_book = held > 0.0
+        np.testing.assert_allclose(funding[in_book], -w * rate[in_book],
+                                   rtol=0, atol=1e-18)
+        assert np.allclose(funding[~in_book], 0.0, rtol=0, atol=0)
+        # Оборот стоит только на входах и выходах: ребалансировок нет.
+        entries, exits = _entries_exits(held)
+        assert entries + exits == int((turnover != 0.0).sum())
+        results[label] = (held, res.returns.to_numpy())
+
+    held_a, returns_a = results["A"]
+    entries_a, exits_a = _entries_exits(held_a)
+    assert (entries_a, exits_a) == (1, 0)        # A не выходит и не мигает
+    assert 2 * w in np.unique(held_a)
+    held_b, returns_b = results["B"]
+    entries_b, exits_b = _entries_exits(held_b)
+    assert entries_b >= 2 and exits_b >= 2       # фикстура B не вырождена
+    # Портфельная единица — равновесное среднее плеч равного бюджета, а не их
+    # сумма: доходность портфеля на весь капитал = Σ P&L_i / (N·C/N).
+    portfolio = 0.5 * (returns_a + returns_b)
+    assert portfolio.shape == returns_a.shape
+    assert np.isfinite(portfolio).all()
