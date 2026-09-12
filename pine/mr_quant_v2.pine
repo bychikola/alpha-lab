@@ -31,19 +31,10 @@
 //        тейк — считается стоп. По истечении maxBars позиция закрывается
 //        по времени. Повторный вход в баре выхода не выполняется.
 //
-//  ─────────────────── ЧТО МОДЕЛЬ ПОКАЗАЛА В БЭКТЕСТЕ ─────────────────────
-//  Это индикатор, а не торговая система, но честно сказать обязан:
-//  модель проверена на реальных данных Binance USDT-M, 2022–2025, часовые
-//  бары, с комиссиями VIP0, историческими ставками funding и моделью
-//  проскальзывания. Результат:
-//
-//     144 конфигурации параметров — ни одна не прошла проверку на
-//     значимость. Максимальный DSR 0.107 при пороге 0.95. 736 сделок
-//     на BTCUSDT, 73.5% капитала ушло в комиссии, доходность −80.8%.
-//
-//  Коротко: издержки съедают модель раньше, чем она успевает что-то
-//  заработать. Индикатор показывает сигналы корректно — но сигналы этой
-//  модели на проверенном периоде не окупали свой оборот.
+//  ────────────────────────────── ПАНЕЛИ ─────────────────────────────────
+//   ① «Модель и позиция» — состояние модели и, если позиция открыта,
+//      её цена входа, стоп, тейк, текущий нереализованный R и удержание.
+//   ② «История сделок» — последние N закрытых сделок и статистика по ним.
 // ═══════════════════════════════════════════════════════════════════════════
 indicator("Mean Reversion Quant v2", shorttitle="MRQ v2", overlay=true,
      max_labels_count=500, max_lines_count=500, max_boxes_count=500)
@@ -81,7 +72,10 @@ showEntry = input.bool(true, "Метки входов", group=grpV)
 showExit = input.bool(true, "Метки выходов", group=grpV)
 showLevels = input.bool(true, "Линии стоп/тейк активной позиции", group=grpV)
 showBg = input.bool(true, "Фон по направлению позиции", group=grpV)
-showTable = input.bool(true, "Таблица состояния", group=grpV)
+showState = input.bool(true, "Панель «Модель и позиция»", group=grpV)
+showHist = input.bool(true, "Панель «История сделок»", group=grpV)
+histRows = input.int(10, "Сделок в истории", minval=1, maxval=12, group=grpV,
+     tooltip="Сколько последних закрытых сделок показывать в таблице истории.")
 
 // ─────────────────────────── ② ЯДРО МОДЕЛИ ───────────────────────────────
 // Среднее и σ. Дисперсия — генеральная (ddof = 0), как rolling().std(ddof=0)
@@ -150,6 +144,8 @@ var int   gStopN  = 0
 var int   gTakeN  = 0
 var int   gTimeN  = 0
 var int   gHoldSum = 0
+var float gBestR  = na
+var float gWorstR = na
 
 // События текущего бара — для меток. Объявлены с var и сбрасываются явно в
 // начале бара: переприсваивание внутри условных блоков должно быть однозначным.
@@ -158,12 +154,22 @@ var bool fEnteredShort = false
 var bool fExited       = false
 var int  fExitKind     = 0         // 1 стоп, 2 тейк, 3 время
 var int  fHoldBars     = 0
+var float fExitP       = na
+
+// ─── Хранилище закрытых сделок: параллельные массивы одной длины ─────────
+var array<int>   hDir    = array.new_int()
+var array<float> hEntry  = array.new_float()
+var array<float> hExit   = array.new_float()
+var array<float> hR      = array.new_float()
+var array<int>   hKind   = array.new_int()
+var array<int>   hBars   = array.new_int()
 
 fEnteredLong  := false
 fEnteredShort := false
 fExited       := false
 fExitKind     := 0
 fHoldBars     := 0
+fExitP        := na
 
 if gDir == 0 and wantLong
     gDir      := 1
@@ -187,32 +193,48 @@ if gDir != 0
     bool hitTP = gDir > 0 ? high >= gTakeP : low <= gTakeP
     bool timeUp = (bar_index - gEntryBar) >= maxBars
 
-    // Консервативно: при одновременном пробое стопа и тейка считается стоп.
-    if hitSL or timeUp
-        fExitKind := hitSL ? 1 : 3
-        fExited := true
-        fHoldBars := bar_index - gEntryBar
-        gTrades += 1
-        gHoldSum += fHoldBars
-        float rMult = gDir > 0 ? (gStopP - gEntryP) / gRiskP : (gEntryP - gStopP) / gRiskP
-        gSumR += rMult
-        gStopN += hitSL ? 1 : 0
-        gTimeN += hitSL ? 0 : 1
-        gDir := 0
-    else if hitTP
-        fExitKind := 2
-        fExited := true
-        fHoldBars := bar_index - gEntryBar
-        gTrades += 1
-        gWins += 1
-        gHoldSum += fHoldBars
-        float rMult = gDir > 0 ? (gTakeP - gEntryP) / gRiskP : (gEntryP - gTakeP) / gRiskP
-        gSumR += rMult
-        gTakeN += 1
+    // Приоритет как в Python: «стоп ИЛИ таймаут» старше тейка. Поэтому
+    // таймаут перебивает одновременный пробой тейка — и цена выхода, и
+    // признак победы обязаны следовать ТОМУ ЖЕ порядку, иначе R посчитается
+    // по цене тейка, а записан будет выход по времени.
+    bool closed = hitSL or timeUp or hitTP
+    if closed
+        int   kind  = hitSL ? 1 : timeUp ? 3 : 2
+        float exitP = hitSL ? gStopP : timeUp ? close : gTakeP
+        float rMult = gDir > 0 ? (exitP - gEntryP) / gRiskP : (gEntryP - exitP) / gRiskP
+        int   bars  = bar_index - gEntryBar
+
+        fExitKind := kind
+        fExited   := true
+        fExitP    := exitP
+        fHoldBars := bars
+
+        gTrades  += 1
+        gWins    += kind == 2 ? 1 : 0
+        gHoldSum += bars
+        gSumR    += rMult
+        gStopN   += kind == 1 ? 1 : 0
+        gTakeN   += kind == 2 ? 1 : 0
+        gTimeN   += kind == 3 ? 1 : 0
+        gBestR   := na(gBestR) ? rMult : math.max(gBestR, rMult)
+        gWorstR  := na(gWorstR) ? rMult : math.min(gWorstR, rMult)
+
+        array.push(hDir, gDir)
+        array.push(hEntry, gEntryP)
+        array.push(hExit, exitP)
+        array.push(hR, rMult)
+        array.push(hKind, kind)
+        array.push(hBars, bars)
+
         gDir := 0
 
 // Позиция, удерживаемая в этом баре. При выходе — ноль (в Python pos[i] = 0).
 posNow = gDir
+
+// Нереализованный R текущей позиции — от текущей цены, не от выхода.
+float liveR = na
+if gDir != 0 and not na(gRiskP) and gRiskP > 0
+    liveR := gDir > 0 ? (close - gEntryP) / gRiskP : (gEntryP - close) / gRiskP
 
 // ─────────────────────────── ⑤ ВИЗУАЛИЗАЦИЯ ─────────────────────────────
 pMean = plot(mean, "μ (среднее)", color.new(color.orange, 0), 1)
@@ -233,14 +255,14 @@ plotshape(showEntry and fEnteredShort, "Вход в шорт", shape.triangledow
 // location.absolute берёт координату Y из значения серии, поэтому булев
 // флаг нарисовал бы метку на уровне 1.0. Передаём цену выхода: для стопа
 // это уровень стопа, для тейка — тейка, для выхода по времени — закрытие.
-plotshape(showExit and fExited and fExitKind == 1 ? gStopP : na, "Выход: стоп",
+plotshape(showExit and fExited and fExitKind == 1 ? fExitP : na, "Выход: стоп",
      shape.xcross, location.absolute, color.new(color.red, 0), size=size.tiny)
-plotshape(showExit and fExited and fExitKind == 2 ? gTakeP : na, "Выход: тейк",
+plotshape(showExit and fExited and fExitKind == 2 ? fExitP : na, "Выход: тейк",
      shape.xcross, location.absolute, color.new(color.green, 0), size=size.tiny)
-plotshape(showExit and fExited and fExitKind == 3 ? close : na, "Выход: время",
+plotshape(showExit and fExited and fExitKind == 3 ? fExitP : na, "Выход: время",
      shape.circle, location.absolute, color.new(color.gray, 0), size=size.tiny)
 
-// Линии активной защиты: одна на позицию, перерисовываются по мере удержания.
+// Линии активной защиты: одна на позицию, тянутся по мере удержания.
 var line lnSL = na
 var line lnTP = na
 if showLevels
@@ -256,73 +278,164 @@ if showLevels
         line.set_x2(lnSL, bar_index)
         line.set_x2(lnTP, bar_index)
 
-// z-скор отдаём в окно данных, не засоряя график.
+// Служебные ряды — в окно данных, не на график.
 plot(z, "z-скор", color.new(color.blue, 100), display=display.data_window)
 plot(theta, "θ (скорость возврата)", display=display.data_window)
 plot(halfLife, "Полужизнь, баров", display=display.data_window)
 plot(posNow, "Позиция", display=display.data_window)
+plot(liveR, "Нереализованный R", display=display.data_window)
 
-// ─────────────────────────── ⑥ ТАБЛИЦА ──────────────────────────────────
-var table tbl = table.new(position.top_right, 2, 11, border_width=1)
-if showTable and barstate.islast
-    winRate = gTrades > 0 ? 100.0 * gWins / gTrades : 0.0
-    avgHold = gTrades > 0 ? gHoldSum / gTrades : 0.0
-    avgR = gTrades > 0 ? gSumR / gTrades : 0.0
+// ─────────────── ⑥ ПАНЕЛЬ «МОДЕЛЬ И ПОЗИЦИЯ» ─────────────────────────────
+var table st = table.new(position.top_right, 2, 12, border_width=1)
 
-    table.cell(tbl, 0, 0, "MRQ v2 — модель", text_color=color.white,
+if showState and barstate.islast
+    table.cell(st, 0, 0, "MRQ v2 · модель", text_color=color.white,
          bgcolor=color.new(color.blue, 70), text_size=size.small)
-    table.cell(tbl, 1, 0, timeframe.period, text_color=color.white,
+    table.cell(st, 1, 0, timeframe.period, text_color=color.white,
          bgcolor=color.new(color.blue, 70), text_size=size.small)
 
-    table.cell(tbl, 0, 1, "z сейчас", text_color=color.gray, text_size=size.small)
-    table.cell(tbl, 1, 1, str.tostring(z, "#.00"),
+    table.cell(st, 0, 1, "z сейчас", text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 1, str.tostring(z, "#.00"),
          text_color=math.abs(z) >= kEntry ? color.yellow : color.gray,
          text_size=size.small)
 
-    table.cell(tbl, 0, 2, "μ / σ", text_color=color.gray, text_size=size.small)
-    table.cell(tbl, 1, 2, str.tostring(mean, format.mintick) + " / " +
+    table.cell(st, 0, 2, "μ / σ", text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 2, str.tostring(mean, format.mintick) + " / " +
          str.tostring(sigma, format.mintick), text_color=color.gray,
          text_size=size.small)
 
-    table.cell(tbl, 0, 3, "ATR(" + str.tostring(atrLen) + ")",
-         text_color=color.gray, text_size=size.small)
-    table.cell(tbl, 1, 3, na(atrVal) ? "—" : str.tostring(atrVal, format.mintick),
+    table.cell(st, 0, 3, "ATR(" + str.tostring(atrLen) + ")", text_color=color.gray,
+         text_size=size.small)
+    table.cell(st, 1, 3, na(atrVal) ? "—" : str.tostring(atrVal, format.mintick),
          text_color=color.gray, text_size=size.small)
 
-    table.cell(tbl, 0, 4, "θ / полужизнь", text_color=color.gray, text_size=size.small)
-    table.cell(tbl, 1, 4, na(halfLife) ? "нет возврата" :
+    table.cell(st, 0, 4, "θ / полужизнь", text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 4, na(halfLife) ? "нет возврата" :
          str.tostring(halfLife, "#.#") + " бар", text_color=color.gray,
          text_size=size.small)
 
-    table.cell(tbl, 0, 5, "Состояние", text_color=color.gray, text_size=size.small)
-    table.cell(tbl, 1, 5, posNow > 0 ? "ЛОНГ" : posNow < 0 ? "ШОРТ" : "вне рынка",
+    table.cell(st, 0, 5, "Состояние", text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 5, posNow > 0 ? "ЛОНГ" : posNow < 0 ? "ШОРТ" : "вне рынка",
          text_color=posNow > 0 ? color.teal : posNow < 0 ? color.maroon : color.gray,
          text_size=size.small)
 
-    table.cell(tbl, 0, 6, "Сделок", text_color=color.gray, text_size=size.small)
-    table.cell(tbl, 1, 6, str.tostring(gTrades), text_color=color.white,
+    // Разделитель и блок текущей позиции.
+    table.cell(st, 0, 6, posNow != 0 ? "ТЕКУЩАЯ ПОЗИЦИЯ" : "ПОЗИЦИИ НЕТ",
+         text_color=color.white, bgcolor=color.new(color.blue, 85),
+         text_size=size.small)
+    table.cell(st, 1, 6, "", bgcolor=color.new(color.blue, 85), text_size=size.small)
+
+    table.cell(st, 0, 7, "Цена входа", text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 7, posNow != 0 ? str.tostring(gEntryP, format.mintick) : "—",
+         text_color=posNow != 0 ? color.white : color.gray, text_size=size.small)
+
+    table.cell(st, 0, 8, "Стоп", text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 8, posNow != 0 ? str.tostring(gStopP, format.mintick) + "  (" +
+         str.tostring(100.0 * (gStopP - close) / close, "#.##") + "%)" : "—",
+         text_color=posNow != 0 ? color.red : color.gray, text_size=size.small)
+
+    table.cell(st, 0, 9, "Тейк", text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 9, posNow != 0 ? str.tostring(gTakeP, format.mintick) + "  (" +
+         str.tostring(100.0 * (gTakeP - close) / close, "#.##") + "%)" : "—",
+         text_color=posNow != 0 ? color.green : color.gray, text_size=size.small)
+
+    table.cell(st, 0, 10, "Нереализ. R", text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 10, na(liveR) ? "—" : str.tostring(liveR, "#.##") + "R",
+         text_color=na(liveR) ? color.gray : liveR >= 0 ? color.green : color.red,
          text_size=size.small)
 
-    table.cell(tbl, 0, 7, "Доля выигрышей", text_color=color.gray, text_size=size.small)
-    table.cell(tbl, 1, 7, str.tostring(winRate, "#.#") + "%",
+    table.cell(st, 0, 11, "Удержание, баров", text_color=color.gray,
+         text_size=size.small)
+    table.cell(st, 1, 11, posNow != 0 ? str.tostring(bar_index - gEntryBar) : "—",
          text_color=color.gray, text_size=size.small)
 
-    table.cell(tbl, 0, 8, "Выходы: стоп/тейк/время", text_color=color.gray,
-         text_size=size.small)
-    table.cell(tbl, 1, 8, str.tostring(gStopN) + " / " + str.tostring(gTakeN) +
-         " / " + str.tostring(gTimeN), text_color=color.gray, text_size=size.small)
+// ─────────────────── ⑦ ПАНЕЛЬ «ИСТОРИЯ СДЕЛОК» ───────────────────────────
+// Фиксированный размер: 1 шапка + 12 строк сделок + 1 шапка статистики
+// + 5 строк статистики = 19 строк.
+var table ht = table.new(position.bottom_right, 6, 19, border_width=1)
 
-    table.cell(tbl, 0, 9, "Средн. R / удержание", text_color=color.gray,
-         text_size=size.small)
-    table.cell(tbl, 1, 9, str.tostring(avgR, "#.##") + "R / " +
-         str.tostring(avgHold, "#.#") + " бар",
-         text_color=avgR >= 0 ? color.green : color.red, text_size=size.small)
+if showHist and barstate.islast
+    table.cell(ht, 0, 0, "№", text_color=color.white,
+         bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 1, 0, "Напр", text_color=color.white,
+         bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 2, 0, "Вход", text_color=color.white,
+         bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 3, 0, "Выход", text_color=color.white,
+         bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 4, 0, "R", text_color=color.white,
+         bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 5, 0, "Причина", text_color=color.white,
+         bgcolor=color.new(color.blue, 70), text_size=size.tiny)
 
-    table.cell(tbl, 0, 10, "Бэктест 2022–2025", text_color=color.gray,
-         text_size=size.small)
-    table.cell(tbl, 1, 10, "DSR 0.107 ≤ 0.95 · выживших 0 из 144",
-         text_color=color.red, text_size=size.small,
-         tooltip="Проверено на реальных данных Binance USDT-M, 1h, с комиссиями " +
-         "VIP0, историческими ставками funding и моделью проскальзывания. " +
-         "Ни одна из 144 конфигураций не прошла проверку на значимость. " +
-         "736 сделок на BTCUSDT: 73.5% капитала ушло в комиссии, доходность −80.8%.")
+    int n = array.size(hDir)
+    int shown = math.min(histRows, n)
+
+    // Последние сделки сверху: идём от конца массива к началу.
+    for i = 0 to 11
+        if i < shown
+            int idx = n - 1 - i
+            int kind = array.get(hKind, idx)
+            float rv = array.get(hR, idx)
+            table.cell(ht, 0, 1 + i, str.tostring(n - i), text_color=color.gray,
+                 text_size=size.tiny)
+            table.cell(ht, 1, 1 + i, array.get(hDir, idx) > 0 ? "▲ лонг" : "▼ шорт",
+                 text_color=array.get(hDir, idx) > 0 ? color.teal : color.maroon,
+                 text_size=size.tiny)
+            table.cell(ht, 2, 1 + i, str.tostring(array.get(hEntry, idx), format.mintick),
+                 text_color=color.gray, text_size=size.tiny)
+            table.cell(ht, 3, 1 + i, str.tostring(array.get(hExit, idx), format.mintick),
+                 text_color=color.gray, text_size=size.tiny)
+            table.cell(ht, 4, 1 + i, str.tostring(rv, "#.##"),
+                 text_color=rv >= 0 ? color.green : color.red, text_size=size.tiny)
+            table.cell(ht, 5, 1 + i, kind == 1 ? "стоп" : kind == 2 ? "тейк" : "время",
+                 text_color=kind == 1 ? color.red : kind == 2 ? color.green : color.gray,
+                 text_size=size.tiny)
+        else
+            for c = 0 to 5
+                table.cell(ht, c, 1 + i, "", text_size=size.tiny)
+
+    // ── Статистика по всем сделкам ──────────────────────────────────────
+    float winRate = gTrades > 0 ? 100.0 * gWins / gTrades : 0.0
+    float avgR = gTrades > 0 ? gSumR / gTrades : 0.0
+    float avgHold = gTrades > 0 ? gHoldSum / gTrades : 0.0
+
+    // ── Статистика по всем сделкам ──────────────────────────────────────
+    int base = 13
+    table.cell(ht, 0, base, "СТАТИСТИКА", text_color=color.white,
+         bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+    table.cell(ht, 1, base, str.tostring(gTrades) + " сделок", text_color=color.white,
+         bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+    table.cell(ht, 2, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+    table.cell(ht, 3, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+    table.cell(ht, 4, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+    table.cell(ht, 5, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+
+    table.cell(ht, 0, base + 1, "Выигрышей", text_color=color.gray,
+         text_size=size.tiny)
+    table.cell(ht, 1, base + 1, str.tostring(gWins) + "  (" +
+         str.tostring(winRate, "#.#") + "%)", text_color=color.gray,
+         text_size=size.tiny)
+
+    table.cell(ht, 0, base + 2, "ΣR / средн. R", text_color=color.gray,
+         text_size=size.tiny)
+    table.cell(ht, 1, base + 2, str.tostring(gSumR, "#.##") + "R / " +
+         str.tostring(avgR, "#.##") + "R",
+         text_color=avgR >= 0 ? color.green : color.red, text_size=size.tiny)
+
+    table.cell(ht, 0, base + 3, "Лучшая / худшая", text_color=color.gray,
+         text_size=size.tiny)
+    table.cell(ht, 1, base + 3,
+         (na(gBestR) ? "—" : str.tostring(gBestR, "#.##") + "R") + " / " +
+         (na(gWorstR) ? "—" : str.tostring(gWorstR, "#.##") + "R"),
+         text_color=color.gray, text_size=size.tiny)
+
+    table.cell(ht, 0, base + 4, "Выходы стоп/тейк/время", text_color=color.gray,
+         text_size=size.tiny)
+    table.cell(ht, 1, base + 4, str.tostring(gStopN) + " / " + str.tostring(gTakeN) +
+         " / " + str.tostring(gTimeN), text_color=color.gray, text_size=size.tiny)
+
+    table.cell(ht, 0, base + 5, "Средн. удержание", text_color=color.gray,
+         text_size=size.tiny)
+    table.cell(ht, 1, base + 5, str.tostring(avgHold, "#.#") + " бар",
+         text_color=color.gray, text_size=size.tiny)
