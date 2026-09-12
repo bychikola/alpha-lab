@@ -138,6 +138,18 @@ var int   gHoldSum = 0
 var float gBestR   = na
 var float gWorstR  = na
 
+// Последняя ЗАКРЫТАЯ сделка. Нужна потому, что таблица рисуется только на
+// последнем баре, а модель большую часть времени вне рынка: без этой памяти
+// блок позиции показывал бы прочерки почти всегда, и выглядело бы это как
+// поломка, а не как «сейчас позиции нет».
+var float zEntry = na
+var float zExit  = na
+var float zSl    = na
+var float zTp    = na
+var float zR     = na
+var int   zKind  = 0
+var int   zBars  = 0
+
 var bool  fEnteredLong  = false
 var bool  fEnteredShort = false
 var bool  fExited       = false
@@ -206,6 +218,14 @@ if gDir != 0
         gBestR   := na(gBestR) ? rMult : math.max(gBestR, rMult)
         gWorstR  := na(gWorstR) ? rMult : math.min(gWorstR, rMult)
 
+        zEntry := gEntryP
+        zExit  := exitP
+        zSl    := gStopP
+        zTp    := gTakeP
+        zR     := rMult
+        zKind  := kind
+        zBars  := bars
+
         array.push(hDir, gDir)
         array.push(hEntry, gEntryP)
         array.push(hExit, exitP)
@@ -239,19 +259,38 @@ plotshape(showExit and fExited and fExitKind == 1 ? fExitP : na, "Выход с�
 plotshape(showExit and fExited and fExitKind == 2 ? fExitP : na, "Выход тейк", shape.xcross, location.absolute, color.new(color.green, 0), size=size.tiny)
 plotshape(showExit and fExited and fExitKind == 3 ? fExitP : na, "Выход время", shape.circle, location.absolute, color.new(color.gray, 0), size=size.tiny)
 
-// Линии активной защиты: одна на позицию, тянутся по мере удержания.
+// Линии защиты активной позиции.
+//
+// ВАЖНО: line.new создаёт НОВУЮ линию, а старая остаётся на графике навсегда.
+// Без удаления за 70 сделок накапливается 140 пунктирных линий от давно
+// закрытых позиций, и график превращается в кашу. Поэтому линии живут ровно
+// столько, сколько открыта позиция: появились на входе, тянутся по барам,
+// удаляются на выходе.
 var line lnSL = na
 var line lnTP = na
+
 if showLevels
-    if fEnteredLong or fEnteredShort
+    if gDir == 0
+        // Позиции нет — линий быть не должно. Ветка самовосстанавливающаяся:
+        // если линия почему-то осталась (например, вход и выход на одном баре
+        // не дошли до создания), она будет удалена здесь.
+        if not na(lnSL)
+            line.set_x2(lnSL, bar_index)
+            line.set_x2(lnTP, bar_index)
+            line.delete(lnSL)
+            line.delete(lnTP)
+            lnSL := na
+            lnTP := na
+    else if fEnteredLong or fEnteredShort
         lnSL := line.new(bar_index, gStopP, bar_index + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
         lnTP := line.new(bar_index, gTakeP, bar_index + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
-    else if gDir != 0 and not na(lnSL)
+    else if not na(lnSL)
         line.set_x2(lnSL, bar_index + 1)
         line.set_x2(lnTP, bar_index + 1)
-    else if fExited and not na(lnSL)
-        line.set_x2(lnSL, bar_index)
-        line.set_x2(lnTP, bar_index)
+    else
+        // Позиция открыта, а линий нет — восстановим по текущим уровням.
+        lnSL := line.new(bar_index, gStopP, bar_index + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
+        lnTP := line.new(bar_index, gTakeP, bar_index + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
 
 // Служебные ряды — в окно данных, не на график.
 plot(z, "z-скор", color.new(color.blue, 100), display=display.data_window)
@@ -282,23 +321,48 @@ if showState and barstate.islast
     table.cell(st, 0, 5, "Состояние", text_color=color.gray, text_size=size.small)
     table.cell(st, 1, 5, posNow > 0 ? "ЛОНГ" : posNow < 0 ? "ШОРТ" : "вне рынка", text_color=posNow > 0 ? color.teal : posNow < 0 ? color.maroon : color.gray, text_size=size.small)
 
-    table.cell(st, 0, 6, posNow != 0 ? "ТЕКУЩАЯ ПОЗИЦИЯ" : "ПОЗИЦИИ НЕТ", text_color=color.white, bgcolor=color.new(color.blue, 85), text_size=size.small)
-    table.cell(st, 1, 6, "", bgcolor=color.new(color.blue, 85), text_size=size.small)
+    // Блок позиции. Пока позиция открыта — её живые данные; когда закрыта —
+    // данные последней закрытой сделки. Прочерки остаются только если сделок
+    // ещё не было вовсе.
+    bool inPos   = posNow != 0
+    bool hasLast = not na(zEntry)
+    bool showRow = inPos or hasLast
 
-    table.cell(st, 0, 7, "Цена входа", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 7, posNow != 0 ? str.tostring(gEntryP, format.mintick) : "-", text_color=posNow != 0 ? color.white : color.gray, text_size=size.small)
+    string hdr = inPos ? (posNow > 0 ? "ТЕКУЩАЯ ПОЗИЦИЯ · ЛОНГ" : "ТЕКУЩАЯ ПОЗИЦИЯ · ШОРТ") : hasLast ? "ПОСЛЕДНЯЯ СДЕЛКА (закрыта)" : "ПОЗИЦИЙ ЕЩЁ НЕ БЫЛО"
+    color hdrBg = inPos ? color.new(posNow > 0 ? color.teal : color.maroon, 75) : color.new(color.blue, 85)
+    table.cell(st, 0, 6, hdr, text_color=color.white, bgcolor=hdrBg, text_size=size.small)
+    table.cell(st, 1, 6, inPos ? "R " + (na(liveR) ? "-" : str.tostring(liveR, "#.##")) : hasLast ? (zR >= 0 ? "+" : "") + str.tostring(zR, "#.##") + "R" : "", text_color=color.white, bgcolor=hdrBg, text_size=size.small)
 
-    table.cell(st, 0, 8, "Стоп", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 8, posNow != 0 ? str.tostring(gStopP, format.mintick) + "  " + str.tostring(100.0 * (gStopP - close) / close, "#.##") + "%" : "-", text_color=posNow != 0 ? color.red : color.gray, text_size=size.small)
+    string l7 = inPos ? "Цена входа" : "Цена входа"
+    string l8 = inPos ? "Стоп" : "Цена выхода"
+    string l9 = inPos ? "Тейк" : "Причина выхода"
+    string l10 = inPos ? "Нереализованный R" : "Результат"
+    string l11 = "Удержание, баров"
 
-    table.cell(st, 0, 9, "Тейк", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 9, posNow != 0 ? str.tostring(gTakeP, format.mintick) + "  " + str.tostring(100.0 * (gTakeP - close) / close, "#.##") + "%" : "-", text_color=posNow != 0 ? color.green : color.gray, text_size=size.small)
+    string v7 = inPos ? str.tostring(gEntryP, format.mintick) : hasLast ? str.tostring(zEntry, format.mintick) : "-"
+    string v8 = inPos ? str.tostring(gStopP, format.mintick) + "  " + str.tostring(100.0 * (gStopP - close) / close, "#.##") + "%" : hasLast ? str.tostring(zExit, format.mintick) : "-"
+    string v9 = inPos ? str.tostring(gTakeP, format.mintick) + "  " + str.tostring(100.0 * (gTakeP - close) / close, "#.##") + "%" : hasLast ? (zKind == 1 ? "стоп" : zKind == 2 ? "тейк" : "время") : "-"
+    string v10 = inPos ? (na(liveR) ? "-" : str.tostring(liveR, "#.##") + "R") : hasLast ? ((zR >= 0 ? "+" : "") + str.tostring(zR, "#.##") + "R") : "-"
+    string v11 = inPos ? str.tostring(bar_index - gEntryBar) : hasLast ? str.tostring(zBars) : "-"
 
-    table.cell(st, 0, 10, "Нереализ. R", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 10, na(liveR) ? "-" : str.tostring(liveR, "#.##") + "R", text_color=na(liveR) ? color.gray : liveR >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(st, 0, 7, l7, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 7, v7, text_color=showRow ? color.white : color.gray, text_size=size.small)
 
-    table.cell(st, 0, 11, "Удержание, баров", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 11, posNow != 0 ? str.tostring(bar_index - gEntryBar) : "-", text_color=color.gray, text_size=size.small)
+    table.cell(st, 0, 8, l8, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 8, v8, text_color=inPos ? color.red : showRow ? color.white : color.gray, text_size=size.small)
+
+    table.cell(st, 0, 9, l9, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 9, v9, text_color=inPos ? color.green : hasLast ? (zKind == 1 ? color.red : zKind == 2 ? color.green : color.gray) : color.gray, text_size=size.small)
+
+    // 0.0, а не 0: в одной тернарной ветке не должно быть int и float —
+    // Pine требует одинаковый тип у ветвей.
+    float rShow = inPos ? (na(liveR) ? 0.0 : liveR) : hasLast ? zR : 0.0
+
+    table.cell(st, 0, 10, l10, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 10, v10, text_color=rShow >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(st, 0, 11, l11, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, 11, v11, text_color=showRow ? color.white : color.gray, text_size=size.small)
 
 // ─────────────────── ⑦ ПАНЕЛЬ «ИСТОРИЯ СДЕЛОК» ───────────────────────────
 // 1 шапка + 12 строк сделок + 1 шапка статистики + 5 строк = 19 строк.
