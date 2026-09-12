@@ -304,7 +304,7 @@ if showState and barstate.islast
          str.tostring(sigma, format.mintick), text_color=color.gray,
          text_size=size.small)
 
-    table.cell(st, 0, 3, "ATR(" + str.tostring(atrLen) + ")", text_color=color.gray,
+    table.cell(st, 0, 3, "ATR " + str.tostring(atrLen), text_color=color.gray,
          text_size=size.small)
     table.cell(st, 1, 3, na(atrVal) ? "—" : str.tostring(atrVal, format.mintick),
          text_color=color.gray, text_size=size.small)
@@ -330,13 +330,13 @@ if showState and barstate.islast
          text_color=posNow != 0 ? color.white : color.gray, text_size=size.small)
 
     table.cell(st, 0, 8, "Стоп", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 8, posNow != 0 ? str.tostring(gStopP, format.mintick) + "  (" +
-         str.tostring(100.0 * (gStopP - close) / close, "#.##") + "%)" : "—",
+    table.cell(st, 1, 8, posNow != 0 ? str.tostring(gStopP, format.mintick) +
+         "  " + str.tostring(100.0 * (gStopP - close) / close, "#.##") + "%" : "—",
          text_color=posNow != 0 ? color.red : color.gray, text_size=size.small)
 
     table.cell(st, 0, 9, "Тейк", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 9, posNow != 0 ? str.tostring(gTakeP, format.mintick) + "  (" +
-         str.tostring(100.0 * (gTakeP - close) / close, "#.##") + "%)" : "—",
+    table.cell(st, 1, 9, posNow != 0 ? str.tostring(gTakeP, format.mintick) +
+         "  " + str.tostring(100.0 * (gTakeP - close) / close, "#.##") + "%" : "—",
          text_color=posNow != 0 ? color.green : color.gray, text_size=size.small)
 
     table.cell(st, 0, 10, "Нереализ. R", text_color=color.gray, text_size=size.small)
@@ -371,29 +371,36 @@ if showHist and barstate.islast
     int n = array.size(hDir)
     int shown = math.min(histRows, n)
 
-    // Последние сделки сверху: идём от конца массива к началу.
-    for i = 0 to 11
+    // Последние сделки сверху: идём от конца массива к началу. Верхняя
+    // граница цикла — histRows, а не константа: пустые строки затираются
+    // явными вызовами, вложенный цикл не нужен.
+    for i = 0 to histRows - 1
+        int row = 1 + i
         if i < shown
             int idx = n - 1 - i
             int kind = array.get(hKind, idx)
             float rv = array.get(hR, idx)
-            table.cell(ht, 0, 1 + i, str.tostring(n - i), text_color=color.gray,
+            table.cell(ht, 0, row, str.tostring(n - i), text_color=color.gray,
                  text_size=size.tiny)
-            table.cell(ht, 1, 1 + i, array.get(hDir, idx) > 0 ? "▲ лонг" : "▼ шорт",
+            table.cell(ht, 1, row, array.get(hDir, idx) > 0 ? "▲ лонг" : "▼ шорт",
                  text_color=array.get(hDir, idx) > 0 ? color.teal : color.maroon,
                  text_size=size.tiny)
-            table.cell(ht, 2, 1 + i, str.tostring(array.get(hEntry, idx), format.mintick),
+            table.cell(ht, 2, row, str.tostring(array.get(hEntry, idx), format.mintick),
                  text_color=color.gray, text_size=size.tiny)
-            table.cell(ht, 3, 1 + i, str.tostring(array.get(hExit, idx), format.mintick),
+            table.cell(ht, 3, row, str.tostring(array.get(hExit, idx), format.mintick),
                  text_color=color.gray, text_size=size.tiny)
-            table.cell(ht, 4, 1 + i, str.tostring(rv, "#.##"),
+            table.cell(ht, 4, row, str.tostring(rv, "#.##"),
                  text_color=rv >= 0 ? color.green : color.red, text_size=size.tiny)
-            table.cell(ht, 5, 1 + i, kind == 1 ? "стоп" : kind == 2 ? "тейк" : "время",
+            table.cell(ht, 5, row, kind == 1 ? "стоп" : kind == 2 ? "тейк" : "время",
                  text_color=kind == 1 ? color.red : kind == 2 ? color.green : color.gray,
                  text_size=size.tiny)
         else
-            for c = 0 to 5
-                table.cell(ht, c, 1 + i, "", text_size=size.tiny)
+            table.cell(ht, 0, row, "", text_size=size.tiny)
+            table.cell(ht, 1, row, "", text_size=size.tiny)
+            table.cell(ht, 2, row, "", text_size=size.tiny)
+            table.cell(ht, 3, row, "", text_size=size.tiny)
+            table.cell(ht, 4, row, "", text_size=size.tiny)
+            table.cell(ht, 5, row, "", text_size=size.tiny)
 
     // ── Статистика по всем сделкам ──────────────────────────────────────
     float winRate = gTrades > 0 ? 100.0 * gWins / gTrades : 0.0
@@ -413,8 +420,8 @@ if showHist and barstate.islast
 
     table.cell(ht, 0, base + 1, "Выигрышей", text_color=color.gray,
          text_size=size.tiny)
-    table.cell(ht, 1, base + 1, str.tostring(gWins) + "  (" +
-         str.tostring(winRate, "#.#") + "%)", text_color=color.gray,
+    table.cell(ht, 1, base + 1, str.tostring(gWins) + "  " +
+         str.tostring(winRate, "#.#") + "%", text_color=color.gray,
          text_size=size.tiny)
 
     table.cell(ht, 0, base + 2, "ΣR / средн. R", text_color=color.gray,
@@ -423,11 +430,15 @@ if showHist and barstate.islast
          str.tostring(avgR, "#.##") + "R",
          text_color=avgR >= 0 ? color.green : color.red, text_size=size.tiny)
 
+    // Строки «лучшая» и «худшая» считаются отдельными переменными: строка
+    // продолжения, начинающаяся с открывающей скобки, разбирается Pine как
+    // лишняя закрывающая (CE10016). Здесь этого не избежать иначе.
+    string bestTxt = na(gBestR) ? "—" : str.tostring(gBestR, "#.##") + "R"
+    string worstTxt = na(gWorstR) ? "—" : str.tostring(gWorstR, "#.##") + "R"
+
     table.cell(ht, 0, base + 3, "Лучшая / худшая", text_color=color.gray,
          text_size=size.tiny)
-    table.cell(ht, 1, base + 3,
-         (na(gBestR) ? "—" : str.tostring(gBestR, "#.##") + "R") + " / " +
-         (na(gWorstR) ? "—" : str.tostring(gWorstR, "#.##") + "R"),
+    table.cell(ht, 1, base + 3, bestTxt + " / " + worstTxt,
          text_color=color.gray, text_size=size.tiny)
 
     table.cell(ht, 0, base + 4, "Выходы стоп/тейк/время", text_color=color.gray,
