@@ -315,11 +315,13 @@ plot(liveR, "Нереализованный R", display=display.data_window)
 var table st = table.new(position.top_right, 2, 12, border_width=1)
 
 if showState and barstate.islast
-    table.cell(st, 0, 0, "MRQ v2 модель", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.small)
-    table.cell(st, 1, 0, timeframe.period, text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.small)
+    table.cell(st, 0, 0, "MRQ v2 модель", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.small)
+    table.cell(st, 1, 0, timeframe.period, text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.small)
 
     table.cell(st, 0, 1, "z сейчас", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 1, str.tostring(z, "#.00"), text_color=math.abs(z) >= kEntry ? color.yellow : color.gray, text_size=size.small)
+    // Оранжевый, а не жёлтый: жёлтый на светлой теме так же невидим, как белый
+    // на тёмной. Оранжевый читается на обоих фонах.
+    table.cell(st, 1, 1, str.tostring(z, "#.00"), text_color=math.abs(z) >= kEntry ? color.orange : color.gray, text_size=size.small)
 
     table.cell(st, 0, 2, "Среднее / сигма", text_color=color.gray, text_size=size.small)
     table.cell(st, 1, 2, str.tostring(mean, format.mintick) + " / " + str.tostring(sigma, format.mintick), text_color=color.gray, text_size=size.small)
@@ -349,8 +351,8 @@ if showState and barstate.islast
 
     string hdr = inPos ? (posNow > 0 ? "ТЕКУЩАЯ ПОЗИЦИЯ · ЛОНГ" : "ТЕКУЩАЯ ПОЗИЦИЯ · ШОРТ") : hasLast ? "ПОСЛЕДНЯЯ СДЕЛКА (закрыта)" : "ПОЗИЦИЙ ЕЩЁ НЕ БЫЛО"
     color hdrBg = inPos ? color.new(posNow > 0 ? color.teal : color.maroon, 75) : color.new(color.blue, 85)
-    table.cell(st, 0, 6, hdr, text_color=color.white, bgcolor=hdrBg, text_size=size.small)
-    table.cell(st, 1, 6, inPos ? "R " + (na(liveR) ? "-" : str.tostring(liveR, "#.##")) : hasLast ? (lastR >= 0 ? "+" : "") + str.tostring(lastR, "#.##") + "R" : "", text_color=color.white, bgcolor=hdrBg, text_size=size.small)
+    table.cell(st, 0, 6, hdr, text_color=chart.fg_color, bgcolor=hdrBg, text_size=size.small)
+    table.cell(st, 1, 6, inPos ? "R " + (na(liveR) ? "-" : str.tostring(liveR, "#.##")) : hasLast ? (lastR >= 0 ? "+" : "") + str.tostring(lastR, "#.##") + "R" : "", text_color=chart.fg_color, bgcolor=hdrBg, text_size=size.small)
 
     string l7  = "Цена входа"
     string l8  = inPos ? "Стоп" : "Цена выхода"
@@ -369,10 +371,10 @@ if showState and barstate.islast
     float rShow = inPos ? (na(liveR) ? 0.0 : liveR) : hasLast ? lastR : 0.0
 
     table.cell(st, 0, 7, l7, text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 7, v7, text_color=showRow ? color.white : color.gray, text_size=size.small)
+    table.cell(st, 1, 7, v7, text_color=color.gray, text_size=size.small)
 
     table.cell(st, 0, 8, l8, text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 8, v8, text_color=inPos ? color.red : showRow ? color.white : color.gray, text_size=size.small)
+    table.cell(st, 1, 8, v8, text_color=inPos ? color.red : color.gray, text_size=size.small)
 
     table.cell(st, 0, 9, l9, text_color=color.gray, text_size=size.small)
     table.cell(st, 1, 9, v9, text_color=inPos ? color.green : hasLast ? (lastKind == 1 ? color.red : lastKind == 2 ? color.green : color.gray) : color.gray, text_size=size.small)
@@ -381,19 +383,19 @@ if showState and barstate.islast
     table.cell(st, 1, 10, v10, text_color=rShow >= 0 ? color.green : color.red, text_size=size.small)
 
     table.cell(st, 0, 11, l11, text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 11, v11, text_color=showRow ? color.white : color.gray, text_size=size.small)
+    table.cell(st, 1, 11, v11, text_color=color.gray, text_size=size.small)
 
 // ─────────────────── ⑦ ПАНЕЛЬ «ИСТОРИЯ СДЕЛОК» ───────────────────────────
 // 1 шапка + 12 строк сделок + 1 шапка статистики + 5 строк = 19 строк.
 var table ht = table.new(position.bottom_right, 6, 19, border_width=1)
 
 if showHist and barstate.islast
-    table.cell(ht, 0, 0, "N", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
-    table.cell(ht, 1, 0, "Напр", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
-    table.cell(ht, 2, 0, "Вход", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
-    table.cell(ht, 3, 0, "Выход", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
-    table.cell(ht, 4, 0, "R", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
-    table.cell(ht, 5, 0, "Причина", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 0, 0, "N", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 1, 0, "Напр", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 2, 0, "Вход", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 3, 0, "Выход", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 4, 0, "R", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
+    table.cell(ht, 5, 0, "Причина", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
 
     int n = array.size(hDir)
     int shown = math.min(histRows, n)
@@ -427,8 +429,8 @@ if showHist and barstate.islast
     string worstTxt = na(gWorstR) ? "-" : str.tostring(gWorstR, "#.##") + "R"
 
     int base = 13
-    table.cell(ht, 0, base, "СТАТИСТИКА", text_color=color.white, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
-    table.cell(ht, 1, base, str.tostring(gTrades) + " сделок", text_color=color.white, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+    table.cell(ht, 0, base, "СТАТИСТИКА", text_color=chart.fg_color, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+    table.cell(ht, 1, base, str.tostring(gTrades) + " сделок", text_color=chart.fg_color, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
     table.cell(ht, 2, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
     table.cell(ht, 3, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
     table.cell(ht, 4, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
