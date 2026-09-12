@@ -293,17 +293,13 @@ if showLevels
         // её место фиксировано на баре сигнала.
         lbEN := label.new(bar_index, gEntryP, "вход " + str.tostring(gEntryP, format.mintick), style=label.style_label_right, color=color.new(color.blue, 15), textcolor=color.white, size=size.tiny)
     else if not na(lnEN)
-        // Линия входа — вдвое короче стопа и тейка: от бара входа до середины
-        // удержания. Служит точкой отсчёта, а не вторым уровнем на всю позицию.
+        // Начало линий НЕ трогаем: оно задано при создании и равно gEntryBar —
+        // бару, на котором появился сигнал. Здесь двигаем только правый конец.
         //
-        // Начало ВСЕГДА переставляем на gEntryBar. bar_index — это текущий бар,
-        // и если линию создали не на баре входа, начало оказалось бы не там,
-        // где сработал сигнал. gEntryBar хранит правду независимо от момента
-        // отрисовки.
+        // Линия входа растёт вдвое медленнее стопа и тейка: от бара сигнала до
+        // середины удержания. Она — точка отсчёта, а не второй уровень на всю
+        // позицию.
         int xMid = gEntryBar + (bar_index - gEntryBar) / 2
-        line.set_x1(lnEN, gEntryBar)
-        line.set_x1(lnSL, gEntryBar)
-        line.set_x1(lnTP, gEntryBar)
         line.set_x2(lnEN, xMid + 1)
         line.set_x2(lnSL, bar_index + 1)
         line.set_x2(lnTP, bar_index + 1)
