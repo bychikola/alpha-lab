@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pine Polygon — проверка и превью индикаторов</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">PP</div>
+  <h1>Pine Polygon <span>— проверка синтаксиса и превью модели</span></h1>
+  <div class="spacer"></div>
+  <div class="row">
+    <select id="tvSymbol" title="Символ для графика TradingView">
+      <option>BINANCE:BTCUSDT</option>
+      <option>BINANCE:ETHUSDT</option>
+      <option>BINANCE:SOLUSDT</option>
+      <option>BINANCE:BNBUSDT</option>
+      <option>BINANCE:XRPUSDT</option>
+      <option>BINANCE:LINKUSDT</option>
+    </select>
+    <select id="tvInterval" title="Таймфрейм">
+      <option value="15">15м</option>
+      <option value="60" selected>1ч</option>
+      <option value="240">4ч</option>
+      <option value="D">1д</option>
+    </select>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ─────────── Честное предупреждение о границах ─────────── -->
+  <div class="card" style="margin-bottom:18px">
+    <div class="note warn" style="border-top:0">
+      <b>Что этот полигон может и чего не может.</b>
+      Pine Script компилируется <b>на серверах TradingView</b> и не исполняется в браузере —
+      ни виджет, ни Charting Library не принимают произвольный Pine. Поэтому:
+      <br>· <b>Линтер</b> ниже проверяет <b>синтаксис</b> локально и ловит ошибки разбора
+      (CE10016, CE10017 и родственные) <b>до</b> вставки в TradingView;
+      <br>· <b>Превью</b> рисует выход <b>проверенной Python-модели</b>, а не Pine. Модель —
+      эталон: Pine-порт сверен с ней побитово, поэтому расхождение картинки с индикатором
+      означает дефект индикатора;
+      <br>· типобезопасность, версии функций и всё, что требует семантики, линтер не знает —
+      это по-прежнему проверит компилятор.
+    </div>
+  </div>
+
+  <div class="grid">
+
+    <!-- ─────────── Редактор и линтер ─────────── -->
+    <div class="card">
+      <h2>Код индикатора <span class="tag" id="srcName">mr_quant_v2.pine</span></h2>
+      <textarea id="editor" spellcheck="false" wrap="off"></textarea>
+      <div class="toolbar">
+        <button class="primary" id="btnLint">Проверить синтаксис</button>
+        <button id="btnCopy">Скопировать код</button>
+        <button class="ghost" id="btnReset">Вернуть исходный</button>
+        <div class="spacer"></div>
+        <span class="mono" style="font-size:11px;color:#64748b" id="stat"></span>
+      </div>
+      <div id="issues"></div>
+    </div>
+
+    <!-- ─────────── Живой график TradingView ─────────── -->
+    <div class="card">
+      <h2>Рынок <span class="tag">виджет TradingView · не исполняет ваш Pine</span></h2>
+      <div id="tv" style="height:520px"></div>
+      <div class="note">
+        Виджет показывает рыночные данные и позволяет накинуть <b>встроенные</b>
+        исследования TradingView. Ваш Pine сюда подставить нельзя — для этого нужен
+        редактор Pine на самом TradingView.
+      </div>
+    </div>
+  </div>
+
+  <!-- ─────────── Превью модели ─────────── -->
+  <div class="card" style="margin-top:18px">
+    <h2>
+      Превью сигналов модели
+      <span class="tag" id="pvTitle">—</span>
+    </h2>
+    <div class="kpis" id="pvKpis"></div>
+    <canvas id="cvPrice"></canvas>
+    <canvas id="cvZ"></canvas>
+    <div class="note" id="pvNote"></div>
+  </div>
+
+  <!-- ─────────── История сделок модели ─────────── -->
+  <div class="card" style="margin-top:18px">
+    <h2>Сделки модели <span class="tag">последние 15 из окна превью</span></h2>
+    <div style="overflow-x:auto">
+      <table id="pvTrades" style="width:100%;border-collapse:collapse;font-size:12.5px"></table>
+    </div>
+  </div>
+
+  <div class="foot">
+    Данные превью выгружены скриптом <span class="mono">scripts/export_preview.py</span>
+    из реальной истории Binance USDT-M.
+  </div>
+</div>
+
+<!-- Данные и код подключаются как скрипты: fetch() к file:// блокируется CORS -->
+<script src="preview.js"></script>
+<script src="pine-source.js"></script>
+<script src="lint.js"></script>
+<script src="chart.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
