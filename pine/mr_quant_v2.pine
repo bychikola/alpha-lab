@@ -283,9 +283,9 @@ if showLevels
             label.delete(lbEN)
             lbEN := na
     else if fEnteredLong or fEnteredShort
-        lnEN := line.new(bar_index, gEntryP, bar_index + 1, gEntryP, color=color.new(color.blue, 0), width=1, style=line.style_solid)
-        lnSL := line.new(bar_index, gStopP, bar_index + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
-        lnTP := line.new(bar_index, gTakeP, bar_index + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
+        lnEN := line.new(gEntryBar, gEntryP, gEntryBar + 1, gEntryP, color=color.new(color.blue, 0), width=1, style=line.style_solid)
+        lnSL := line.new(gEntryBar, gStopP, gEntryBar + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
+        lnTP := line.new(gEntryBar, gTakeP, gEntryBar + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
         if not na(lbEN)
             label.delete(lbEN)
         // label.style_label_right — носик метки справа, тело уходит ВЛЕВО от
@@ -295,15 +295,25 @@ if showLevels
     else if not na(lnEN)
         // Линия входа — вдвое короче стопа и тейка: от бара входа до середины
         // удержания. Служит точкой отсчёта, а не вторым уровнем на всю позицию.
+        //
+        // Начало ВСЕГДА переставляем на gEntryBar. bar_index — это текущий бар,
+        // и если линию создали не на баре входа, начало оказалось бы не там,
+        // где сработал сигнал. gEntryBar хранит правду независимо от момента
+        // отрисовки.
         int xMid = gEntryBar + (bar_index - gEntryBar) / 2
+        line.set_x1(lnEN, gEntryBar)
+        line.set_x1(lnSL, gEntryBar)
+        line.set_x1(lnTP, gEntryBar)
         line.set_x2(lnEN, xMid + 1)
         line.set_x2(lnSL, bar_index + 1)
         line.set_x2(lnTP, bar_index + 1)
     else
         // Позиция открыта, а линий нет — восстановим по текущим уровням.
-        lnEN := line.new(bar_index, gEntryP, bar_index + 1, gEntryP, color=color.new(color.blue, 0), width=1, style=line.style_solid)
-        lnSL := line.new(bar_index, gStopP, bar_index + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
-        lnTP := line.new(bar_index, gTakeP, bar_index + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
+        // Начало — gEntryBar, а не bar_index: линия обязана идти от бара
+        // сигнала, даже если рисуется позже.
+        lnEN := line.new(gEntryBar, gEntryP, bar_index + 1, gEntryP, color=color.new(color.blue, 0), width=1, style=line.style_solid)
+        lnSL := line.new(gEntryBar, gStopP, bar_index + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
+        lnTP := line.new(gEntryBar, gTakeP, bar_index + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
         if not na(lbEN)
             label.delete(lbEN)
         lbEN := label.new(bar_index, gEntryP, "вход " + str.tostring(gEntryP, format.mintick), style=label.style_label_right, color=color.new(color.blue, 15), textcolor=color.white, size=size.tiny)
