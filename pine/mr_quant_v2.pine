@@ -71,6 +71,7 @@ showState = input.bool(true, "Панель Модель и позиция", grou
 showHist = input.bool(true, "Панель История сделок", group=grpV)
 histRows = input.int(10, "Сделок в истории", minval=1, maxval=12, group=grpV, tooltip="Сколько последних закрытых сделок показывать в таблице истории.")
 lbBars = input.int(12, "Метка входа: отступ влево, баров", minval=2, maxval=100, group=grpV, tooltip="На сколько баров влево от свечи сигнала поставить метку с ценой. Линия-указатель идёт от метки и заканчивается на свече сигнала.")
+compactMode = input.bool(false, "Компактный режим (мобильные)", group=grpV, tooltip="Убирает из таблиц второстепенные строки: панель модели становится вдвое короче, история показывает 3 сделки и одну строку итогов вместо подробной статистики. Pine не умеет определять телефон — переключайте вручную.")
 
 // ─────────────────────────── ② ЯДРО МОДЕЛИ ───────────────────────────────
 // Среднее и сигма. Дисперсия генеральная (ddof = 0), как в Python.
@@ -327,28 +328,37 @@ plot(posNow, "Позиция", display=display.data_window)
 plot(liveR, "Нереализованный R", display=display.data_window)
 
 // ─────────────── ⑥ ПАНЕЛЬ «МОДЕЛЬ И ПОЗИЦИЯ» ─────────────────────────────
-var table st = table.new(position.top_right, 2, 12, border_width=1)
+//
+// В компактном режиме панель короче на четыре строки: блок модели (z, среднее,
+// ATR, полужизнь) скрывается, остаётся состояние и позиция. Блок позиции при
+// этом сдвигается вверх — поэтому номера строк не константы, а переменные.
+int stateRows = compactMode ? 8 : 12
+int rState    = compactMode ? 1 : 5
+int rBlock    = compactMode ? 2 : 6
+
+var table st = table.new(position.top_right, 2, stateRows, border_width=1)
 
 if showState and barstate.islast
     table.cell(st, 0, 0, "MRQ v2 модель", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.small)
     table.cell(st, 1, 0, timeframe.period, text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.small)
 
-    table.cell(st, 0, 1, "z сейчас", text_color=color.gray, text_size=size.small)
-    // Оранжевый, а не жёлтый: жёлтый на светлой теме так же невидим, как белый
-    // на тёмной. Оранжевый читается на обоих фонах.
-    table.cell(st, 1, 1, str.tostring(z, "#.00"), text_color=math.abs(z) >= kEntry ? color.orange : color.gray, text_size=size.small)
+    if not compactMode
+        table.cell(st, 0, 1, "z сейчас", text_color=color.gray, text_size=size.small)
+        // Оранжевый, а не жёлтый: жёлтый на светлой теме так же невидим, как белый
+        // на тёмной. Оранжевый читается на обоих фонах.
+        table.cell(st, 1, 1, str.tostring(z, "#.00"), text_color=math.abs(z) >= kEntry ? color.orange : color.gray, text_size=size.small)
 
-    table.cell(st, 0, 2, "Среднее / сигма", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 2, str.tostring(mean, format.mintick) + " / " + str.tostring(sigma, format.mintick), text_color=color.gray, text_size=size.small)
+        table.cell(st, 0, 2, "Среднее / сигма", text_color=color.gray, text_size=size.small)
+        table.cell(st, 1, 2, str.tostring(mean, format.mintick) + " / " + str.tostring(sigma, format.mintick), text_color=color.gray, text_size=size.small)
 
-    table.cell(st, 0, 3, "ATR " + str.tostring(atrLen), text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 3, na(atrVal) ? "-" : str.tostring(atrVal, format.mintick), text_color=color.gray, text_size=size.small)
+        table.cell(st, 0, 3, "ATR " + str.tostring(atrLen), text_color=color.gray, text_size=size.small)
+        table.cell(st, 1, 3, na(atrVal) ? "-" : str.tostring(atrVal, format.mintick), text_color=color.gray, text_size=size.small)
 
-    table.cell(st, 0, 4, "theta / полужизнь", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 4, na(halfLife) ? "нет возврата" : str.tostring(halfLife, "#.#") + " бар", text_color=color.gray, text_size=size.small)
+        table.cell(st, 0, 4, "theta / полужизнь", text_color=color.gray, text_size=size.small)
+        table.cell(st, 1, 4, na(halfLife) ? "нет возврата" : str.tostring(halfLife, "#.#") + " бар", text_color=color.gray, text_size=size.small)
 
-    table.cell(st, 0, 5, "Состояние", text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 5, posNow > 0 ? "ЛОНГ" : posNow < 0 ? "ШОРТ" : "вне рынка", text_color=posNow > 0 ? color.teal : posNow < 0 ? color.maroon : color.gray, text_size=size.small)
+    table.cell(st, 0, rState, "Состояние", text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, rState, posNow > 0 ? "ЛОНГ" : posNow < 0 ? "ШОРТ" : "вне рынка", text_color=posNow > 0 ? color.teal : posNow < 0 ? color.maroon : color.gray, text_size=size.small)
 
     // Блок позиции. Пока позиция открыта — её живые данные; когда закрыта —
     // данные последней сделки ИЗ МАССИВОВ ИСТОРИИ (единственный источник
@@ -366,8 +376,8 @@ if showState and barstate.islast
 
     string hdr = inPos ? (posNow > 0 ? "ТЕКУЩАЯ ПОЗИЦИЯ · ЛОНГ" : "ТЕКУЩАЯ ПОЗИЦИЯ · ШОРТ") : hasLast ? "ПОСЛЕДНЯЯ СДЕЛКА (закрыта)" : "ПОЗИЦИЙ ЕЩЁ НЕ БЫЛО"
     color hdrBg = inPos ? color.new(posNow > 0 ? color.teal : color.maroon, 75) : color.new(color.blue, 85)
-    table.cell(st, 0, 6, hdr, text_color=chart.fg_color, bgcolor=hdrBg, text_size=size.small)
-    table.cell(st, 1, 6, inPos ? "R " + (na(liveR) ? "-" : str.tostring(liveR, "#.##")) : hasLast ? (lastR >= 0 ? "+" : "") + str.tostring(lastR, "#.##") + "R" : "", text_color=chart.fg_color, bgcolor=hdrBg, text_size=size.small)
+    table.cell(st, 0, rBlock, hdr, text_color=chart.fg_color, bgcolor=hdrBg, text_size=size.small)
+    table.cell(st, 1, rBlock, inPos ? "R " + (na(liveR) ? "-" : str.tostring(liveR, "#.##")) : hasLast ? (lastR >= 0 ? "+" : "") + str.tostring(lastR, "#.##") + "R" : "", text_color=chart.fg_color, bgcolor=hdrBg, text_size=size.small)
 
     string l7  = "Цена входа"
     string l8  = inPos ? "Стоп" : "Цена выхода"
@@ -385,24 +395,32 @@ if showState and barstate.islast
     // Pine требует одинаковый тип у ветвей.
     float rShow = inPos ? (na(liveR) ? 0.0 : liveR) : hasLast ? lastR : 0.0
 
-    table.cell(st, 0, 7, l7, text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 7, v7, text_color=color.gray, text_size=size.small)
+    table.cell(st, 0, rBlock + 1, l7, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, rBlock + 1, v7, text_color=color.gray, text_size=size.small)
 
-    table.cell(st, 0, 8, l8, text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 8, v8, text_color=inPos ? color.red : color.gray, text_size=size.small)
+    table.cell(st, 0, rBlock + 2, l8, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, rBlock + 2, v8, text_color=inPos ? color.red : color.gray, text_size=size.small)
 
-    table.cell(st, 0, 9, l9, text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 9, v9, text_color=inPos ? color.green : hasLast ? (lastKind == 1 ? color.red : lastKind == 2 ? color.green : color.gray) : color.gray, text_size=size.small)
+    table.cell(st, 0, rBlock + 3, l9, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, rBlock + 3, v9, text_color=inPos ? color.green : hasLast ? (lastKind == 1 ? color.red : lastKind == 2 ? color.green : color.gray) : color.gray, text_size=size.small)
 
-    table.cell(st, 0, 10, l10, text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 10, v10, text_color=rShow >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(st, 0, rBlock + 4, l10, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, rBlock + 4, v10, text_color=rShow >= 0 ? color.green : color.red, text_size=size.small)
 
-    table.cell(st, 0, 11, l11, text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 11, v11, text_color=color.gray, text_size=size.small)
+    table.cell(st, 0, rBlock + 5, l11, text_color=color.gray, text_size=size.small)
+    table.cell(st, 1, rBlock + 5, v11, text_color=color.gray, text_size=size.small)
 
 // ─────────────────── ⑦ ПАНЕЛЬ «ИСТОРИЯ СДЕЛОК» ───────────────────────────
-// 1 шапка + 12 строк сделок + 1 шапка статистики + 5 строк = 19 строк.
-var table ht = table.new(position.bottom_right, 6, 19, border_width=1)
+//
+// Полный режим: 1 шапка + 12 сделок + 1 шапка статистики + 5 строк = 19.
+// Компактный:   1 шапка +  3 сделки + 1 строка итогов               =  5.
+//
+// Число строк задаётся при создании таблицы, поэтому размер зависит от режима:
+// пустые ячейки всё равно занимают место, укоротить таблицу потом нельзя.
+int histShow  = compactMode ? 3 : histRows
+int histRowsN = compactMode ? 5 : 19
+
+var table ht = table.new(position.bottom_right, 6, histRowsN, border_width=1)
 
 if showHist and barstate.islast
     table.cell(ht, 0, 0, "N", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
@@ -413,10 +431,10 @@ if showHist and barstate.islast
     table.cell(ht, 5, 0, "Причина", text_color=chart.fg_color, bgcolor=color.new(color.blue, 70), text_size=size.tiny)
 
     int n = array.size(hDir)
-    int shown = math.min(histRows, n)
+    int shown = math.min(histShow, n)
 
     // Последние сделки сверху: идём от конца массива к началу.
-    for i = 0 to histRows - 1
+    for i = 0 to histShow - 1
         int row = 1 + i
         if i < shown
             int idx = n - 1 - i
@@ -443,25 +461,39 @@ if showHist and barstate.islast
     string bestTxt = na(gBestR) ? "-" : str.tostring(gBestR, "#.##") + "R"
     string worstTxt = na(gWorstR) ? "-" : str.tostring(gWorstR, "#.##") + "R"
 
-    int base = 13
-    table.cell(ht, 0, base, "СТАТИСТИКА", text_color=chart.fg_color, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
-    table.cell(ht, 1, base, str.tostring(gTrades) + " сделок", text_color=chart.fg_color, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
-    table.cell(ht, 2, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
-    table.cell(ht, 3, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
-    table.cell(ht, 4, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
-    table.cell(ht, 5, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+    // Строка итогов — последняя в таблице. Номер строки зависит от режима:
+    // в компактном сделок меньше, значит и итоги выше.
+    int base = 1 + histShow
 
-    table.cell(ht, 0, base + 1, "Выигрышей", text_color=color.gray, text_size=size.tiny)
-    table.cell(ht, 1, base + 1, str.tostring(gWins) + "  " + str.tostring(winRate, "#.#") + "%", text_color=color.gray, text_size=size.tiny)
+    if compactMode
+        // Всё в одну строку: сделок, доля выигрышей, сумма R.
+        table.cell(ht, 0, base, "Итог", text_color=chart.fg_color, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 1, base, str.tostring(gTrades) + " сд · " + str.tostring(winRate, "#.#") + "% · " + str.tostring(gSumR, "#.##") + "R", text_color=gSumR >= 0 ? color.green : color.red, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 2, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 3, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 4, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 5, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+    else
+        // Подробная статистика. Записывать её в компактном режиме нельзя:
+        // таблица там всего 5 строк, и обращение к base+5 вышло бы за границы.
+        table.cell(ht, 0, base, "СТАТИСТИКА", text_color=chart.fg_color, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 1, base, str.tostring(gTrades) + " сделок", text_color=chart.fg_color, bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 2, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 3, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 4, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
+        table.cell(ht, 5, base, "", bgcolor=color.new(color.blue, 85), text_size=size.tiny)
 
-    table.cell(ht, 0, base + 2, "Сумма R / средний R", text_color=color.gray, text_size=size.tiny)
-    table.cell(ht, 1, base + 2, str.tostring(gSumR, "#.##") + "R / " + str.tostring(avgR, "#.##") + "R", text_color=avgR >= 0 ? color.green : color.red, text_size=size.tiny)
+        table.cell(ht, 0, base + 1, "Выигрышей", text_color=color.gray, text_size=size.tiny)
+        table.cell(ht, 1, base + 1, str.tostring(gWins) + "  " + str.tostring(winRate, "#.#") + "%", text_color=color.gray, text_size=size.tiny)
 
-    table.cell(ht, 0, base + 3, "Лучшая / худшая", text_color=color.gray, text_size=size.tiny)
-    table.cell(ht, 1, base + 3, bestTxt + " / " + worstTxt, text_color=color.gray, text_size=size.tiny)
+        table.cell(ht, 0, base + 2, "Сумма R / средний R", text_color=color.gray, text_size=size.tiny)
+        table.cell(ht, 1, base + 2, str.tostring(gSumR, "#.##") + "R / " + str.tostring(avgR, "#.##") + "R", text_color=avgR >= 0 ? color.green : color.red, text_size=size.tiny)
 
-    table.cell(ht, 0, base + 4, "Выходы стоп/тейк/время", text_color=color.gray, text_size=size.tiny)
-    table.cell(ht, 1, base + 4, str.tostring(gStopN) + " / " + str.tostring(gTakeN) + " / " + str.tostring(gTimeN), text_color=color.gray, text_size=size.tiny)
+        table.cell(ht, 0, base + 3, "Лучшая / худшая", text_color=color.gray, text_size=size.tiny)
+        table.cell(ht, 1, base + 3, bestTxt + " / " + worstTxt, text_color=color.gray, text_size=size.tiny)
 
-    table.cell(ht, 0, base + 5, "Среднее удержание", text_color=color.gray, text_size=size.tiny)
-    table.cell(ht, 1, base + 5, str.tostring(avgHold, "#.#") + " бар", text_color=color.gray, text_size=size.tiny)
+        table.cell(ht, 0, base + 4, "Выходы стоп/тейк/время", text_color=color.gray, text_size=size.tiny)
+        table.cell(ht, 1, base + 4, str.tostring(gStopN) + " / " + str.tostring(gTakeN) + " / " + str.tostring(gTimeN), text_color=color.gray, text_size=size.tiny)
+
+        table.cell(ht, 0, base + 5, "Среднее удержание", text_color=color.gray, text_size=size.tiny)
+        table.cell(ht, 1, base + 5, str.tostring(avgHold, "#.#") + " бар", text_color=color.gray, text_size=size.tiny)
