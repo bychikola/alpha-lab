@@ -107,15 +107,43 @@ class MeanReversionStrategy:
             required = max(required, self.hl_window)
         return required
 
+    def _signal_thresholds(self, bars: pd.DataFrame, close: pd.Series,
+                           z: pd.Series):
+        """Пороги z: ниже нижнего — лонг, выше верхнего — шорт.
+
+        По умолчанию константы ±k. Точка расширения для вариантов с
+        адаптивным порогом: там возвращаются не числа, а ряды, потому что
+        порог меняется от бара к бару. Возвращаются именно ПОРОГИ, а не
+        готовые маски, — чтобы смысл знака («ниже нижнего — это лонг»)
+        остался в одном месте и переопределение не могло его перепутать.
+        """
+        return -self.k, self.k
+
+    def _entry_masks(self, bars: pd.DataFrame, close: pd.Series, z: pd.Series,
+                     ready: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Маски входа (лонг, шорт) до страховки от нефинитных уровней.
+
+        ready — прогревочная граница: до неё входов нет ни при каком сигнале.
+        Маски возвращаются writable-копиями: фильтрующие варианты дописывают
+        их на месте через &=, а to_numpy() в pandas 3 отдаёт read-only массив.
+        """
+        low, high = self._signal_thresholds(bars, close, z)
+        long_entry = (z <= low).to_numpy(copy=True)
+        short_entry = (z >= high).to_numpy(copy=True)
+        long_entry &= ready
+        short_entry &= ready
+
+        if self.use_hl_filter:
+            allowed = self._half_life_ok(close).to_numpy()
+            long_entry &= allowed
+            short_entry &= allowed
+
+        return long_entry, short_entry
+
     def generate(self, bars: pd.DataFrame) -> pd.Series:
         close = bars["close"].astype("float64")
         z = zscore(close, self.window)
         atr_vals = atr_series(bars, self.atr_len)
-
-        # copy=True: в pandas 3 to_numpy() отдаёт read-only массив (CoW),
-        # а маски ниже дописываются на месте через &=
-        long_entry = (z <= -self.k).to_numpy(copy=True)
-        short_entry = (z >= self.k).to_numpy(copy=True)
 
         # Прогрев — явная граница входа, а не побочный эффект значений
         # признаков. zscore отдаёт 0.0 на первых window-1 барах (0.0 значит
@@ -124,13 +152,7 @@ class MeanReversionStrategy:
         # границы входов нет ни при каком сигнале.
         bar_idx = np.arange(len(bars))
         ready = (bar_idx >= self.window - 1) & (bar_idx >= self.atr_len - 1)
-        long_entry &= ready
-        short_entry &= ready
-
-        if self.use_hl_filter:
-            allowed = self._half_life_ok(close).to_numpy()
-            long_entry &= allowed
-            short_entry &= allowed
+        long_entry, short_entry = self._entry_masks(bars, close, z, ready)
 
         # Стоп и тейк для каждого направления; берём то, что соответствует входу
         sl_long, tp_long = atr_brackets(close, atr_vals, 1, self.sl_atr, self.tp_atr)

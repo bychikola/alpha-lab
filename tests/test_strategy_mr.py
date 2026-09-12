@@ -262,6 +262,71 @@ def test_half_life_filter_suppresses_signals():
     assert (strict.generate(bars) != 0).sum() < (loose.generate(bars) != 0).sum()
 
 
+def _entry_bars(pos: pd.Series) -> np.ndarray:
+    """Бары, на которых позиция открывалась (переход из нуля в ненулевое)."""
+    p = pos.to_numpy()
+    return np.flatnonzero((p != 0) & (np.r_[0.0, p[:-1]] == 0))
+
+
+def test_entry_thresholds_are_an_overridable_hook():
+    """Порог входа переопределяется, не копируя generate.
+
+    Точка расширения нужна фильтрующим вариантам: без неё квантильный порог
+    пришлось бы вписывать в копию generate, и две копии разошлись бы при
+    первой же правке базовой модели.
+
+    Проверяются края диапазона, а не «побольше/поменьше»: при пороге ±∞
+    условие z ≤ −∞ не выполняется ни на одном баре, и позиций быть не может
+    вовсе; при пороге ±1e-9 вход разрешён почти везде, и первый вход обязан
+    случиться раньше базового. Оба утверждения — свойство кода, а не выборки:
+    «снизили порог — входов стало больше» неверно (низкий порог даёт не
+    больше сделок, а более длинные: измерено 18 входов против 29 при большем
+    времени в позиции).
+    """
+    bars = ou_bars(n=3000, theta=0.05, seed=19)
+
+    class Endless(MeanReversionStrategy):
+        def _signal_thresholds(self, bars_, close, z):
+            return -1e-9, 1e-9
+
+    class Never(MeanReversionStrategy):
+        def _signal_thresholds(self, bars_, close, z):
+            return -np.inf, np.inf
+
+    base = MeanReversionStrategy({"window": 20, "k": 2.0}).generate(bars)
+    endless = Endless({"window": 20, "k": 2.0}).generate(bars)
+    never = Never({"window": 20, "k": 2.0}).generate(bars)
+
+    assert (never == 0).all()
+    assert _entry_bars(endless)[0] < _entry_bars(base)[0]
+
+
+def test_entry_masks_are_an_overridable_hook():
+    """Маски входа переопределяются, и переопределение обязано сужать.
+
+    Переопределение сохраняет смысл знака: лонг-маска остаётся лонг-маской.
+    Разрешаем вход только на чётных барах — открытие сделки на нечётном баре
+    становится невозможным по построению, и это проверяется точно, а не
+    «сделок стало меньше»: сдвиг входа меняет цены стопа и тейка, поэтому
+    число и длительность сделок — не гарантия, а исход конкретной выборки.
+    """
+    bars = ou_bars(n=3000, theta=0.05, seed=19)
+
+    class Half(MeanReversionStrategy):
+        def _entry_masks(self, bars_, close, z, ready):
+            long_entry, short_entry = super()._entry_masks(bars_, close, z, ready)
+            keep = np.arange(len(bars_)) % 2 == 0
+            return long_entry & keep, short_entry & keep
+
+    base = MeanReversionStrategy({"window": 20, "k": 2.0}).generate(bars)
+    half = Half({"window": 20, "k": 2.0}).generate(bars)
+
+    opened = _entry_bars(half)
+    assert len(opened) > 0                # иначе «все чётные» тривиально верно
+    assert (opened % 2 == 0).all()
+    assert not half.equals(base)
+
+
 def test_build_strategy_returns_mr():
     s = build_strategy("mean_reversion", {"window": 10})
 
