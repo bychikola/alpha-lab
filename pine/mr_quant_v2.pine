@@ -138,18 +138,6 @@ var int   gHoldSum = 0
 var float gBestR   = na
 var float gWorstR  = na
 
-// Последняя ЗАКРЫТАЯ сделка. Нужна потому, что таблица рисуется только на
-// последнем баре, а модель большую часть времени вне рынка: без этой памяти
-// блок позиции показывал бы прочерки почти всегда, и выглядело бы это как
-// поломка, а не как «сейчас позиции нет».
-var float zEntry = na
-var float zExit  = na
-var float zSl    = na
-var float zTp    = na
-var float zR     = na
-var int   zKind  = 0
-var int   zBars  = 0
-
 var bool  fEnteredLong  = false
 var bool  fEnteredShort = false
 var bool  fExited       = false
@@ -158,11 +146,17 @@ var int   fHoldBars     = 0
 var float fExitP        = na
 
 // Хранилище закрытых сделок: параллельные массивы одной длины.
+//
+// Это ЕДИНСТВЕННЫЙ источник данных о прошлых сделках — и для таблицы истории,
+// и для блока «последняя сделка», когда позиции нет. Отдельные переменные для
+// того же самого заводить нельзя: два источника правды расходятся, и один из
+// них оказывается пустым.
 var array<int>   hDir   = array.new_int()
 var array<float> hEntry = array.new_float()
 var array<float> hExit  = array.new_float()
 var array<float> hR     = array.new_float()
 var array<int>   hKind  = array.new_int()
+var array<int>   hBars  = array.new_int()
 
 fEnteredLong  := false
 fEnteredShort := false
@@ -218,19 +212,14 @@ if gDir != 0
         gBestR   := na(gBestR) ? rMult : math.max(gBestR, rMult)
         gWorstR  := na(gWorstR) ? rMult : math.min(gWorstR, rMult)
 
-        zEntry := gEntryP
-        zExit  := exitP
-        zSl    := gStopP
-        zTp    := gTakeP
-        zR     := rMult
-        zKind  := kind
-        zBars  := bars
-
+        // Пишем сделку ТОЛЬКО сюда. Блок «последняя сделка» в таблице читает
+        // эти же массивы — так данные не могут разойтись.
         array.push(hDir, gDir)
         array.push(hEntry, gEntryP)
         array.push(hExit, exitP)
         array.push(hR, rMult)
         array.push(hKind, kind)
+        array.push(hBars, bars)
 
         gDir := 0
 
@@ -331,28 +320,39 @@ if showState and barstate.islast
     table.cell(st, 1, 5, posNow > 0 ? "ЛОНГ" : posNow < 0 ? "ШОРТ" : "вне рынка", text_color=posNow > 0 ? color.teal : posNow < 0 ? color.maroon : color.gray, text_size=size.small)
 
     // Блок позиции. Пока позиция открыта — её живые данные; когда закрыта —
-    // данные последней закрытой сделки. Прочерки остаются только если сделок
-    // ещё не было вовсе.
+    // данные последней сделки ИЗ МАССИВОВ ИСТОРИИ (единственный источник
+    // правды). Прочерки остаются только если сделок ещё не было вовсе.
+    int  hn      = array.size(hEntry)
     bool inPos   = posNow != 0
-    bool hasLast = not na(zEntry)
+    bool hasLast = hn > 0
     bool showRow = inPos or hasLast
+
+    float lastEntry = hasLast ? array.get(hEntry, hn - 1) : na
+    float lastExit  = hasLast ? array.get(hExit,  hn - 1) : na
+    float lastR     = hasLast ? array.get(hR,     hn - 1) : na
+    int   lastKind  = hasLast ? array.get(hKind,  hn - 1) : 0
+    int   lastBars  = hasLast ? array.get(hBars,  hn - 1) : 0
 
     string hdr = inPos ? (posNow > 0 ? "ТЕКУЩАЯ ПОЗИЦИЯ · ЛОНГ" : "ТЕКУЩАЯ ПОЗИЦИЯ · ШОРТ") : hasLast ? "ПОСЛЕДНЯЯ СДЕЛКА (закрыта)" : "ПОЗИЦИЙ ЕЩЁ НЕ БЫЛО"
     color hdrBg = inPos ? color.new(posNow > 0 ? color.teal : color.maroon, 75) : color.new(color.blue, 85)
     table.cell(st, 0, 6, hdr, text_color=color.white, bgcolor=hdrBg, text_size=size.small)
-    table.cell(st, 1, 6, inPos ? "R " + (na(liveR) ? "-" : str.tostring(liveR, "#.##")) : hasLast ? (zR >= 0 ? "+" : "") + str.tostring(zR, "#.##") + "R" : "", text_color=color.white, bgcolor=hdrBg, text_size=size.small)
+    table.cell(st, 1, 6, inPos ? "R " + (na(liveR) ? "-" : str.tostring(liveR, "#.##")) : hasLast ? (lastR >= 0 ? "+" : "") + str.tostring(lastR, "#.##") + "R" : "", text_color=color.white, bgcolor=hdrBg, text_size=size.small)
 
-    string l7 = inPos ? "Цена входа" : "Цена входа"
-    string l8 = inPos ? "Стоп" : "Цена выхода"
-    string l9 = inPos ? "Тейк" : "Причина выхода"
+    string l7  = "Цена входа"
+    string l8  = inPos ? "Стоп" : "Цена выхода"
+    string l9  = inPos ? "Тейк" : "Причина выхода"
     string l10 = inPos ? "Нереализованный R" : "Результат"
     string l11 = "Удержание, баров"
 
-    string v7 = inPos ? str.tostring(gEntryP, format.mintick) : hasLast ? str.tostring(zEntry, format.mintick) : "-"
-    string v8 = inPos ? str.tostring(gStopP, format.mintick) + "  " + str.tostring(100.0 * (gStopP - close) / close, "#.##") + "%" : hasLast ? str.tostring(zExit, format.mintick) : "-"
-    string v9 = inPos ? str.tostring(gTakeP, format.mintick) + "  " + str.tostring(100.0 * (gTakeP - close) / close, "#.##") + "%" : hasLast ? (zKind == 1 ? "стоп" : zKind == 2 ? "тейк" : "время") : "-"
-    string v10 = inPos ? (na(liveR) ? "-" : str.tostring(liveR, "#.##") + "R") : hasLast ? ((zR >= 0 ? "+" : "") + str.tostring(zR, "#.##") + "R") : "-"
-    string v11 = inPos ? str.tostring(bar_index - gEntryBar) : hasLast ? str.tostring(zBars) : "-"
+    string v7  = inPos ? str.tostring(gEntryP, format.mintick) : hasLast ? str.tostring(lastEntry, format.mintick) : "-"
+    string v8  = inPos ? str.tostring(gStopP, format.mintick) + "  " + str.tostring(100.0 * (gStopP - close) / close, "#.##") + "%" : hasLast ? str.tostring(lastExit, format.mintick) : "-"
+    string v9  = inPos ? str.tostring(gTakeP, format.mintick) + "  " + str.tostring(100.0 * (gTakeP - close) / close, "#.##") + "%" : hasLast ? (lastKind == 1 ? "стоп" : lastKind == 2 ? "тейк" : "время") : "-"
+    string v10 = inPos ? (na(liveR) ? "-" : str.tostring(liveR, "#.##") + "R") : hasLast ? ((lastR >= 0 ? "+" : "") + str.tostring(lastR, "#.##") + "R") : "-"
+    string v11 = inPos ? str.tostring(bar_index - gEntryBar) : hasLast ? str.tostring(lastBars) : "-"
+
+    // 0.0, а не 0: в одной тернарной ветке не должно быть int и float —
+    // Pine требует одинаковый тип у ветвей.
+    float rShow = inPos ? (na(liveR) ? 0.0 : liveR) : hasLast ? lastR : 0.0
 
     table.cell(st, 0, 7, l7, text_color=color.gray, text_size=size.small)
     table.cell(st, 1, 7, v7, text_color=showRow ? color.white : color.gray, text_size=size.small)
@@ -361,11 +361,7 @@ if showState and barstate.islast
     table.cell(st, 1, 8, v8, text_color=inPos ? color.red : showRow ? color.white : color.gray, text_size=size.small)
 
     table.cell(st, 0, 9, l9, text_color=color.gray, text_size=size.small)
-    table.cell(st, 1, 9, v9, text_color=inPos ? color.green : hasLast ? (zKind == 1 ? color.red : zKind == 2 ? color.green : color.gray) : color.gray, text_size=size.small)
-
-    // 0.0, а не 0: в одной тернарной ветке не должно быть int и float —
-    // Pine требует одинаковый тип у ветвей.
-    float rShow = inPos ? (na(liveR) ? 0.0 : liveR) : hasLast ? zR : 0.0
+    table.cell(st, 1, 9, v9, text_color=inPos ? color.green : hasLast ? (lastKind == 1 ? color.red : lastKind == 2 ? color.green : color.gray) : color.gray, text_size=size.small)
 
     table.cell(st, 0, 10, l10, text_color=color.gray, text_size=size.small)
     table.cell(st, 1, 10, v10, text_color=rShow >= 0 ? color.green : color.red, text_size=size.small)
