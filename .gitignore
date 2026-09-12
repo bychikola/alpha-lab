@@ -9,6 +9,7 @@ notebooks/.ipynb_checkpoints/
 Thumbs.db
 .superpowers/
 reports/
+results/
 dashboard/report.js
 dashboard/report.json
 dashboard/funnel.js
