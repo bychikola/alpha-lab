@@ -151,9 +151,13 @@ def _registry() -> dict[str, type]:
     """
     from alpha_lab.strategies.funding_harvest import FundingHarvestStrategy
     from alpha_lab.strategies.mean_reversion import MeanReversionStrategy
+    from alpha_lab.strategies.mean_reversion_filtered import (
+        MeanReversionFilteredStrategy,
+    )
 
     return {
         "mean_reversion": MeanReversionStrategy,
+        "mean_reversion_filtered": MeanReversionFilteredStrategy,
         "funding_harvest": FundingHarvestStrategy,
         **REGISTRY,
     }

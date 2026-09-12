@@ -71,9 +71,14 @@ class MeanReversionStrategy:
     # класса). Выводится из DEFAULTS, чтобы новый параметр не забывался в
     # списке: ключ дефолтов и есть принятое имя.
     PARAM_NAMES = frozenset(DEFAULTS)
+    # Значения по умолчанию — атрибут класса, а не только модульная константа:
+    # наследник расширяет набор параметров, и слияние обязано взять ИМЕННО его
+    # набор. Иначе параметры наследника молча не заполнялись бы дефолтами и
+    # он падал бы на KeyError — или, хуже, брал бы базовые значения.
+    defaults = DEFAULTS
 
     def __init__(self, params: dict | None = None):
-        cfg = {**DEFAULTS, **(params or {})}
+        cfg = {**type(self).defaults, **(params or {})}
         self.window = int(cfg["window"])
         self.k = float(cfg["k"])
         self.atr_len = int(cfg["atr_len"])
