@@ -70,6 +70,7 @@ showBg = input.bool(true, "Фон по направлению позиции", g
 showState = input.bool(true, "Панель Модель и позиция", group=grpV)
 showHist = input.bool(true, "Панель История сделок", group=grpV)
 histRows = input.int(10, "Сделок в истории", minval=1, maxval=12, group=grpV, tooltip="Сколько последних закрытых сделок показывать в таблице истории.")
+lbBars = input.int(12, "Метка входа: отступ влево, баров", minval=2, maxval=100, group=grpV, tooltip="На сколько баров влево от свечи сигнала поставить метку с ценой. Линия-указатель идёт от метки и заканчивается на свече сигнала.")
 
 // ─────────────────────────── ② ЯДРО МОДЕЛИ ───────────────────────────────
 // Среднее и сигма. Дисперсия генеральная (ddof = 0), как в Python.
@@ -283,41 +284,40 @@ if showLevels
             label.delete(lbEN)
             lbEN := na
     else if fEnteredLong or fEnteredShort
-        // Начало — на бар ЛЕВЕЕ свечи сигнала. Так линия не прячется за самой
-        // свечой и за треугольником входа, и видно, что она начинается именно
-        // от сигнала. Ограничение снизу: bar_index не может быть отрицательным.
-        int xStart = math.max(gEntryBar - 1, 0)
-        lnEN := line.new(xStart, gEntryP, gEntryBar + 1, gEntryP, color=color.new(color.blue, 0), width=1, style=line.style_solid)
-        lnSL := line.new(xStart, gStopP, gEntryBar + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
-        lnTP := line.new(xStart, gTakeP, gEntryBar + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
+        // Метка входа и линия-указатель стоят ЛЕВЕЕ свечи сигнала.
+        //
+        // Линия идёт от метки и ЗАКАНЧИВАЕТСЯ на свече сигнала: она отвечает
+        // на вопрос «где именно был вход», а не показывает уровень через всю
+        // позицию. Уровни стопа и тейка, наоборот, тянутся вправо — им это
+        // положено по смыслу.
+        //
+        // xStart ограничен снизу нулём: на первых барах истории индекс не может
+        // уйти в минус.
+        int xStart = math.max(gEntryBar - lbBars, 0)
+        lnEN := line.new(xStart, gEntryP, gEntryBar, gEntryP, color=color.new(color.blue, 0), width=1, style=line.style_solid)
+        lnSL := line.new(gEntryBar, gStopP, gEntryBar + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
+        lnTP := line.new(gEntryBar, gTakeP, gEntryBar + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
         if not na(lbEN)
             label.delete(lbEN)
-        // label.style_label_right — носик метки справа, тело уходит ВЛЕВО от
-        // точки входа. Метка не переставляется по барам: это отметка входа,
-        // её место фиксировано на баре сигнала.
-        lbEN := label.new(bar_index, gEntryP, "вход " + str.tostring(gEntryP, format.mintick), style=label.style_label_right, color=color.new(color.blue, 15), textcolor=color.white, size=size.tiny)
+        // Метка на левом конце линии. style_label_right — носик справа, тело
+        // уходит дальше влево, не перекрывая ни линию, ни свечу сигнала.
+        lbEN := label.new(xStart, gEntryP, "вход " + str.tostring(gEntryP, format.mintick), style=label.style_label_right, color=color.new(color.blue, 15), textcolor=color.white, size=size.tiny)
     else if not na(lnEN)
-        // Начало линий НЕ трогаем: оно задано при создании и равно gEntryBar —
-        // бару, на котором появился сигнал. Здесь двигаем только правый конец.
-        //
-        // Линия входа растёт вдвое медленнее стопа и тейка: от бара сигнала до
-        // середины удержания. Она — точка отсчёта, а не второй уровень на всю
-        // позицию.
-        int xMid = gEntryBar + (bar_index - gEntryBar) / 2
-        line.set_x2(lnEN, xMid + 1)
+        // Линия входа не растёт: она закончилась на свече сигнала и больше не
+        // меняется. Тянем только стоп и тейк — они живут, пока жива позиция.
         line.set_x2(lnSL, bar_index + 1)
         line.set_x2(lnTP, bar_index + 1)
     else
         // Позиция открыта, а линий нет — восстановим по текущим уровням.
         // Начало — gEntryBar, а не bar_index: линия обязана идти от бара
         // сигнала, даже если рисуется позже.
-        int xStart = math.max(gEntryBar - 1, 0)
-        lnEN := line.new(xStart, gEntryP, bar_index + 1, gEntryP, color=color.new(color.blue, 0), width=1, style=line.style_solid)
-        lnSL := line.new(xStart, gStopP, bar_index + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
-        lnTP := line.new(xStart, gTakeP, bar_index + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
+        int xStart = math.max(gEntryBar - lbBars, 0)
+        lnEN := line.new(xStart, gEntryP, gEntryBar, gEntryP, color=color.new(color.blue, 0), width=1, style=line.style_solid)
+        lnSL := line.new(gEntryBar, gStopP, bar_index + 1, gStopP, color=color.new(color.red, 20), width=1, style=line.style_dashed)
+        lnTP := line.new(gEntryBar, gTakeP, bar_index + 1, gTakeP, color=color.new(color.green, 20), width=1, style=line.style_dashed)
         if not na(lbEN)
             label.delete(lbEN)
-        lbEN := label.new(bar_index, gEntryP, "вход " + str.tostring(gEntryP, format.mintick), style=label.style_label_right, color=color.new(color.blue, 15), textcolor=color.white, size=size.tiny)
+        lbEN := label.new(xStart, gEntryP, "вход " + str.tostring(gEntryP, format.mintick), style=label.style_label_right, color=color.new(color.blue, 15), textcolor=color.white, size=size.tiny)
 
 // Служебные ряды — в окно данных, не на график.
 plot(z, "z-скор", color.new(color.blue, 100), display=display.data_window)
